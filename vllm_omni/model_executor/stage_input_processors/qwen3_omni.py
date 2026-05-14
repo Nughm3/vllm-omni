@@ -635,6 +635,67 @@ def thinker2talker(
     return talker_inputs
 
 
+def thinker2talker_token_only(
+    source_outputs: list[Any],
+    prompt: OmniTokensPrompt | TextPrompt | None = None,
+    requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
+) -> list[OmniTokensPrompt]:
+    """Non-async-chunk Stage-1 input builder for the connector data plane.
+
+    The worker connector (Stage-0 ``thinker2talker_full_payload`` →
+    ``_sync_local_stage_payloads``) supplies the talker conditioning data
+    (embed / hidden_states / ids / speaker / language) via
+    ``model_intermediate_buffer``. The orchestrator only needs to ship a
+    placeholder prefill prompt of the correct length so the scheduler can
+    allocate KV-cache slots; ``additional_information`` is omitted so the
+    worker buffer is seeded by the connector instead of overwritten.
+    """
+    talker_inputs: list[OmniTokensPrompt] = []
+    for i, thinker_output in enumerate(source_outputs):
+        output = thinker_output.outputs[0]
+        req_id = str(getattr(thinker_output, "request_id", f"idx-{i}"))
+        # Skip-on-missing parity with thinker2talker_full_payload: if the
+        # connector builder would drop this request (no MM dict or missing
+        # hidden-state layers), do the same here so the worker buffer
+        # presence agrees with the orchestrator's scheduling decision.
+        thinker_mm_raw = getattr(output, "multimodal_output", None)
+        if not isinstance(thinker_mm_raw, dict):
+            logger.debug("thinker2talker_token_only: skip req=%s due to empty multimodal_output", req_id)
+            continue
+        mm_hs = thinker_mm_raw.get("hidden_states", {})
+        mm_layers = mm_hs.get("layers", {}) if isinstance(mm_hs, dict) else {}
+        if _layer_tensor(mm_layers, _EMBED_LAYER_KEY) is None or _layer_tensor(mm_layers, _HIDDEN_LAYER_KEY) is None:
+            logger.debug("thinker2talker_token_only: skip req=%s due to missing hidden-state layers", req_id)
+            continue
+        prompt_token_ids = _ensure_list(thinker_output.prompt_token_ids)
+        output_ids = _ensure_list(output.cumulative_token_ids)
+        is_streaming_session = bool(getattr(streaming_context, "enabled", False))
+        if is_streaming_session:
+            prompt_token_ids, output_ids, thinker_sequences, thinker_input_ids = _get_streaming_talker_tokens(
+                req_id,
+                prompt_token_ids,
+                output_ids,
+                getattr(streaming_context, "new_prompt_len_snapshot", None),
+                streaming_context,
+                clear_state=bool(getattr(thinker_output, "finished", False)),
+            )
+        else:
+            thinker_sequences = prompt_token_ids + output_ids
+            thinker_input_ids = prompt_token_ids
+        info_for_len = {"ids": {"all": thinker_sequences, "prompt": thinker_input_ids}}
+        prompt_len = _compute_talker_prompt_ids_length(info_for_len, device="cpu")
+        talker_inputs.append(
+            OmniTokensPrompt(
+                prompt_token_ids=[0] * prompt_len,
+                additional_information=None,
+                multi_modal_data=None,
+                mm_processor_kwargs=None,
+            )
+        )
+    return talker_inputs
+
+
 # =========================
 # Talker -> Code2Wav
 # =========================

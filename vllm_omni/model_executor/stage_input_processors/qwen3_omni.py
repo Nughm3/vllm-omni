@@ -644,12 +644,19 @@ def thinker2talker_token_only(
     """Non-async-chunk Stage-1 input builder for the connector data plane.
 
     The worker connector (Stage-0 ``thinker2talker_full_payload`` →
-    ``_sync_local_stage_payloads``) supplies the talker conditioning data
-    (embed / hidden_states / ids / speaker / language) via
-    ``model_intermediate_buffer``. The orchestrator only needs to ship a
-    placeholder prefill prompt of the correct length so the scheduler can
-    allocate KV-cache slots; ``additional_information`` is omitted so the
-    worker buffer is seeded by the connector instead of overwritten.
+    ``_sync_local_stage_payloads``) supplies the bulk talker conditioning
+    tensors (embed / hidden_states / ids) via ``model_intermediate_buffer``.
+    The orchestrator only needs to ship a placeholder prefill prompt of the
+    correct length so the scheduler can allocate KV-cache slots.
+
+    Small per-request voice metadata (``speaker`` / ``language``) is forwarded
+    here from the user prompt so the worker's line-408 buffer seed picks it
+    up. The connector-side ``extract_speaker_from_request`` reads the
+    strongly-typed ``request.additional_information.entries["speaker"]`` which
+    currently does not always round-trip the user-supplied voice; until that
+    plumbing is normalized, providing the small fields directly preserves
+    voice selection (regression discovered on Buildkite 9668:
+    ``test_speaker_002[default]`` lost the preset voice).
     """
     talker_inputs: list[OmniTokensPrompt] = []
     for i, thinker_output in enumerate(source_outputs):
@@ -685,10 +692,21 @@ def thinker2talker_token_only(
             thinker_input_ids = prompt_token_ids
         info_for_len = {"ids": {"all": thinker_sequences, "prompt": thinker_input_ids}}
         prompt_len = _compute_talker_prompt_ids_length(info_for_len, device="cpu")
+
+        # Forward only small voice metadata; bulk tensors come from the
+        # connector path via _sync_local_stage_payloads.
+        small_info: dict[str, Any] = {}
+        speaker = extract_speaker_from_prompt(prompt, index=i)
+        if speaker is not None:
+            small_info["speaker"] = speaker
+        language = extract_language_from_prompt(prompt, index=i)
+        if language is not None:
+            small_info["language"] = language
+
         talker_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[0] * prompt_len,
-                additional_information=None,
+                additional_information=(small_info if small_info else None),
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
             )

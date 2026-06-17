@@ -542,12 +542,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if hasattr(self, "_omni_connector"):
             for request in getattr(scheduler_output, "pending_input_registrations", []):
                 self.register_chunk_recv(request)
-            self.recv_full_payload_inputs(scheduler_output)
+            with record_function_or_nullcontext("omni_connector: recv_full_payload_inputs"):
+                self.recv_full_payload_inputs(scheduler_output)
             if self._pending_full_payload_send:
                 flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
                 flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
                 if flush_ids:
-                    self.flush_full_payload_outputs(flush_ids)
+                    with record_function_or_nullcontext("omni_connector: flush_full_payload_outputs"):
+                        self.flush_full_payload_outputs(flush_ids)
 
         if self.omni_prefix_cache is not None and scheduler_output.finished_req_ids:
             self.omni_prefix_cache.commit_deferred_mm_outputs(
@@ -1324,7 +1326,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 cudagraph_stats=cudagraph_stats,
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
-            output.omni_connector_output = self.get_omni_connector_output()
+            with record_function_or_nullcontext("omni_connector: get_omni_connector_output"):
+                output.omni_connector_output = self.get_omni_connector_output()
             output.routed_experts = routed_experts_lists
 
         if not self.use_async_scheduling:

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
+from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
@@ -561,10 +562,12 @@ class OmniConnectorModelRunnerMixin:
         """Receive one ordinary non-KV stage payload on the local leader rank only."""
         tp_group = self._get_local_tp_group()
         if tp_group is None or getattr(tp_group, "world_size", 1) <= 1:
-            return connector.get(from_stage, to_stage, connector_get_key)
+            with record_function_or_nullcontext("omni_connector: connector.get"):
+                return connector.get(from_stage, to_stage, connector_get_key)
         if not self.is_data_transfer_rank():
             return None
-        return connector.get(from_stage, to_stage, connector_get_key)
+        with record_function_or_nullcontext("omni_connector: connector.get"):
+            return connector.get(from_stage, to_stage, connector_get_key)
 
     def _recv_full_payload_result(
         self,
@@ -1968,12 +1971,13 @@ class OmniConnectorModelRunnerMixin:
             )
         put_key = task.get("put_key")
 
-        success, _size, _metadata = connector.put(
-            from_stage=str(task["stage_id"]),
-            to_stage=str(task["next_stage_id"]),
-            put_key=put_key,
-            data=payload_data,
-        )
+        with record_function_or_nullcontext("omni_connector: connector.put"):
+            success, _size, _metadata = connector.put(
+                from_stage=str(task["stage_id"]),
+                to_stage=str(task["next_stage_id"]),
+                put_key=put_key,
+                data=payload_data,
+            )
         logger.debug(
             "[Stage-%s] _send_single_request: put_key=%s success=%s size=%s",
             task["stage_id"],

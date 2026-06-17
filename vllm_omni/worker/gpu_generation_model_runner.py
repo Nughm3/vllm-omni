@@ -113,12 +113,14 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         if hasattr(self, "_omni_connector"):
             for request in getattr(scheduler_output, "pending_input_registrations", []):
                 self.register_chunk_recv(request)
-            self.recv_full_payload_inputs(scheduler_output)
+            with record_function_or_nullcontext("omni_connector: recv_full_payload_inputs"):
+                self.recv_full_payload_inputs(scheduler_output)
             if self._pending_full_payload_send:
                 flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
                 flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
                 if flush_ids:
-                    self.flush_full_payload_outputs(flush_ids)
+                    with record_function_or_nullcontext("omni_connector: flush_full_payload_outputs"):
+                        self.flush_full_payload_outputs(flush_ids)
 
         if self.routed_experts_initialized:
             capturer = self.routed_experts_capturer
@@ -477,7 +479,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             cudagraph_stats=cudagraph_stats,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
         )
-        output.omni_connector_output = self.get_omni_connector_output()
+        with record_function_or_nullcontext("omni_connector: get_omni_connector_output"):
+            output.omni_connector_output = self.get_omni_connector_output()
         output.routed_experts = routed_experts_lists
 
         if not self.use_async_scheduling:

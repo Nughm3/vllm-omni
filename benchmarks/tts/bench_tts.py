@@ -57,8 +57,9 @@ _TASK_TO_DATASET: dict[str, str] = {
     "sound_effect": "sound-effect",
 }
 
-# Default design dataset path (bundled with the repo)
+# Default bundled dataset paths
 _DEFAULT_DESIGN_DATASET_PATH = str(_REPO_ROOT / "benchmarks" / "build_dataset" / "seed_tts_design")
+_DEFAULT_SMOKE_DATASET_PATH = str(_REPO_ROOT / "benchmarks" / "build_dataset" / "seed_tts_smoke")
 
 
 def load_model_configs(path: Path) -> dict[str, Any]:
@@ -96,6 +97,8 @@ def build_bench_args(
         resolved_dataset_path = dataset_path
     elif task == "voice_design":
         resolved_dataset_path = _DEFAULT_DESIGN_DATASET_PATH
+    elif task == "default_voice":
+        resolved_dataset_path = _DEFAULT_SMOKE_DATASET_PATH
     else:
         resolved_dataset_path = None
 
@@ -240,6 +243,12 @@ def main() -> None:
         "--dataset-path", default=None, help="Root of seed-tts-eval dataset (required for voice_clone/default_voice)"
     )
     parser.add_argument("--wer-eval", action="store_true", help="Enable WER/SIM/UTMOS quality eval")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable torch profiler via /start_profile + /stop_profile. "
+        "Requires the server to be started with --profiler-config.torch_profiler_dir.",
+    )
     parser.add_argument("--output-dir", default=None, help="Directory to save result JSON files")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8000)
@@ -293,6 +302,9 @@ def main() -> None:
         for concurrency, num_prompts in zip(args.concurrency, num_prompts_list):
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             result_filename = f"bench_tts_{args.model.replace('/', '_')}_{task}_c{concurrency}_{ts}.json"
+            extra = list(args.extra or [])
+            if args.profile:
+                extra.append("--profile")
             cmd = build_bench_args(
                 host=args.host,
                 port=args.port,
@@ -306,7 +318,7 @@ def main() -> None:
                 wer_eval=args.wer_eval,
                 output_dir=args.output_dir,
                 result_filename=result_filename,
-                extra_cli_args=args.extra or [],
+                extra_cli_args=extra,
                 output_len=args.output_len,
             )
             result = run_one_benchmark(cmd)

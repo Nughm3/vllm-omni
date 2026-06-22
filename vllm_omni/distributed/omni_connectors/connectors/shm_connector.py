@@ -11,7 +11,7 @@ from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
 from ..utils.logging import get_connector_logger
 from .base import OmniConnectorBase
 
-from vllm.v1.utils import record_function_or_nullcontext
+from vllm_omni.profiler.pr2_record_function import record_function_or_nullcontext
 
 logger = get_connector_logger(__name__)
 

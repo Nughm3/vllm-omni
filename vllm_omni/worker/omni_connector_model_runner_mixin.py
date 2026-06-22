@@ -33,7 +33,7 @@ from vllm_omni.worker.payload_span import (
     merge_tensor_spans,
 )
 
-from vllm.v1.utils import record_function_or_nullcontext
+from vllm_omni.profiler.pr2_record_function import record_function_or_nullcontext
 
 _EMBED_SPAN_GROUPS: tuple[tuple[str, str, str], ...] = (("decode", "decode_token_start", "decode_token_end"),)
 

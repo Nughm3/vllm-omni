@@ -654,26 +654,27 @@ class OmniConnectorModelRunnerMixin:
             tp_group is None or getattr(tp_group, "world_size", 1) <= 1
         ) and not self._full_payload_pending_broadcast_req_ids:
             return None
-        with self._lock:
-            results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
-        results = self._broadcast_tp_payload_packet(results)
-        if not results:
-            return None
-        with self._lock:
-            self._stage_recv_req_ids.update(results.keys())
-            for req_id in results:
-                self._pending_load_reqs.pop(req_id, None)
-            self._apply_staged_payloads_locked(results)
-            for req_id, payload in results.items():
-                self._local_request_metadata[req_id] = self._extract_scheduling_metadata(payload)
-        logger.info(
-            "[Stage-%s] recv_full_payload_inputs: consumed %s reqs: %s, stage_recv_req_ids now=%s",
-            self._stage_id,
-            len(results),
-            list(results.keys()),
-            self._stage_recv_req_ids,
-        )
-        return results
+        with record_function_or_nullcontext(f"PR2 after: recv_full_payload_inputs s{self._stage_id}"):
+            with self._lock:
+                results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
+            results = self._broadcast_tp_payload_packet(results)
+            if not results:
+                return None
+            with self._lock:
+                self._stage_recv_req_ids.update(results.keys())
+                for req_id in results:
+                    self._pending_load_reqs.pop(req_id, None)
+                self._apply_staged_payloads_locked(results)
+                for req_id, payload in results.items():
+                    self._local_request_metadata[req_id] = self._extract_scheduling_metadata(payload)
+            logger.info(
+                "[Stage-%s] recv_full_payload_inputs: consumed %s reqs: %s, stage_recv_req_ids now=%s",
+                self._stage_id,
+                len(results),
+                list(results.keys()),
+                self._stage_recv_req_ids,
+            )
+            return results
 
     def _get_model_config(self) -> Any:
         model_config = getattr(self, "model_config", None)
@@ -733,6 +734,27 @@ class OmniConnectorModelRunnerMixin:
                 output[k] = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
         return output, request
 
+    @staticmethod
+    def _pr2_pooler_dict_summary(pooler_output: Any) -> str:
+        if not isinstance(pooler_output, dict):
+            return type(pooler_output).__name__
+        parts: list[str] = []
+        for key, value in sorted(pooler_output.items()):
+            if isinstance(value, torch.Tensor):
+                if value.dim() >= 2:
+                    parts.append(f"{key}:{int(value.shape[0])}")
+                else:
+                    parts.append(f"{key}:t")
+            else:
+                parts.append(str(key))
+        return " ".join(parts) if parts else "empty"
+
+    @staticmethod
+    def _pr2_row_counts_summary(rows: dict[str, int] | None) -> str:
+        if not rows:
+            return ""
+        return " acc=" + " ".join(f"{k}:{v}" for k, v in sorted(rows.items()))
+
     def accumulate_full_payload_output(
         self,
         req_id: str,
@@ -756,34 +778,40 @@ class OmniConnectorModelRunnerMixin:
         with the finished request IDs from the next scheduler cycle.
         """
         existing = self._pending_full_payload_send.get(req_id)
+        acc_rows = existing[2] if existing is not None and len(existing) == 4 else None
+        in_summary = self._pr2_pooler_dict_summary(pooler_output)
+        acc_summary = self._pr2_row_counts_summary(acc_rows)
+        with record_function_or_nullcontext(
+            f"PR2 after: accumulate_full_payload s{self._stage_id} {req_id} "
+            f"in={in_summary}{acc_summary}"
+        ):
+            if existing is None:
+                chunks, latest, rows = self._new_full_payload_accumulator(pooler_output)
+                self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
+                return
 
-        if existing is None:
-            chunks, latest, rows = self._new_full_payload_accumulator(pooler_output)
-            self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
-            return
-
-        if len(existing) == 2:
-            chunks, latest, rows = self._new_full_payload_accumulator(existing[0])
-        else:
-            chunks, latest, rows, _ = existing
-
-        for k, v in pooler_output.items():
-            if v is None:
-                continue
-            if isinstance(v, torch.Tensor) and v.dim() >= 2:
-                if k in chunks and chunks[k] and v.shape[1:] == chunks[k][0].shape[1:]:
-                    chunks[k].append(v)
-                    rows[k] += int(v.shape[0])
-                else:
-                    latest.pop(k, None)
-                    chunks[k] = [v]
-                    rows[k] = int(v.shape[0])
+            if len(existing) == 2:
+                chunks, latest, rows = self._new_full_payload_accumulator(existing[0])
             else:
-                chunks.pop(k, None)
-                rows.pop(k, None)
-                latest[k] = v
+                chunks, latest, rows, _ = existing
 
-        self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
+            for k, v in pooler_output.items():
+                if v is None:
+                    continue
+                if isinstance(v, torch.Tensor) and v.dim() >= 2:
+                    if k in chunks and chunks[k] and v.shape[1:] == chunks[k][0].shape[1:]:
+                        chunks[k].append(v)
+                        rows[k] += int(v.shape[0])
+                    else:
+                        latest.pop(k, None)
+                        chunks[k] = [v]
+                        rows[k] = int(v.shape[0])
+                else:
+                    chunks.pop(k, None)
+                    rows.pop(k, None)
+                    latest[k] = v
+
+            self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
 
     def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
         """Send accumulated full_payload outputs for requests that just finished."""
@@ -797,7 +825,14 @@ class OmniConnectorModelRunnerMixin:
         for req_id in finished_req_ids:
             entry = self._pending_full_payload_send.pop(req_id, None)
             if entry is not None:
-                to_send[req_id] = self._materialize_full_payload_entry(entry)
+                if len(entry) == 4:
+                    row_summary = self._pr2_row_counts_summary(entry[2])
+                else:
+                    row_summary = f" keys={self._pr2_pooler_dict_summary(entry[0])}"
+                with record_function_or_nullcontext(
+                    f"PR2 after: materialize_full_payload s{self._stage_id} {req_id}{row_summary}"
+                ):
+                    to_send[req_id] = self._materialize_full_payload_entry(entry)
         logger.info("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
         if to_send:
             self.send_full_payload_outputs(scheduler_output=None, outputs=to_send)
@@ -884,9 +919,14 @@ class OmniConnectorModelRunnerMixin:
                 "data": payload,
                 "request_id": req_id,
             }
-            with self._lock:
-                self._pending_save_reqs.setdefault(req_id, deque()).append(task)
-                self._pending_save_counts[req_id] += 1
+            payload_summary = self._pr2_pooler_dict_summary(payload)
+            with record_function_or_nullcontext(
+                f"PR2 after: send_full_payload_enqueue s{self._stage_id}->{next_stage_id} "
+                f"{req_id} {connector_put_key} {payload_summary}"
+            ):
+                with self._lock:
+                    self._pending_save_reqs.setdefault(req_id, deque()).append(task)
+                    self._pending_save_counts[req_id] += 1
             sent_ids.append(req_id)
         if sent_ids:
             self._work_available.set()
@@ -1771,21 +1811,25 @@ class OmniConnectorModelRunnerMixin:
             except Exception:
                 logger.debug("request.is_finished() failed for %s", request_id, exc_info=True)
 
-        try:
-            return self._custom_process_func(**kwargs)
-        except TypeError as exc:
-            if "is_finished" not in kwargs or not self._is_unexpected_is_finished_kwarg_error(exc):
-                logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
-                return None
-            kwargs.pop("is_finished", None)
+        in_summary = self._pr2_pooler_dict_summary(pooling_output)
+        with record_function_or_nullcontext(
+            f"PR2 after: build_custom_process_payload s{self._stage_id} {request_id} in={in_summary}"
+        ):
             try:
                 return self._custom_process_func(**kwargs)
+            except TypeError as exc:
+                if "is_finished" not in kwargs or not self._is_unexpected_is_finished_kwarg_error(exc):
+                    logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
+                    return None
+                kwargs.pop("is_finished", None)
+                try:
+                    return self._custom_process_func(**kwargs)
+                except Exception:
+                    logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
+                    return None
             except Exception:
                 logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
                 return None
-        except Exception:
-            logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
-            return None
 
     def _custom_process_supports_is_finished_kwarg(self) -> bool | None:
         """Return whether the custom process hook accepts `is_finished`."""

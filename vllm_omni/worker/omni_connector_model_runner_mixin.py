@@ -33,6 +33,8 @@ from vllm_omni.worker.payload_span import (
     merge_tensor_spans,
 )
 
+from vllm.v1.utils import record_function_or_nullcontext
+
 _EMBED_SPAN_GROUPS: tuple[tuple[str, str, str], ...] = (("decode", "decode_token_start", "decode_token_end"),)
 
 if TYPE_CHECKING:
@@ -510,12 +512,14 @@ class OmniConnectorModelRunnerMixin:
         connector_get_key: str,
     ) -> Any:
         """Receive one full-payload transfer on the local leader rank only."""
-        return self._recv_ordinary_stage_result(
-            connector,
-            from_stage,
-            to_stage,
-            connector_get_key,
-        )
+        with record_function_or_nullcontext("PR2 before: get"):
+            result = self._recv_ordinary_stage_result(
+                connector,
+                from_stage,
+                to_stage,
+                connector_get_key,
+            )
+        return result
 
     def _recv_async_chunk_result(
         self,
@@ -1769,12 +1773,13 @@ class OmniConnectorModelRunnerMixin:
             )
         put_key = task.get("put_key")
 
-        success, _size, _metadata = connector.put(
-            from_stage=str(task["stage_id"]),
-            to_stage=str(task["next_stage_id"]),
-            put_key=put_key,
-            data=payload_data,
-        )
+        with record_function_or_nullcontext("PR2 before: put"):
+            success, _size, _metadata = connector.put(
+                from_stage=str(task["stage_id"]),
+                to_stage=str(task["next_stage_id"]),
+                put_key=put_key,
+                data=payload_data,
+            )
         logger.info(
             "[Stage-%s] _send_single_request: put_key=%s success=%s size=%s",
             task["stage_id"],

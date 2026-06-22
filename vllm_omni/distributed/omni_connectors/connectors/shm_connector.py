@@ -11,6 +11,8 @@ from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
 from ..utils.logging import get_connector_logger
 from .base import OmniConnectorBase
 
+from vllm.v1.utils import record_function_or_nullcontext
+
 logger = get_connector_logger(__name__)
 
 
@@ -50,17 +52,20 @@ class SharedMemoryConnector(OmniConnectorBase):
             # Note: For extremely large objects in "inline" mode (e.g. Ray),
             # we might double-serialize if we're not careful, but here we assume
             # if it's huge we use SHM, or if Ray, threshold is maxsize.
-            payload = self.serialize_obj(data)
+            with record_function_or_nullcontext("PR2 after: shm_put_serialize"):
+                payload = self.serialize_obj(data)
             size = len(payload)
 
             # Currently, we always use SHM.
             if True:
                 # Use Shared Memory
                 lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
-                with open(lock_file, "wb+") as lockf:
-                    fcntl.flock(lockf, fcntl.LOCK_EX)
-                    meta = shm_write_bytes(payload, name=put_key)
-                    fcntl.flock(lockf, fcntl.LOCK_UN)
+                with record_function_or_nullcontext("PR2 after: shm_put_transfer"):
+                    with open(lock_file, "wb+") as lockf:
+                        fcntl.flock(lockf, fcntl.LOCK_EX)
+                        with record_function_or_nullcontext("PR2 after: shm_put_write_bytes"):
+                            meta = shm_write_bytes(payload, name=put_key)
+                        fcntl.flock(lockf, fcntl.LOCK_UN)
 
                 # meta contains {'name': ..., 'size': ...}
                 metadata = {"shm": meta, "size": size}
@@ -85,11 +90,14 @@ class SharedMemoryConnector(OmniConnectorBase):
     def _get_data_with_lock(self, lock_file: str, shm_handle: dict):
         obj = None
         try:
-            with open(lock_file, "rb+") as lockf:
-                fcntl.flock(lockf, fcntl.LOCK_EX)
-                data_bytes = shm_read_bytes(shm_handle)
-                fcntl.flock(lockf, fcntl.LOCK_UN)
-            obj = self.deserialize_obj(data_bytes)
+            with record_function_or_nullcontext("PR2 after: shm_get_transfer"):
+                with open(lock_file, "rb+") as lockf:
+                    fcntl.flock(lockf, fcntl.LOCK_EX)
+                    with record_function_or_nullcontext("PR2 after: shm_get_read_bytes"):
+                        data_bytes = shm_read_bytes(shm_handle)
+                    fcntl.flock(lockf, fcntl.LOCK_UN)
+            with record_function_or_nullcontext("PR2 after: shm_get_deserialize"):
+                obj = self.deserialize_obj(data_bytes)
             return obj, int(shm_handle.get("size", 0))
         except Exception as e:
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")

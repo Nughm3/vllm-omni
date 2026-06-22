@@ -512,7 +512,7 @@ class OmniConnectorModelRunnerMixin:
         connector_get_key: str,
     ) -> Any:
         """Receive one full-payload transfer on the local leader rank only."""
-        with record_function_or_nullcontext("PR2 before: get"):
+        with record_function_or_nullcontext(f"PR2 before: get {from_stage}->{to_stage} {connector_get_key}"):
             result = self._recv_ordinary_stage_result(
                 connector,
                 from_stage,
@@ -1773,7 +1773,7 @@ class OmniConnectorModelRunnerMixin:
             )
         put_key = task.get("put_key")
 
-        with record_function_or_nullcontext("PR2 before: put"):
+        with record_function_or_nullcontext(f"PR2 before: put {task['stage_id']}->{task['next_stage_id']} {put_key}"):
             success, _size, _metadata = connector.put(
                 from_stage=str(task["stage_id"]),
                 to_stage=str(task["next_stage_id"]),

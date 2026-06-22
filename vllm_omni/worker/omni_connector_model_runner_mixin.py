@@ -632,26 +632,48 @@ class OmniConnectorModelRunnerMixin:
         that has arrived, or ``None`` if nothing is ready.  Stores full
         payloads in the local cache and extracts scheduling metadata.
         """
-        with self._lock:
-            results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
-        results = self._broadcast_tp_payload_packet(results)
-        if not results:
-            return None
-        with self._lock:
-            self._stage_recv_req_ids.update(results.keys())
-            for req_id in results:
-                self._pending_load_reqs.pop(req_id, None)
-            self._apply_staged_payloads_locked(results)
-            for req_id, payload in results.items():
-                self._local_request_metadata[req_id] = self._extract_scheduling_metadata(payload)
-        logger.info(
-            "[Stage-%s] recv_full_payload_inputs: consumed %s reqs: %s, stage_recv_req_ids now=%s",
-            self._stage_id,
-            len(results),
-            list(results.keys()),
-            self._stage_recv_req_ids,
-        )
-        return results
+        with record_function_or_nullcontext(f"PR2 before: recv_full_payload_inputs s{self._stage_id}"):
+            with self._lock:
+                results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
+            results = self._broadcast_tp_payload_packet(results)
+            if not results:
+                return None
+            with self._lock:
+                self._stage_recv_req_ids.update(results.keys())
+                for req_id in results:
+                    self._pending_load_reqs.pop(req_id, None)
+                self._apply_staged_payloads_locked(results)
+                for req_id, payload in results.items():
+                    self._local_request_metadata[req_id] = self._extract_scheduling_metadata(payload)
+            logger.info(
+                "[Stage-%s] recv_full_payload_inputs: consumed %s reqs: %s, stage_recv_req_ids now=%s",
+                self._stage_id,
+                len(results),
+                list(results.keys()),
+                self._stage_recv_req_ids,
+            )
+            return results
+
+    @staticmethod
+    def _pr2_pooler_dict_summary(pooler_output: Any) -> str:
+        if not isinstance(pooler_output, dict):
+            return type(pooler_output).__name__
+        parts: list[str] = []
+        for key, value in sorted(pooler_output.items()):
+            if isinstance(value, torch.Tensor):
+                if value.dim() >= 2:
+                    parts.append(f"{key}:{int(value.shape[0])}")
+                else:
+                    parts.append(f"{key}:t")
+            else:
+                parts.append(str(key))
+        return " ".join(parts) if parts else "empty"
+
+    @staticmethod
+    def _pr2_row_counts_summary(rows: dict[str, int] | None) -> str:
+        if not rows:
+            return ""
+        return " acc=" + " ".join(f"{k}:{v}" for k, v in sorted(rows.items()))
 
     @staticmethod
     def _is_all_zero_tensor(t: Any) -> bool:
@@ -677,48 +699,52 @@ class OmniConnectorModelRunnerMixin:
         The data is actually sent when ``flush_full_payload_outputs`` is called
         with the finished request IDs from the next scheduler cycle.
         """
-        # ---- Filter out all-zero tensors from the incoming pooler_output ----
-        filtered: dict[str, Any] = {}
-        dropped_zero_keys: list[tuple[str, tuple[int, ...]]] = []
-        for k, v in pooler_output.items():
-            if self._is_all_zero_tensor(v):
-                dropped_zero_keys.append((k, tuple(v.shape)))
-                continue  # skip prefill zero-filled placeholders
-            filtered[k] = v
-        if dropped_zero_keys:
-            logger.info(
-                "[Stage-%s] accumulate_full_payload_output: req=%s dropped_zero_keys=%s",
-                self._stage_id,
-                req_id,
-                dropped_zero_keys,
-            )
-        pooler_output = filtered
+        in_summary = self._pr2_pooler_dict_summary(pooler_output)
+        with record_function_or_nullcontext(
+            f"PR2 before: accumulate_full_payload s{self._stage_id} {req_id} in={in_summary}"
+        ):
+            # ---- Filter out all-zero tensors from the incoming pooler_output ----
+            filtered: dict[str, Any] = {}
+            dropped_zero_keys: list[tuple[str, tuple[int, ...]]] = []
+            for k, v in pooler_output.items():
+                if self._is_all_zero_tensor(v):
+                    dropped_zero_keys.append((k, tuple(v.shape)))
+                    continue  # skip prefill zero-filled placeholders
+                filtered[k] = v
+            if dropped_zero_keys:
+                logger.info(
+                    "[Stage-%s] accumulate_full_payload_output: req=%s dropped_zero_keys=%s",
+                    self._stage_id,
+                    req_id,
+                    dropped_zero_keys,
+                )
+            pooler_output = filtered
 
-        existing = self._pending_full_payload_send.get(req_id)
-        if existing is None:
-            self._pending_full_payload_send[req_id] = (pooler_output, request)
-            return
+            existing = self._pending_full_payload_send.get(req_id)
+            if existing is None:
+                self._pending_full_payload_send[req_id] = (pooler_output, request)
+                return
 
-        prev_output, _ = existing
-        merged: dict[str, Any] = {}
-        for k in set(prev_output) | set(pooler_output):
-            v_new = pooler_output.get(k)
-            v_old = prev_output.get(k)
-            if v_new is None:
-                merged[k] = v_old
-            elif v_old is None:
-                merged[k] = v_new
-            elif (
-                isinstance(v_new, torch.Tensor)
-                and isinstance(v_old, torch.Tensor)
-                and v_new.dim() >= 2
-                and v_old.dim() >= 2
-                and v_new.shape[1:] == v_old.shape[1:]
-            ):
-                merged[k] = torch.cat([v_old, v_new], dim=0)
-            else:
-                merged[k] = v_new
-        self._pending_full_payload_send[req_id] = (merged, request)
+            prev_output, _ = existing
+            merged: dict[str, Any] = {}
+            for k in set(prev_output) | set(pooler_output):
+                v_new = pooler_output.get(k)
+                v_old = prev_output.get(k)
+                if v_new is None:
+                    merged[k] = v_old
+                elif v_old is None:
+                    merged[k] = v_new
+                elif (
+                    isinstance(v_new, torch.Tensor)
+                    and isinstance(v_old, torch.Tensor)
+                    and v_new.dim() >= 2
+                    and v_old.dim() >= 2
+                    and v_new.shape[1:] == v_old.shape[1:]
+                ):
+                    merged[k] = torch.cat([v_old, v_new], dim=0)
+                else:
+                    merged[k] = v_new
+            self._pending_full_payload_send[req_id] = (merged, request)
 
     def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
         """Send accumulated full_payload outputs for requests that just finished."""
@@ -732,7 +758,12 @@ class OmniConnectorModelRunnerMixin:
         for req_id in finished_req_ids:
             entry = self._pending_full_payload_send.pop(req_id, None)
             if entry is not None:
-                to_send[req_id] = entry
+                raw_output = entry[0] if isinstance(entry, tuple) else entry
+                keys_summary = self._pr2_pooler_dict_summary(raw_output)
+                with record_function_or_nullcontext(
+                    f"PR2 before: materialize_full_payload s{self._stage_id} {req_id} keys={keys_summary}"
+                ):
+                    to_send[req_id] = entry
         logger.info("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
         if to_send:
             self.send_full_payload_outputs(scheduler_output=None, outputs=to_send)
@@ -819,9 +850,14 @@ class OmniConnectorModelRunnerMixin:
                 "data": payload,
                 "request_id": req_id,
             }
-            with self._lock:
-                self._pending_save_reqs.setdefault(req_id, deque()).append(task)
-                self._pending_save_counts[req_id] += 1
+            payload_summary = self._pr2_pooler_dict_summary(payload)
+            with record_function_or_nullcontext(
+                f"PR2 before: send_full_payload_enqueue s{self._stage_id}->{next_stage_id} "
+                f"{req_id} {connector_put_key} {payload_summary}"
+            ):
+                with self._lock:
+                    self._pending_save_reqs.setdefault(req_id, deque()).append(task)
+                    self._pending_save_counts[req_id] += 1
             sent_ids.append(req_id)
         if sent_ids:
             self._work_available.set()
@@ -1706,21 +1742,25 @@ class OmniConnectorModelRunnerMixin:
             except Exception:
                 logger.debug("request.is_finished() failed for %s", request_id, exc_info=True)
 
-        try:
-            return self._custom_process_func(**kwargs)
-        except TypeError as exc:
-            if "is_finished" not in kwargs or not self._is_unexpected_is_finished_kwarg_error(exc):
-                logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
-                return None
-            kwargs.pop("is_finished", None)
+        in_summary = self._pr2_pooler_dict_summary(pooling_output)
+        with record_function_or_nullcontext(
+            f"PR2 before: build_custom_process_payload s{self._stage_id} {request_id} in={in_summary}"
+        ):
             try:
                 return self._custom_process_func(**kwargs)
+            except TypeError as exc:
+                if "is_finished" not in kwargs or not self._is_unexpected_is_finished_kwarg_error(exc):
+                    logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
+                    return None
+                kwargs.pop("is_finished", None)
+                try:
+                    return self._custom_process_func(**kwargs)
+                except Exception:
+                    logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
+                    return None
             except Exception:
                 logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
                 return None
-        except Exception:
-            logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
-            return None
 
     def _custom_process_supports_is_finished_kwarg(self) -> bool | None:
         """Return whether the custom process hook accepts `is_finished`."""

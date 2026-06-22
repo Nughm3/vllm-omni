@@ -784,21 +784,19 @@ def merge_pipeline_deploy(
     if len(pipeline.stages) <= 1:
         deploy.async_chunk = False
 
-    # A pipeline supports async_chunk if any stage has either an explicit
-    # async-chunk-only processor slot OR a custom next-stage processor (some
-    # pipelines like qwen3_omni wire async-chunk processing directly through
-    # ``custom_process_next_stage_input_func``). Only raise when neither is
-    # present — that's the "user enabled async_chunk but pipeline has no
-    # inter-stage processing at all" case.
-    if deploy.async_chunk and not any(
-        ps.async_chunk_process_next_stage_input_func or ps.custom_process_next_stage_input_func
-        for ps in pipeline.stages
-    ):
+    # A pipeline supports async_chunk only when at least one stage declares a
+    # dedicated per-step async producer (``async_chunk_process_next_stage_input_func``).
+    # ``custom_process_next_stage_input_func`` is the full-payload / connector-path
+    # producer and does NOT imply async_chunk support — pipelines like qwen2_5_omni
+    # and covo_audio have it but removed their consumer-side ``custom_process_input_func``
+    # because they don't support async_chunk, so accepting them here would silently
+    # miswire the consumer stage instead of raising a clear error.
+    if deploy.async_chunk and not any(ps.async_chunk_process_next_stage_input_func for ps in pipeline.stages):
         raise ValueError(
             f"Pipeline {pipeline.model_type!r} has async_chunk=True in deploy but no stage "
-            "declares a next-stage input processor "
-            "(``async_chunk_process_next_stage_input_func`` or ``custom_process_next_stage_input_func``). "
-            "Either set async_chunk=False or implement an async-chunk processor on the pipeline."
+            "declares a dedicated async-chunk next-stage processor "
+            "(``async_chunk_process_next_stage_input_func``). "
+            "Either set async_chunk=False or implement an async-chunk producer on the pipeline."
         )
 
     result: list[StageConfig] = []

@@ -25,6 +25,9 @@ from vllm_omni.distributed.omni_connectors.utils.initialization import (
 )
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
+from vllm_omni.profiler.pr2_record_function import (
+    record_function_or_nullcontext as pr2_record_function,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutput
@@ -403,19 +406,21 @@ class StageEngineCoreClientBase(StageClientBase):
         and the original prompt.
         """
         if self.custom_process_input_func is not None:
-            signature = inspect.signature(self.custom_process_input_func)
-            if len(signature.parameters) >= 4:
+            func_name = getattr(self.custom_process_input_func, "__name__", type(self.custom_process_input_func).__name__)
+            with pr2_record_function(f"PR2 before-old: {func_name} stage{self.stage_id}"):
+                signature = inspect.signature(self.custom_process_input_func)
+                if len(signature.parameters) >= 4:
+                    return self.custom_process_input_func(
+                        source_outputs,
+                        prompt,
+                        self.requires_multimodal_data,
+                        streaming_context,
+                    )
                 return self.custom_process_input_func(
                     source_outputs,
                     prompt,
                     self.requires_multimodal_data,
-                    streaming_context,
                 )
-            return self.custom_process_input_func(
-                source_outputs,
-                prompt,
-                self.requires_multimodal_data,
-            )
 
         if not self.engine_input_source:
             raise ValueError(f"engine_input_source empty for stage {self.stage_id}")

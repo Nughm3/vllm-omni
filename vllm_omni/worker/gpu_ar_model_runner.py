@@ -41,6 +41,9 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.profiler.pr2_record_function import (
+    record_function_or_nullcontext as pr2_record_function,
+)
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -926,65 +929,69 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     end = start + sched
                     req_hidden_states_cpu[rid] = hidden_states[start:end].detach().to("cpu").contiguous()
 
-            pooler_output = []
-            for rid in req_ids_output_copy:
-                if rid not in downstream_req_id_set:
-                    pooler_output.append({})
-                    continue
-                idx = req_id_to_index_output_copy[rid]
-                start = int(query_start_loc_cpu[idx])
-                sched = int(num_scheduled_tokens_np[idx])
-                end = start + sched
-                # If prefix cache is enabled, we have already split everything
-                # by request and converted the states to CPU tensors
-                if req_hidden_states_cpu is not None and combined_hidden_states is None:
-                    req_hidden_states = req_hidden_states_cpu[rid]
-                else:
-                    req_hidden_states = self._resolve_req_hidden_states(
-                        hidden_states_cpu,
-                        combined_hidden_states,
-                        rid,
-                        start,
-                        end,
-                    )
-                payload: dict[str, object] = {"hidden": req_hidden_states}
-
-                mm_payload: dict[str, object] = {}
-                if combined_multimodal_outputs or mm_cpu:
-                    if combined_multimodal_outputs:
-                        # Prefix cache enabled; all items have already been processed
-                        # and split apart for each request as needed, and all tensors
-                        # have already been detached to the CPU.  Lists are kept as
-                        # passthrough data for consistent behavior in postprocess.
-                        # Recurse into nested dicts so list-valued sub-keys (e.g.
-                        # embed.tts_bos = [tensor]) are unwrapped to bare tensors
-                        # at the leaves; downstream flatten_payload then yields a
-                        # wire-clean dict[str, torch.Tensor].
-                        def _unwrap_lists(v):
-                            if isinstance(v, list):
-                                return v[idx] if idx < len(v) else v[0]
-                            if isinstance(v, dict):
-                                return {k: _unwrap_lists(sv) for k, sv in v.items()}
-                            return v
-
-                        for mm_key in combined_multimodal_outputs.keys():
-                            mm_payload[mm_key] = _unwrap_lists(combined_multimodal_outputs[mm_key][rid])
-
+            stage_id = getattr(self.model_config, "stage_id", "?")
+            with pr2_record_function(
+                f"PR2 before-old: build_pooler_output s{stage_id} reqs={len(downstream_req_id_set)}"
+            ):
+                pooler_output = []
+                for rid in req_ids_output_copy:
+                    if rid not in downstream_req_id_set:
+                        pooler_output.append({})
+                        continue
+                    idx = req_id_to_index_output_copy[rid]
+                    start = int(query_start_loc_cpu[idx])
+                    sched = int(num_scheduled_tokens_np[idx])
+                    end = start + sched
+                    # If prefix cache is enabled, we have already split everything
+                    # by request and converted the states to CPU tensors
+                    if req_hidden_states_cpu is not None and combined_hidden_states is None:
+                        req_hidden_states = req_hidden_states_cpu[rid]
                     else:
-                        # Prefix cache disabled; we still need to process the data
-                        for mm_key, mm_val in mm_cpu.items():
-                            mm_payload[mm_key] = to_payload_element(
-                                element=mm_val,
-                                idx=idx,
-                                start=start,
-                                end=end,
-                                pass_lists_through=False,
-                                seq_len=seq_len,
-                            )
-                    payload.update(mm_payload)
-                # Flatten nested dicts to dotted keys so pooling_output
-                # stays dict[str, torch.Tensor] for msgspec serialization.
-                pooler_output.append(flatten_payload(payload))
+                        req_hidden_states = self._resolve_req_hidden_states(
+                            hidden_states_cpu,
+                            combined_hidden_states,
+                            rid,
+                            start,
+                            end,
+                        )
+                    payload: dict[str, object] = {"hidden": req_hidden_states}
+
+                    mm_payload: dict[str, object] = {}
+                    if combined_multimodal_outputs or mm_cpu:
+                        if combined_multimodal_outputs:
+                            # Prefix cache enabled; all items have already been processed
+                            # and split apart for each request as needed, and all tensors
+                            # have already been detached to the CPU.  Lists are kept as
+                            # passthrough data for consistent behavior in postprocess.
+                            # Recurse into nested dicts so list-valued sub-keys (e.g.
+                            # embed.tts_bos = [tensor]) are unwrapped to bare tensors
+                            # at the leaves; downstream flatten_payload then yields a
+                            # wire-clean dict[str, torch.Tensor].
+                            def _unwrap_lists(v):
+                                if isinstance(v, list):
+                                    return v[idx] if idx < len(v) else v[0]
+                                if isinstance(v, dict):
+                                    return {k: _unwrap_lists(sv) for k, sv in v.items()}
+                                return v
+
+                            for mm_key in combined_multimodal_outputs.keys():
+                                mm_payload[mm_key] = _unwrap_lists(combined_multimodal_outputs[mm_key][rid])
+
+                        else:
+                            # Prefix cache disabled; we still need to process the data
+                            for mm_key, mm_val in mm_cpu.items():
+                                mm_payload[mm_key] = to_payload_element(
+                                    element=mm_val,
+                                    idx=idx,
+                                    start=start,
+                                    end=end,
+                                    pass_lists_through=False,
+                                    seq_len=seq_len,
+                                )
+                        payload.update(mm_payload)
+                    # Flatten nested dicts to dotted keys so pooling_output
+                    # stays dict[str, torch.Tensor] for msgspec serialization.
+                    pooler_output.append(flatten_payload(payload))
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
                 capturer = RoutedExpertsCapturer.get_instance()

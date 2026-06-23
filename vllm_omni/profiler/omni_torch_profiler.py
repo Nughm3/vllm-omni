@@ -26,6 +26,30 @@ TorchProfilerActivityMap = {
     "MUSA": torch.profiler.ProfilerActivity.CUDA,
 }
 
+_ALLOWED_PROFILER_ACTIVITIES: frozenset[TorchProfilerActivity] = frozenset(
+    {"CPU", "CUDA", "XPU", "NPU", "MUSA"}
+)
+
+
+def _profiler_activities_from_env() -> list[TorchProfilerActivity]:
+    """Parse PROFILER_ACTIVITIES (comma-separated). Default CPU-only for connector spans."""
+    raw = os.environ.get("PROFILER_ACTIVITIES", "CPU").strip()
+    if raw.upper() in ("ALL", "DEFAULT", "CPU,CUDA"):
+        return ["CPU", "CUDA"]
+    activities: list[TorchProfilerActivity] = []
+    for part in raw.split(","):
+        name = part.strip().upper()
+        if not name:
+            continue
+        if name not in _ALLOWED_PROFILER_ACTIVITIES:
+            logger.warning("Ignoring unknown PROFILER_ACTIVITIES value: %s", name)
+            continue
+        activities.append(name)  # type: ignore[arg-type]
+    if not activities:
+        logger.warning("PROFILER_ACTIVITIES empty; falling back to CPU-only")
+        return ["CPU"]
+    return activities
+
 
 class OmniTorchProfilerWrapper(WorkerProfiler):
     """Base torch profiler wrapper with platform-agnostic functionality.
@@ -75,6 +99,12 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
                 self._trace_dir,
                 scope="local",
             )
+            logger.info_once(
+                "Omni torch profiler activities: %s (PROFILER_ACTIVITIES=%r)",
+                ",".join(activities),
+                os.environ.get("PROFILER_ACTIVITIES", "CPU"),
+                scope="local",
+            )
 
         self.dump_cpu_time_total = "CPU" in activities and len(activities) == 1
         self.profiler = self._create_profiler(profiler_config, activities)
@@ -86,8 +116,9 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         """Get default activities for this platform.
 
         Override in subclasses to provide platform-specific defaults.
+        Set PROFILER_ACTIVITIES=CPU (default) or CPU,CUDA / ALL for full traces.
         """
-        return ["CPU", "CUDA"]
+        return _profiler_activities_from_env()
 
     def _create_profiler(
         self,

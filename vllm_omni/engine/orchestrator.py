@@ -39,6 +39,9 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.profiler.pr2_record_function import (
+    record_function_or_nullcontext as pr2_record_function,
+)
 
 logger = init_logger(__name__)
 
@@ -955,11 +958,14 @@ class Orchestrator:
 
         next_client = next_pool.llm_stage_client
         try:
-            next_inputs = next_client.process_engine_inputs(
-                source_outputs,
-                req_state.prompt,
-                streaming_context=req_state.streaming,
-            )
+            with pr2_record_function(
+                f"PR2 before-old: process_engine_inputs s{src_stage_id}->{next_logical} {req_id}"
+            ):
+                next_inputs = next_client.process_engine_inputs(
+                    source_outputs,
+                    req_state.prompt,
+                    streaming_context=req_state.streaming,
+                )
         except Exception:
             logger.exception(
                 "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",
@@ -970,24 +976,27 @@ class Orchestrator:
 
         # Build and submit requests for each input
         for next_input in next_inputs:
-            # Only AR thinker stages consume encoder mm_features; downstream
-            # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
-            model_stage = next_client.model_stage
-            mm_features = req_state.mm_features if model_stage == "thinker" else None
-            request = build_engine_core_request_from_tokens(
-                request_id=req_id,
-                prompt=next_input,
-                params=params,
-                model_config=next_pool.stage_vllm_config.model_config,
-                mm_features=mm_features,
-                resumable=next_stage_resumable,
-            )
+            with pr2_record_function(
+                f"PR2 before-old: submit_next_stage_request s{src_stage_id}->{next_logical} {req_id}"
+            ):
+                # Only AR thinker stages consume encoder mm_features; downstream
+                # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
+                model_stage = next_client.model_stage
+                mm_features = req_state.mm_features if model_stage == "thinker" else None
+                request = build_engine_core_request_from_tokens(
+                    request_id=req_id,
+                    prompt=next_input,
+                    params=params,
+                    model_config=next_pool.stage_vllm_config.model_config,
+                    mm_features=mm_features,
+                    resumable=next_stage_resumable,
+                )
 
-            request.external_req_id = request.request_id
-            if already_submitted:
-                await next_pool.submit_update(req_id, req_state, request)
-            else:
-                await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                request.external_req_id = request.request_id
+                if already_submitted:
+                    await next_pool.submit_update(req_id, req_state, request)
+                else:
+                    await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
         req_state.stage_submit_ts[next_logical] = _time.time()
 

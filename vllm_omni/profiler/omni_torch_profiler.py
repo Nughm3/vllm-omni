@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 import torch
+from torch.autograd.profiler_util import EventList
 from typing_extensions import override
 from vllm.config import ProfilerConfig
 from vllm.config.profiler import _is_uri_path
@@ -25,6 +26,49 @@ TorchProfilerActivityMap = {
     "XPU": torch.profiler.ProfilerActivity.XPU,
     "MUSA": torch.profiler.ProfilerActivity.CUDA,
 }
+
+_ALLOWED_PROFILER_ACTIVITIES: frozenset[TorchProfilerActivity] = frozenset(
+    {"CPU", "CUDA", "XPU", "NPU", "MUSA"}
+)
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off"}
+_PR2_TRACE_FILTER_NEEDLES = (
+    "PR2 ",
+    "gpu_model_runner",
+)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    logger.warning("Ignoring invalid boolean env %s=%r; using %s", name, raw, default)
+    return default
+
+
+def _profiler_activities_from_env() -> list[TorchProfilerActivity]:
+    """Parse PROFILER_ACTIVITIES (comma-separated). Default CPU-only for connector spans."""
+    raw = os.environ.get("PROFILER_ACTIVITIES", "CPU").strip()
+    if raw.upper() in ("ALL", "DEFAULT", "CPU,CUDA"):
+        return ["CPU", "CUDA"]
+    activities: list[TorchProfilerActivity] = []
+    for part in raw.split(","):
+        name = part.strip().upper()
+        if not name:
+            continue
+        if name not in _ALLOWED_PROFILER_ACTIVITIES:
+            logger.warning("Ignoring unknown PROFILER_ACTIVITIES value: %s", name)
+            continue
+        activities.append(name)  # type: ignore[arg-type]
+    if not activities:
+        logger.warning("PROFILER_ACTIVITIES empty; falling back to CPU-only")
+        return ["CPU"]
+    return activities
 
 
 class OmniTorchProfilerWrapper(WorkerProfiler):
@@ -61,6 +105,8 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         self._trace_filename: str | None = None
         self._trace_path: str | None = None
         self._table_path: str | None = None
+        self._export_trace = _env_bool("OMNI_TORCH_PROFILER_EXPORT_TRACE", True)
+        self._trace_filter = os.environ.get("OMNI_TORCH_PROFILER_TRACE_FILTER", "").strip().lower()
 
         self._activities = activities
         self._session_dir: str | None = None
@@ -75,6 +121,23 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
                 self._trace_dir,
                 scope="local",
             )
+            logger.info_once(
+                "Omni torch profiler activities: %s (PROFILER_ACTIVITIES=%r)",
+                ",".join(activities),
+                os.environ.get("PROFILER_ACTIVITIES", "CPU"),
+                scope="local",
+            )
+            logger.info_once(
+                "Omni torch profiler export trace: %s (OMNI_TORCH_PROFILER_EXPORT_TRACE=%r)",
+                self._export_trace,
+                os.environ.get("OMNI_TORCH_PROFILER_EXPORT_TRACE"),
+                scope="local",
+            )
+            logger.info_once(
+                "Omni torch profiler trace filter: %r",
+                self._trace_filter or None,
+                scope="local",
+            )
 
         self.dump_cpu_time_total = "CPU" in activities and len(activities) == 1
         self.profiler = self._create_profiler(profiler_config, activities)
@@ -86,8 +149,9 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         """Get default activities for this platform.
 
         Override in subclasses to provide platform-specific defaults.
+        Set PROFILER_ACTIVITIES=CPU (default) or CPU,CUDA / ALL for full traces.
         """
-        return ["CPU", "CUDA"]
+        return _profiler_activities_from_env()
 
     def _create_profiler(
         self,
@@ -167,10 +231,32 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         """Custom trace handler: export chrome trace with omni naming."""
         rank = self._rank()
 
+        if not self._export_trace:
+            logger.info(
+                "[Rank %s] Skipping Chrome trace export because "
+                "OMNI_TORCH_PROFILER_EXPORT_TRACE=false",
+                rank,
+            )
+            self._trace_path = None
+            self._artifact_paths["trace"] = None
+            return
+
         json_file = self._artifact_path("trace", ".json")
 
         try:
-            prof.export_chrome_trace(json_file)
+            if self._trace_filter:
+                try:
+                    self._export_filtered_chrome_trace(prof, json_file)
+                except Exception as filter_err:
+                    logger.warning(
+                        "[Rank %s] Filtered Chrome trace export failed; falling back "
+                        "to full export: %s",
+                        rank,
+                        filter_err,
+                    )
+                    prof.export_chrome_trace(json_file)
+            else:
+                prof.export_chrome_trace(json_file)
             logger.info("[Rank %s] Trace exported to %s", rank, json_file)
 
             if self._use_gzip:
@@ -196,6 +282,34 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
 
         except Exception as e:
             logger.warning("[Rank %s] Failed to export trace: %s", rank, e)
+
+    def _include_event_in_filtered_trace(self, event: Any) -> bool:
+        name = self._safe_get(event, "key", None) or self._safe_get(event, "name", "")
+        if self._trace_filter in ("pr2", "handoff", "connector"):
+            return any(needle in name for needle in _PR2_TRACE_FILTER_NEEDLES)
+        needles = [part.strip() for part in self._trace_filter.split(",") if part.strip()]
+        if needles:
+            return any(needle in name for needle in needles)
+        return True
+
+    def _export_filtered_chrome_trace(self, prof: Any, path: str) -> None:
+        events = prof.events()
+        filtered_events = [event for event in events if self._include_event_in_filtered_trace(event)]
+        event_list = EventList(
+            filtered_events,
+            use_device=getattr(events, "_use_device", None),
+            profile_memory=getattr(events, "_profile_memory", False),
+            with_flops=getattr(events, "_with_flops", False),
+        )
+        event_list.export_chrome_trace(path)
+        logger.info(
+            "[Rank %s] Filtered Chrome trace export kept %s/%s events "
+            "(OMNI_TORCH_PROFILER_TRACE_FILTER=%r)",
+            self._rank(),
+            len(filtered_events),
+            len(events),
+            self._trace_filter,
+        )
 
     def _try_enable_memory_history(self) -> None:
         """Enable backend-specific memory history for snapshot analysis."""

@@ -33,6 +33,7 @@ from vllm_omni.worker.payload_span import (
     merge_tensor_spans,
 )
 
+from vllm_omni.profiler.pr2_manual_profiler import manual_span
 from vllm_omni.profiler.pr2_record_function import record_function_or_nullcontext
 
 _EMBED_SPAN_GROUPS: tuple[tuple[str, str, str], ...] = (("decode", "decode_token_start", "decode_token_end"),)
@@ -524,13 +525,15 @@ class OmniConnectorModelRunnerMixin:
         connector_get_key: str,
     ) -> Any:
         """Receive one full-payload transfer on the local leader rank only."""
-        with record_function_or_nullcontext(f"PR2 after: get {from_stage}->{to_stage} {connector_get_key}"):
-            result = self._recv_ordinary_stage_result(
-                connector,
-                from_stage,
-                to_stage,
-                connector_get_key,
-            )
+        span_name = f"PR2 after-manual: get {from_stage}->{to_stage}"
+        with manual_span(span_name, key=connector_get_key):
+            with record_function_or_nullcontext(f"PR2 after: get {from_stage}->{to_stage} {connector_get_key}"):
+                result = self._recv_ordinary_stage_result(
+                    connector,
+                    from_stage,
+                    to_stage,
+                    connector_get_key,
+                )
         return result
 
     def _recv_async_chunk_result(
@@ -654,27 +657,30 @@ class OmniConnectorModelRunnerMixin:
             tp_group is None or getattr(tp_group, "world_size", 1) <= 1
         ) and not self._full_payload_pending_broadcast_req_ids:
             return None
-        with record_function_or_nullcontext(f"PR2 after: recv_full_payload_inputs s{self._stage_id}"):
-            with self._lock:
-                results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
-            results = self._broadcast_tp_payload_packet(results)
-            if not results:
-                return None
-            with self._lock:
-                self._stage_recv_req_ids.update(results.keys())
-                for req_id in results:
-                    self._pending_load_reqs.pop(req_id, None)
-                self._apply_staged_payloads_locked(results)
-                for req_id, payload in results.items():
-                    self._local_request_metadata[req_id] = self._extract_scheduling_metadata(payload)
-            logger.info(
-                "[Stage-%s] recv_full_payload_inputs: consumed %s reqs: %s, stage_recv_req_ids now=%s",
-                self._stage_id,
-                len(results),
-                list(results.keys()),
-                self._stage_recv_req_ids,
-            )
-            return results
+        span_name = f"PR2 after-manual: recv_full_payload_inputs s{self._stage_id}"
+        with manual_span(span_name):
+            torch_span_name = f"PR2 after: recv_full_payload_inputs s{self._stage_id}"
+            with record_function_or_nullcontext(torch_span_name):
+                with self._lock:
+                    results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
+                results = self._broadcast_tp_payload_packet(results)
+                if not results:
+                    return None
+                with self._lock:
+                    self._stage_recv_req_ids.update(results.keys())
+                    for req_id in results:
+                        self._pending_load_reqs.pop(req_id, None)
+                    self._apply_staged_payloads_locked(results)
+                    for req_id, payload in results.items():
+                        self._local_request_metadata[req_id] = self._extract_scheduling_metadata(payload)
+                logger.info(
+                    "[Stage-%s] recv_full_payload_inputs: consumed %s reqs: %s, stage_recv_req_ids now=%s",
+                    self._stage_id,
+                    len(results),
+                    list(results.keys()),
+                    self._stage_recv_req_ids,
+                )
+                return results
 
     def _get_model_config(self) -> Any:
         model_config = getattr(self, "model_config", None)
@@ -781,37 +787,39 @@ class OmniConnectorModelRunnerMixin:
         acc_rows = existing[2] if existing is not None and len(existing) == 4 else None
         in_summary = self._pr2_pooler_dict_summary(pooler_output)
         acc_summary = self._pr2_row_counts_summary(acc_rows)
-        with record_function_or_nullcontext(
-            f"PR2 after: accumulate_full_payload s{self._stage_id} {req_id} "
-            f"in={in_summary}{acc_summary}"
-        ):
-            if existing is None:
-                chunks, latest, rows = self._new_full_payload_accumulator(pooler_output)
-                self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
-                return
+        span_name = f"PR2 after-manual: accumulate_full_payload s{self._stage_id}"
+        with manual_span(span_name, request_id=req_id, summary=f"in={in_summary}{acc_summary}"):
+            with record_function_or_nullcontext(
+                f"PR2 after: accumulate_full_payload s{self._stage_id} {req_id} "
+                f"in={in_summary}{acc_summary}"
+            ):
+                if existing is None:
+                    chunks, latest, rows = self._new_full_payload_accumulator(pooler_output)
+                    self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
+                    return
 
-            if len(existing) == 2:
-                chunks, latest, rows = self._new_full_payload_accumulator(existing[0])
-            else:
-                chunks, latest, rows, _ = existing
-
-            for k, v in pooler_output.items():
-                if v is None:
-                    continue
-                if isinstance(v, torch.Tensor) and v.dim() >= 2:
-                    if k in chunks and chunks[k] and v.shape[1:] == chunks[k][0].shape[1:]:
-                        chunks[k].append(v)
-                        rows[k] += int(v.shape[0])
-                    else:
-                        latest.pop(k, None)
-                        chunks[k] = [v]
-                        rows[k] = int(v.shape[0])
+                if len(existing) == 2:
+                    chunks, latest, rows = self._new_full_payload_accumulator(existing[0])
                 else:
-                    chunks.pop(k, None)
-                    rows.pop(k, None)
-                    latest[k] = v
+                    chunks, latest, rows, _ = existing
 
-            self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
+                for k, v in pooler_output.items():
+                    if v is None:
+                        continue
+                    if isinstance(v, torch.Tensor) and v.dim() >= 2:
+                        if k in chunks and chunks[k] and v.shape[1:] == chunks[k][0].shape[1:]:
+                            chunks[k].append(v)
+                            rows[k] += int(v.shape[0])
+                        else:
+                            latest.pop(k, None)
+                            chunks[k] = [v]
+                            rows[k] = int(v.shape[0])
+                    else:
+                        chunks.pop(k, None)
+                        rows.pop(k, None)
+                        latest[k] = v
+
+                self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
 
     def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
         """Send accumulated full_payload outputs for requests that just finished."""
@@ -829,10 +837,12 @@ class OmniConnectorModelRunnerMixin:
                     row_summary = self._pr2_row_counts_summary(entry[2])
                 else:
                     row_summary = f" keys={self._pr2_pooler_dict_summary(entry[0])}"
-                with record_function_or_nullcontext(
-                    f"PR2 after: materialize_full_payload s{self._stage_id} {req_id}{row_summary}"
-                ):
-                    to_send[req_id] = self._materialize_full_payload_entry(entry)
+                span_name = f"PR2 after-manual: materialize_full_payload s{self._stage_id}"
+                with manual_span(span_name, request_id=req_id, summary=row_summary):
+                    with record_function_or_nullcontext(
+                        f"PR2 after: materialize_full_payload s{self._stage_id} {req_id}{row_summary}"
+                    ):
+                        to_send[req_id] = self._materialize_full_payload_entry(entry)
         logger.info("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
         if to_send:
             self.send_full_payload_outputs(scheduler_output=None, outputs=to_send)
@@ -920,13 +930,15 @@ class OmniConnectorModelRunnerMixin:
                 "request_id": req_id,
             }
             payload_summary = self._pr2_pooler_dict_summary(payload)
-            with record_function_or_nullcontext(
-                f"PR2 after: send_full_payload_enqueue s{self._stage_id}->{next_stage_id} "
-                f"{req_id} {connector_put_key} {payload_summary}"
-            ):
-                with self._lock:
-                    self._pending_save_reqs.setdefault(req_id, deque()).append(task)
-                    self._pending_save_counts[req_id] += 1
+            span_name = f"PR2 after-manual: send_full_payload_enqueue s{self._stage_id}->{next_stage_id}"
+            with manual_span(span_name, request_id=req_id, key=connector_put_key, summary=payload_summary):
+                with record_function_or_nullcontext(
+                    f"PR2 after: send_full_payload_enqueue s{self._stage_id}->{next_stage_id} "
+                    f"{req_id} {connector_put_key} {payload_summary}"
+                ):
+                    with self._lock:
+                        self._pending_save_reqs.setdefault(req_id, deque()).append(task)
+                        self._pending_save_counts[req_id] += 1
             sent_ids.append(req_id)
         if sent_ids:
             self._work_available.set()
@@ -1812,24 +1824,25 @@ class OmniConnectorModelRunnerMixin:
                 logger.debug("request.is_finished() failed for %s", request_id, exc_info=True)
 
         in_summary = self._pr2_pooler_dict_summary(pooling_output)
-        with record_function_or_nullcontext(
-            f"PR2 after: build_custom_process_payload s{self._stage_id} {request_id} in={in_summary}"
-        ):
-            try:
-                return self._custom_process_func(**kwargs)
-            except TypeError as exc:
-                if "is_finished" not in kwargs or not self._is_unexpected_is_finished_kwarg_error(exc):
-                    logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
-                    return None
-                kwargs.pop("is_finished", None)
+        span_name = f"PR2 after-manual: build_custom_process_payload s{self._stage_id}"
+        with manual_span(span_name, request_id=request_id, summary=f"in={in_summary}"):
+            torch_span_name = f"PR2 after: build_custom_process_payload s{self._stage_id} {request_id} in={in_summary}"
+            with record_function_or_nullcontext(torch_span_name):
                 try:
                     return self._custom_process_func(**kwargs)
+                except TypeError as exc:
+                    if "is_finished" not in kwargs or not self._is_unexpected_is_finished_kwarg_error(exc):
+                        logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
+                        return None
+                    kwargs.pop("is_finished", None)
+                    try:
+                        return self._custom_process_func(**kwargs)
+                    except Exception:
+                        logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
+                        return None
                 except Exception:
                     logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
                     return None
-            except Exception:
-                logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
-                return None
 
     def _custom_process_supports_is_finished_kwarg(self) -> bool | None:
         """Return whether the custom process hook accepts `is_finished`."""
@@ -1882,13 +1895,16 @@ class OmniConnectorModelRunnerMixin:
             )
         put_key = task.get("put_key")
 
-        with record_function_or_nullcontext(f"PR2 after: put {task['stage_id']}->{task['next_stage_id']} {put_key}"):
-            success, _size, _metadata = connector.put(
-                from_stage=str(task["stage_id"]),
-                to_stage=str(task["next_stage_id"]),
-                put_key=put_key,
-                data=payload_data,
-            )
+        span_name = f"PR2 after-manual: put {task['stage_id']}->{task['next_stage_id']}"
+        with manual_span(span_name, key=put_key, request_id=request_id) as span:
+            with record_function_or_nullcontext(f"PR2 after: put {task['stage_id']}->{task['next_stage_id']} {put_key}"):
+                success, _size, _metadata = connector.put(
+                    from_stage=str(task["stage_id"]),
+                    to_stage=str(task["next_stage_id"]),
+                    put_key=put_key,
+                    data=payload_data,
+                )
+            span.bytes_count = _size
         logger.info(
             "[Stage-%s] _send_single_request: put_key=%s success=%s size=%s",
             task["stage_id"],

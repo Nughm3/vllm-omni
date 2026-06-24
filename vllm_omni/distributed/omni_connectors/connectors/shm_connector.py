@@ -11,6 +11,7 @@ from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
 from ..utils.logging import get_connector_logger
 from .base import OmniConnectorBase
 
+from vllm_omni.profiler.pr2_manual_profiler import dump_manual_profile, manual_span
 from vllm_omni.profiler.pr2_record_function import record_function_or_nullcontext
 
 logger = get_connector_logger(__name__)
@@ -48,35 +49,65 @@ class SharedMemoryConnector(OmniConnectorBase):
         data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         try:
-            # Always serialize first to check size (and for SHM writing)
-            # Note: For extremely large objects in "inline" mode (e.g. Ray),
-            # we might double-serialize if we're not careful, but here we assume
-            # if it's huge we use SHM, or if Ray, threshold is maxsize.
-            with record_function_or_nullcontext(f"PR2 after: shm_put_serialize {from_stage}->{to_stage} {put_key}"):
-                payload = self.serialize_obj(data)
-            size = len(payload)
+            with manual_span(
+                f"PR2 after-bg: shm_put_total s{self.stage_id}",
+                from_stage=from_stage,
+                to_stage=to_stage,
+                key=put_key,
+            ) as put_span:
+                # Always serialize first to check size (and for SHM writing)
+                # Note: For extremely large objects in "inline" mode (e.g. Ray),
+                # we might double-serialize if we're not careful, but here we assume
+                # if it's huge we use SHM, or if Ray, threshold is maxsize.
+                with record_function_or_nullcontext(f"PR2 after: shm_put_serialize {from_stage}->{to_stage} {put_key}"):
+                    with manual_span(
+                        f"PR2 after-bg: shm_put_serialize s{self.stage_id}",
+                        from_stage=from_stage,
+                        to_stage=to_stage,
+                        key=put_key,
+                    ) as serialize_span:
+                        payload = self.serialize_obj(data)
+                        serialize_span.bytes_count = len(payload)
+                size = len(payload)
+                put_span.bytes_count = size
 
-            # Currently, we always use SHM.
-            if True:
-                # Use Shared Memory
-                lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
-                with record_function_or_nullcontext(f"PR2 after: shm_put_transfer {from_stage}->{to_stage} {put_key}"):
-                    with open(lock_file, "wb+") as lockf:
-                        fcntl.flock(lockf, fcntl.LOCK_EX)
-                        with record_function_or_nullcontext(f"PR2 after: shm_put_write_bytes {from_stage}->{to_stage} {put_key}"):
-                            meta = shm_write_bytes(payload, name=put_key)
-                        fcntl.flock(lockf, fcntl.LOCK_UN)
+                # Currently, we always use SHM.
+                if True:
+                    # Use Shared Memory
+                    lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
+                    with record_function_or_nullcontext(f"PR2 after: shm_put_transfer {from_stage}->{to_stage} {put_key}"):
+                        with manual_span(
+                            f"PR2 after-bg: shm_put_transfer s{self.stage_id}",
+                            from_stage=from_stage,
+                            to_stage=to_stage,
+                            key=put_key,
+                        ) as transfer_span:
+                            transfer_span.bytes_count = size
+                            with open(lock_file, "wb+") as lockf:
+                                fcntl.flock(lockf, fcntl.LOCK_EX)
+                                with record_function_or_nullcontext(
+                                    f"PR2 after: shm_put_write_bytes {from_stage}->{to_stage} {put_key}"
+                                ):
+                                    with manual_span(
+                                        f"PR2 after-bg: shm_put_write_bytes s{self.stage_id}",
+                                        from_stage=from_stage,
+                                        to_stage=to_stage,
+                                        key=put_key,
+                                    ) as write_span:
+                                        write_span.bytes_count = size
+                                        meta = shm_write_bytes(payload, name=put_key)
+                                fcntl.flock(lockf, fcntl.LOCK_UN)
 
-                # meta contains {'name': ..., 'size': ...}
-                metadata = {"shm": meta, "size": size}
-                self._pending_keys.add(put_key)
-                self._metrics["shm_writes"] += 1
-            else:
-                # Inline - pass bytes directly to avoid double serialization of the object
-                # We already serialized it to check size, so we pass the bytes.
-                # The Queue will pickle these bytes (fast), avoiding re-serializing the complex object.
-                metadata = {"inline_bytes": payload, "size": size}
-                self._metrics["inline_writes"] += 1
+                    # meta contains {'name': ..., 'size': ...}
+                    metadata = {"shm": meta, "size": size}
+                    self._pending_keys.add(put_key)
+                    self._metrics["shm_writes"] += 1
+                else:
+                    # Inline - pass bytes directly to avoid double serialization of the object
+                    # We already serialized it to check size, so we pass the bytes.
+                    # The Queue will pickle these bytes (fast), avoiding re-serializing the complex object.
+                    metadata = {"inline_bytes": payload, "size": size}
+                    self._metrics["inline_writes"] += 1
 
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
@@ -90,15 +121,25 @@ class SharedMemoryConnector(OmniConnectorBase):
     def _get_data_with_lock(self, lock_file: str, shm_handle: dict):
         obj = None
         try:
-            with record_function_or_nullcontext(f"PR2 after: shm_get_transfer {lock_file}"):
-                with open(lock_file, "rb+") as lockf:
-                    fcntl.flock(lockf, fcntl.LOCK_EX)
-                    with record_function_or_nullcontext(f"PR2 after: shm_get_read_bytes {lock_file}"):
-                        data_bytes = shm_read_bytes(shm_handle)
-                    fcntl.flock(lockf, fcntl.LOCK_UN)
-            with record_function_or_nullcontext(f"PR2 after: shm_get_deserialize {lock_file}"):
-                obj = self.deserialize_obj(data_bytes)
-            return obj, int(shm_handle.get("size", 0))
+            size = int(shm_handle.get("size", 0))
+            key = str(shm_handle.get("name", ""))
+            with manual_span(f"PR2 after-bg: shm_get_total s{self.stage_id}", key=key) as get_span:
+                get_span.bytes_count = size
+                with record_function_or_nullcontext(f"PR2 after: shm_get_transfer {lock_file}"):
+                    with manual_span(f"PR2 after-bg: shm_get_transfer s{self.stage_id}", key=key) as transfer_span:
+                        transfer_span.bytes_count = size
+                        with open(lock_file, "rb+") as lockf:
+                            fcntl.flock(lockf, fcntl.LOCK_EX)
+                            with record_function_or_nullcontext(f"PR2 after: shm_get_read_bytes {lock_file}"):
+                                with manual_span(f"PR2 after-bg: shm_get_read_bytes s{self.stage_id}", key=key) as read_span:
+                                    data_bytes = shm_read_bytes(shm_handle)
+                                    read_span.bytes_count = len(data_bytes)
+                            fcntl.flock(lockf, fcntl.LOCK_UN)
+                with record_function_or_nullcontext(f"PR2 after: shm_get_deserialize {lock_file}"):
+                    with manual_span(f"PR2 after-bg: shm_get_deserialize s{self.stage_id}", key=key) as deserialize_span:
+                        deserialize_span.bytes_count = len(data_bytes)
+                        obj = self.deserialize_obj(data_bytes)
+                return obj, size
         except Exception as e:
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
             return None
@@ -145,7 +186,10 @@ class SharedMemoryConnector(OmniConnectorBase):
 
             if "inline_bytes" in metadata:
                 try:
-                    obj = self.deserialize_obj(metadata["inline_bytes"])
+                    inline_bytes = metadata["inline_bytes"]
+                    with manual_span(f"PR2 after-bg: inline_get_deserialize s{self.stage_id}", key=get_key) as deserialize_span:
+                        deserialize_span.bytes_count = len(inline_bytes)
+                        obj = self.deserialize_obj(inline_bytes)
                     self._pending_keys.discard(get_key)
                     return obj, int(metadata.get("size", 0))
                 except Exception as e:
@@ -213,6 +257,7 @@ class SharedMemoryConnector(OmniConnectorBase):
                 except OSError:
                     pass
         self._pending_keys.clear()
+        dump_manual_profile()
 
     def health(self) -> dict[str, Any]:
         return {"status": "healthy", "threshold": self.threshold, **self._metrics}

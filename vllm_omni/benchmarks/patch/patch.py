@@ -6,12 +6,14 @@ import os
 import random
 import ssl
 import sys
+import threading
 import time
 import traceback
 import wave
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Literal
 
 import aiohttp
@@ -57,6 +59,52 @@ def _seed_tts_capture_pcm_for_wer() -> bool:
         "true",
         "yes",
     )
+
+
+_SAVE_AUDIO_TRUE_VALUES = {"1", "true", "yes", "on"}
+_SAVE_AUDIO_FALSE_VALUES = {"", "0", "false", "no", "off"}
+_SAVE_AUDIO_LOCK = threading.Lock()
+_SAVE_AUDIO_STATE = {"count": 0, "first_saved": False}
+
+
+def _save_audio_root() -> Path | None:
+    value = os.environ.get("SAVE_AUDIO", "").strip()
+    if value.lower() in _SAVE_AUDIO_FALSE_VALUES:
+        return None
+    if value.lower() in _SAVE_AUDIO_TRUE_VALUES or value.lower() == "all":
+        return Path(os.environ.get("BENCH_DIR") or os.environ.get("RESULT_DIR") or ".") / "audio"
+    return Path(value)
+
+
+def _maybe_save_edge_audio(generated_audio: AudioSegment, output: "MixRequestFuncOutput") -> None:
+    root = _save_audio_root()
+    if root is None:
+        return
+    save_all = os.environ.get("SAVE_AUDIO", "").strip().lower() == "all"
+    with _SAVE_AUDIO_LOCK:
+        if not save_all and _SAVE_AUDIO_STATE["first_saved"]:
+            return
+        root.mkdir(parents=True, exist_ok=True)
+        _SAVE_AUDIO_STATE["count"] += 1
+        ordinal = _SAVE_AUDIO_STATE["count"]
+        metadata = {
+            "ordinal": ordinal,
+            "audio_duration_s": output.audio_duration,
+            "audio_frames": output.audio_frames,
+            "audio_rtf": output.audio_rtf,
+            "latency_s": output.latency,
+            "generated_text": output.generated_text,
+        }
+        if not _SAVE_AUDIO_STATE["first_saved"]:
+            generated_audio.export(root / "first.wav", format="wav")
+            (root / "first.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
+            _SAVE_AUDIO_STATE["first_saved"] = True
+        if save_all:
+            stem = f"{ordinal:06d}"
+            generated_audio.export(root / f"{stem}.wav", format="wav")
+            (root / f"{stem}.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
+            generated_audio.export(root / "last.wav", format="wav")
+            (root / "last.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
 
 
 def _merge_extra_body_mm_kwargs(base: dict | None, overlay: dict | None) -> dict | None:
@@ -527,6 +575,10 @@ async def async_request_openai_chat_omni_completions(
                                 output.tts_output_pcm_bytes = bytes(seg.raw_data)
                             except Exception as ex:
                                 logger.warning("seed_tts WER PCM export failed: %s", ex)
+                        try:
+                            _maybe_save_edge_audio(generated_audio, output)
+                        except Exception as ex:
+                            logger.warning("SAVE_AUDIO export failed: %s", ex)
                     output.success = True
                 else:
                     output.error = response.reason or ""

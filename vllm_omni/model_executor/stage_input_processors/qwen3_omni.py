@@ -4,6 +4,7 @@
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -39,6 +40,7 @@ _QWEN3_CODEC_CODEBOOK_SIZE = 2048
 _QWEN3_CODEC_PAD_TOKEN_ID = 4196
 _QWEN3_CODEC_BOS_TOKEN_ID = 4197
 _QWEN3_CODEC_EOS_TOKEN_ID = 4198
+_LEGACY_CODEC_CROP_VALUES = {"legacy", "legacy_tail", "tail"}
 
 
 def _layer_tensor(layers: dict[Any, Any], key: str) -> torch.Tensor | None:
@@ -178,6 +180,33 @@ def _extract_qwen3_full_payload_codec_rows(
         "aligned_rows": aligned_len,
         "valid_rows": int(filtered_rows.shape[0]) if filtered_rows.ndim > 0 else 0,
         "trailing_placeholder_count": trailing_placeholder_count,
+    }
+
+
+def _use_legacy_full_payload_codec_crop() -> bool:
+    return os.environ.get("QWEN3_OMNI_FULL_PAYLOAD_CODEC_CROP", "").strip().lower() in _LEGACY_CODEC_CROP_VALUES
+
+
+def _legacy_qwen3_full_payload_codec_rows(
+    code_predictor_codes: torch.Tensor,
+    output_token_ids: list[int],
+) -> tuple[torch.Tensor, dict[str, int]]:
+    """Approximate the pre-PR2677 code2wav crop for an accumulated full payload."""
+    seq_len = max(0, len(output_token_ids) - 1)
+    if code_predictor_codes.ndim != 2 or code_predictor_codes.numel() == 0 or seq_len <= 0:
+        rows = code_predictor_codes[:0] if code_predictor_codes.ndim > 0 else code_predictor_codes
+        return rows, {
+            "raw_rows": int(code_predictor_codes.shape[0]) if code_predictor_codes.ndim > 0 else 0,
+            "aligned_rows": 0,
+            "valid_rows": 0,
+            "trailing_placeholder_count": 0,
+        }
+    rows = code_predictor_codes[-min(int(code_predictor_codes.shape[0]), seq_len) :]
+    return rows, {
+        "raw_rows": int(code_predictor_codes.shape[0]),
+        "aligned_rows": int(rows.shape[0]),
+        "valid_rows": int(rows.shape[0]),
+        "trailing_placeholder_count": 0,
     }
 
 
@@ -812,17 +841,17 @@ def talker2code2wav_full_payload(
 
     output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
     raw_shape = tuple(code_predictor_codes.shape)
-    code_predictor_codes, codec_stats = _extract_qwen3_full_payload_codec_rows(
-        code_predictor_codes.to(torch.long),
-        list(output_token_ids),
-    )
+    crop_mode = "legacy" if _use_legacy_full_payload_codec_crop() else "filtered"
+    crop_func = _legacy_qwen3_full_payload_codec_rows if crop_mode == "legacy" else _extract_qwen3_full_payload_codec_rows
+    code_predictor_codes, codec_stats = crop_func(code_predictor_codes.to(torch.long), list(output_token_ids))
     if code_predictor_codes.numel() == 0:
         return None
 
     codec_codes = code_predictor_codes.transpose(0, 1).cpu().reshape(-1).tolist()
     logger.debug(
-        "talker2code2wav_full_payload: raw_shape=%s output_ids_len=%s aligned_rows=%s "
+        "talker2code2wav_full_payload: crop_mode=%s raw_shape=%s output_ids_len=%s aligned_rows=%s "
         "valid_rows=%s placeholders=%s flattened_len=%s pad4196=%s bos4197=%s eos4198=%s",
+        crop_mode,
         raw_shape,
         len(output_token_ids),
         codec_stats["aligned_rows"],

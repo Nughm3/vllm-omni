@@ -10,11 +10,73 @@ import json
 
 import pytest
 from pytest_mock import MockerFixture
+from pydub import AudioSegment
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
-from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput, async_request_openai_chat_omni_completions
+from vllm_omni.benchmarks.patch.patch import (
+    MixRequestFuncOutput,
+    _SAVE_AUDIO_STATE,
+    _maybe_save_edge_audio,
+    async_request_openai_chat_omni_completions,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
+
+
+def test_save_audio_one_writes_first_only(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setenv("SAVE_AUDIO", "1")
+    monkeypatch.setenv("BENCH_DIR", str(tmp_path))
+    _SAVE_AUDIO_STATE["count"] = 0
+    _SAVE_AUDIO_STATE["first_saved"] = False
+    first = MixRequestFuncOutput()
+    first.audio_duration = 0.1
+    first.audio_frames = 2400
+    first.audio_rtf = 1.0
+    first.latency = 0.1
+    first.generated_text = "first"
+    last = MixRequestFuncOutput()
+    last.audio_duration = 0.2
+    last.audio_frames = 4800
+    last.audio_rtf = 2.0
+    last.latency = 0.4
+    last.generated_text = "last"
+
+    _maybe_save_edge_audio(AudioSegment.silent(duration=100), first)
+    _maybe_save_edge_audio(AudioSegment.silent(duration=200), last)
+
+    audio_dir = tmp_path / "audio"
+    assert (audio_dir / "first.wav").exists()
+    assert not (audio_dir / "last.wav").exists()
+    first_meta = json.loads((audio_dir / "first.json").read_text(encoding="utf-8"))
+    assert first_meta["generated_text"] == "first"
+    assert first_meta["ordinal"] == 1
+    assert _SAVE_AUDIO_STATE["count"] == 1
+
+
+def test_save_audio_all_writes_every_completion(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setenv("SAVE_AUDIO", "all")
+    monkeypatch.setenv("BENCH_DIR", str(tmp_path))
+    _SAVE_AUDIO_STATE["count"] = 0
+    _SAVE_AUDIO_STATE["first_saved"] = False
+
+    for idx in range(3):
+        output = MixRequestFuncOutput()
+        output.audio_duration = float(idx + 1)
+        output.audio_frames = 24000 * (idx + 1)
+        output.audio_rtf = 1.0
+        output.latency = float(idx + 1)
+        output.generated_text = f"sample {idx + 1}"
+        _maybe_save_edge_audio(AudioSegment.silent(duration=10), output)
+
+    audio_dir = tmp_path / "audio"
+    assert (audio_dir / "first.wav").exists()
+    assert (audio_dir / "last.wav").exists()
+    for idx in range(1, 4):
+        assert (audio_dir / f"{idx:06d}.wav").exists()
+        assert (audio_dir / f"{idx:06d}.json").exists()
+    last_meta = json.loads((audio_dir / "last.json").read_text(encoding="utf-8"))
+    assert last_meta["generated_text"] == "sample 3"
+    assert last_meta["ordinal"] == 3
 
 
 class MockResponse:

@@ -167,6 +167,31 @@ def test_talker2code2wav_full_payload_keeps_all_zero_codec_rows() -> None:
     assert payload["code_predictor_codes"] == payload["codes"]["audio"]
 
 
+def test_talker2code2wav_full_payload_legacy_crop_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("QWEN3_OMNI_FULL_PAYLOAD_CODEC_CROP", "legacy")
+    request = SimpleNamespace(
+        request_id="codec_legacy",
+        output_token_ids=[4197, 1, 2, 4198, -1, 2048],
+    )
+    rows = torch.tensor(
+        [
+            [100, 101, 102],
+            [10, 11, 12],
+            [20, 21, 22],
+            [30, 31, 32],
+            [40, 41, 42],
+            [50, 51, 52],
+        ],
+        dtype=torch.long,
+    )
+
+    payload = q3.talker2code2wav_full_payload(None, {"codes.audio": rows}, request)
+
+    assert payload is not None
+    assert payload["codes"]["audio"] == [10, 20, 30, 40, 50, 11, 21, 31, 41, 51, 12, 22, 32, 42, 52]
+    assert payload["code_predictor_codes"] == payload["codes"]["audio"]
+
+
 def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
     request = SimpleNamespace(
         request_id="thinker",

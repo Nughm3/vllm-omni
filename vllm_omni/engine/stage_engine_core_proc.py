@@ -32,6 +32,7 @@ from vllm.v1.engine.utils import (
     get_engine_zmq_addresses,
 )
 from vllm.v1.utils import shutdown
+from vllm_omni.profiler.pr2_manual_profiler import dump_manual_profile
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -113,6 +114,10 @@ class StageEngineCoreProc(EngineCoreProc):
                 signal_callback.stop()
             if engine_core is not None:
                 engine_core.shutdown()
+            try:
+                dump_manual_profile()
+            except Exception:
+                logger.warning("Failed to dump PR2 manual profile", exc_info=True)
 
 
 def spawn_stage_core(

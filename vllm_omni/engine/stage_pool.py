@@ -18,6 +18,10 @@ from vllm_omni.engine.stage_client import (
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
+from vllm_omni.profiler.pr2_manual_profiler import manual_span
+from vllm_omni.profiler.pr2_record_function import (
+    record_function_or_nullcontext as pr2_record_function,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
@@ -285,7 +289,10 @@ class StagePool:
 
     async def _poll_stage_raw(self, client: StagePoolLLMClient) -> EngineCoreOutputs | None:
         """Pull raw EngineCoreOutputs from a stage replica without processing."""
-        outputs = await client.get_output_async()
+        span_name = f"PR2 before-old-manual: mp_recv_outputs_boundary s{self.stage_id}"
+        with manual_span(span_name):
+            with pr2_record_function(f"PR2 before-old: mp_recv_outputs_boundary s{self.stage_id}"):
+                outputs = await client.get_output_async()
         if not outputs.outputs:
             return None
         return outputs
@@ -298,11 +305,14 @@ class StagePool:
         """Run the shared LLM output processor on one raw poll result."""
         client = self._llm_client(replica_id)
         processor = self.output_processor
-        processed = processor.process_outputs(
-            raw_outputs.outputs,
-            raw_outputs.timestamp,
-            None,
-        )
+        span_name = f"PR2 before-old-manual: process_mp_outputs s{self.stage_id}"
+        with manual_span(span_name):
+            with pr2_record_function(f"PR2 before-old: process_mp_outputs s{self.stage_id}"):
+                processed = processor.process_outputs(
+                    raw_outputs.outputs,
+                    raw_outputs.timestamp,
+                    None,
+                )
 
         if processed.reqs_to_abort:
             await client.abort_requests_async(processed.reqs_to_abort)

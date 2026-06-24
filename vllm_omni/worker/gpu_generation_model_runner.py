@@ -38,6 +38,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.profiler.pr2_manual_profiler import manual_span
 from vllm_omni.profiler.pr2_record_function import (
     record_function_or_nullcontext as pr2_record_function,
 )
@@ -369,44 +370,46 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             self.finalize_kv_connector()
 
         stage_id = getattr(self.model_config, "stage_id", "?")
-        with pr2_record_function(
-            f"PR2 before-old: build_generation_pooler_output s{stage_id} reqs={self.input_batch.num_reqs}"
-        ):
-            pooler_output: list[object] = []
-            if isinstance(multimodal_outputs, torch.Tensor):
-                assert multimodal_outputs.shape[0] == 1, (
-                    "model should return a single tensor, to return multiple tensors, use a dict"
-                )
-                assert multimodal_outputs.shape[0] == self.input_batch.num_reqs
-                for i in range(self.input_batch.num_reqs):
-                    pooler_output.append({"model_outputs": multimodal_outputs[i].detach().to("cpu").contiguous()})
-            elif isinstance(multimodal_outputs, list):
-                assert len(multimodal_outputs) == 1, (
-                    "model should return a single list, to return multiple lists, use a dict"
-                )
-                for out in multimodal_outputs:
-                    pooler_output.append(
-                        {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
+        span_name = f"PR2 before-old-manual: build_generation_pooler_output s{stage_id}"
+        with manual_span(span_name, reqs=self.input_batch.num_reqs):
+            with pr2_record_function(
+                f"PR2 before-old: build_generation_pooler_output s{stage_id} reqs={self.input_batch.num_reqs}"
+            ):
+                pooler_output: list[object] = []
+                if isinstance(multimodal_outputs, torch.Tensor):
+                    assert multimodal_outputs.shape[0] == 1, (
+                        "model should return a single tensor, to return multiple tensors, use a dict"
                     )
-            elif isinstance(multimodal_outputs, dict):
-                num_reqs = self.input_batch.num_reqs
-                for i in range(num_reqs):
-                    mm_payload = {}
-                    for key, out in multimodal_outputs.items():
-                        if isinstance(out, list):
-                            if len(out) != num_reqs:
-                                raise ValueError(
-                                    f"Multimodal output list for key '{key}' has length {len(out)} "
-                                    f"but expected {num_reqs} (one entry per request)."
-                                )
-                            mm_payload[key] = out[i].detach().to("cpu").contiguous()
-                        elif isinstance(out, torch.Tensor):
-                            mm_payload[key] = out.detach().to("cpu").contiguous()
-                        else:
-                            logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
-                    pooler_output.append(mm_payload)
-            else:
-                raise RuntimeError("Unsupported diffusion output type")
+                    assert multimodal_outputs.shape[0] == self.input_batch.num_reqs
+                    for i in range(self.input_batch.num_reqs):
+                        pooler_output.append({"model_outputs": multimodal_outputs[i].detach().to("cpu").contiguous()})
+                elif isinstance(multimodal_outputs, list):
+                    assert len(multimodal_outputs) == 1, (
+                        "model should return a single list, to return multiple lists, use a dict"
+                    )
+                    for out in multimodal_outputs:
+                        pooler_output.append(
+                            {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
+                        )
+                elif isinstance(multimodal_outputs, dict):
+                    num_reqs = self.input_batch.num_reqs
+                    for i in range(num_reqs):
+                        mm_payload = {}
+                        for key, out in multimodal_outputs.items():
+                            if isinstance(out, list):
+                                if len(out) != num_reqs:
+                                    raise ValueError(
+                                        f"Multimodal output list for key '{key}' has length {len(out)} "
+                                        f"but expected {num_reqs} (one entry per request)."
+                                    )
+                                mm_payload[key] = out[i].detach().to("cpu").contiguous()
+                            elif isinstance(out, torch.Tensor):
+                                mm_payload[key] = out.detach().to("cpu").contiguous()
+                            else:
+                                logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
+                        pooler_output.append(mm_payload)
+                else:
+                    raise RuntimeError("Unsupported diffusion output type")
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()

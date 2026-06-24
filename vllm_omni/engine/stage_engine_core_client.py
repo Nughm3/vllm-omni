@@ -25,6 +25,7 @@ from vllm_omni.distributed.omni_connectors.utils.initialization import (
 )
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
+from vllm_omni.profiler.pr2_manual_profiler import manual_span
 from vllm_omni.profiler.pr2_record_function import (
     record_function_or_nullcontext as pr2_record_function,
 )
@@ -270,7 +271,12 @@ class StageEngineCoreClientBase(StageClientBase):
             self.replica_id,
             request.request_id,
         )
-        await super().add_request_async(request)
+        span_name = f"PR2 before-old-manual: mp_send_request_boundary s{self.stage_id}"
+        with manual_span(span_name, request_id=request.request_id):
+            with pr2_record_function(
+                f"PR2 before-old: mp_send_request_boundary s{self.stage_id} {request.request_id}"
+            ):
+                await super().add_request_async(request)
 
     # ==================== Stage Methods ====================
 
@@ -407,20 +413,22 @@ class StageEngineCoreClientBase(StageClientBase):
         """
         if self.custom_process_input_func is not None:
             func_name = getattr(self.custom_process_input_func, "__name__", type(self.custom_process_input_func).__name__)
-            with pr2_record_function(f"PR2 before-old: {func_name} stage{self.stage_id}"):
-                signature = inspect.signature(self.custom_process_input_func)
-                if len(signature.parameters) >= 4:
+            span_name = f"PR2 before-old-manual: {func_name} stage{self.stage_id}"
+            with manual_span(span_name):
+                with pr2_record_function(f"PR2 before-old: {func_name} stage{self.stage_id}"):
+                    signature = inspect.signature(self.custom_process_input_func)
+                    if len(signature.parameters) >= 4:
+                        return self.custom_process_input_func(
+                            source_outputs,
+                            prompt,
+                            self.requires_multimodal_data,
+                            streaming_context,
+                        )
                     return self.custom_process_input_func(
                         source_outputs,
                         prompt,
                         self.requires_multimodal_data,
-                        streaming_context,
                     )
-                return self.custom_process_input_func(
-                    source_outputs,
-                    prompt,
-                    self.requires_multimodal_data,
-                )
 
         if not self.engine_input_source:
             raise ValueError(f"engine_input_source empty for stage {self.stage_id}")

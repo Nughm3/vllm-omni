@@ -22,6 +22,7 @@ _PID = os.getpid()
 
 # Type markers for custom serialization
 _TENSOR_MARKER = "__tensor__"
+_SCALAR_TENSOR_MARKER = "__scalar_tensor__"
 _NDARRAY_MARKER = "__ndarray__"
 _PIL_IMAGE_MARKER = "__pil_image__"
 
@@ -55,8 +56,10 @@ class OmniMsgpackEncoder:
 
     def _enc_hook(self, obj: Any) -> Any:
         """Custom encoding hook for non-standard types."""
-        # torch.Tensor
+        # torch.Tensor — single-element tensors skip the heavy encode path
         if isinstance(obj, torch.Tensor):
+            if obj.numel() == 1:
+                return self._encode_scalar_tensor(obj)
             return self._encode_tensor(obj)
 
         # numpy.ndarray (exclude object/void dtypes)
@@ -83,27 +86,50 @@ class OmniMsgpackEncoder:
         if isinstance(obj, slice):
             return (obj.start, obj.stop, obj.step)
 
+        # byte-like objects — modern msgspec encodes memoryview/bytearray natively
+        # as msgpack bin without reaching this hook; this is a compatibility fallback.
+        if isinstance(obj, (memoryview, bytearray)):
+            return bytes(obj)
+
         raise TypeError(
             f"Object of type {type(obj).__name__} is not serializable. "
             "Supported types: torch.Tensor, np.ndarray, PIL.Image, dataclass, "
             "RequestOutput, and standard Python types (dict, list, str, int, float, bool, None, bytes)."
         )
 
+    def _encode_scalar_tensor(self, tensor: torch.Tensor) -> dict[str, Any]:
+        """Encode a single-element tensor as a Python scalar — avoids detach/cpu/view/numpy overhead."""
+        return {
+            _SCALAR_TENSOR_MARKER: True,
+            "dtype": str(tensor.dtype).removeprefix("torch."),
+            "shape": list(tensor.shape),
+            "value": tensor.item(),
+        }
+
     def _encode_tensor(self, tensor: torch.Tensor) -> dict[str, Any]:
         """Encode torch.Tensor to dict."""
-        t = tensor.detach().cpu()
-        start = time.perf_counter()
-        # Handle 0-dimensional (scalar) tensors by reshaping to 1D first
         called_reshape = False
         called_contiguous = False
+
+        start = time.perf_counter()
+
+        t = tensor.detach()
+
+        # Perform contiguous on GPU if possible
+        if not t.is_contiguous():
+            t = t.contiguous()
+            called_contiguous = True
+
+        t = t.cpu()
+
+        # Handle 0-dimensional (scalar) tensors by reshaping to 1D first
         if t.dim() == 0:
             called_reshape = True
             t = t.reshape(1)
-        if not t.is_contiguous():
-            called_contiguous = True
-            t = t.contiguous()
+
         t = t.view(torch.uint8)
-        data = t.numpy().tobytes()
+        data = memoryview(t.numpy())
+
         end = time.perf_counter()
 
         if PROFILE:
@@ -138,12 +164,16 @@ class OmniMsgpackEncoder:
 
     def _encode_ndarray(self, arr: np.ndarray) -> dict[str, Any]:
         """Encode numpy.ndarray to dict."""
-        start = time.perf_counter()
         called_contiguous = False
+
+        start = time.perf_counter()
+
         if not arr.flags.c_contiguous:
-            called_contiguous = True
             arr = np.ascontiguousarray(arr)
-        data = arr.tobytes()
+            called_contiguous = True
+
+        data = memoryview(arr)
+
         end = time.perf_counter()
         if PROFILE:
             print(
@@ -165,6 +195,7 @@ class OmniMsgpackEncoder:
                     }
                 ),
             )
+
         return {
             _NDARRAY_MARKER: True,
             "dtype": arr.dtype.str,
@@ -174,14 +205,19 @@ class OmniMsgpackEncoder:
 
     def _encode_pil_image(self, img: Image.Image) -> dict[str, Any]:
         """Encode PIL.Image to dict."""
-        start = time.perf_counter()
         called_contiguous = False
+
+        start = time.perf_counter()
+
         arr = np.asarray(img, dtype=np.uint8)
         if not arr.flags.c_contiguous:
-            called_contiguous = True
             arr = np.ascontiguousarray(arr)
-        data = arr.tobytes()
+            called_contiguous = True
+
+        data = memoryview(arr)
+
         end = time.perf_counter()
+
         if PROFILE:
             print(
                 "SHM_PROFILE",
@@ -324,6 +360,8 @@ class OmniMsgpackDecoder:
         """Recursively restore tensor/ndarray/image/RequestOutput/OmniRequestOutput from their dict representations."""
         if isinstance(obj, dict):
             # Check for type markers first
+            if obj.get(_SCALAR_TENSOR_MARKER):
+                return self._decode_scalar_tensor(obj)
             if obj.get(_TENSOR_MARKER):
                 return self._decode_tensor(obj)
             if obj.get(_NDARRAY_MARKER):
@@ -420,6 +458,10 @@ class OmniMsgpackDecoder:
             )
         return result
 
+    def _decode_scalar_tensor(self, obj: dict[str, Any]) -> torch.Tensor:
+        """Decode a scalar-encoded tensor back to a torch.Tensor."""
+        return torch.tensor(obj["value"], dtype=getattr(torch, obj["dtype"])).reshape(obj["shape"])
+
     def _decode_tensor(self, obj: dict[str, Any]) -> torch.Tensor:
         """Decode dict to torch.Tensor."""
         dtype_str = obj["dtype"]
@@ -431,8 +473,7 @@ class OmniMsgpackDecoder:
         if not data:
             result = torch.empty(shape, dtype=torch_dtype)
         else:
-            buffer = bytearray(data) if isinstance(data, (bytes, memoryview)) else data
-            arr = torch.frombuffer(buffer, dtype=torch.uint8)
+            arr = torch.frombuffer(data, dtype=torch.uint8)
             result = arr.view(torch_dtype).reshape(shape)
         end = time.perf_counter()
         if PROFILE:

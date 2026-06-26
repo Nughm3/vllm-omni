@@ -9,7 +9,7 @@ import time
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
 
-from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
+from vllm_omni.entrypoints.stage_utils import shm_write_bytes
 
 from ..utils.logging import get_connector_logger
 from .base import OmniConnectorBase
@@ -45,6 +45,19 @@ class SharedMemoryConnector(OmniConnectorBase):
             "shm_writes": 0,
             "inline_writes": 0,
         }
+
+    @staticmethod
+    def serialize_obj(obj: Any) -> memoryview:
+        """Return a memoryview into the thread-local encode buffer — zero allocation.
+
+        Valid until the next serialize_obj() call on the same thread.  The SHM
+        write path (shm_write_bytes) consumes this synchronously before returning,
+        so the view is always released before re-encoding.  The inline path copies
+        to bytes explicitly since that metadata travels via IPC.
+        """
+        from ..utils.serialization import OmniSerializer
+
+        return OmniSerializer.serialize(obj)
 
     def put(
         self,
@@ -85,7 +98,9 @@ class SharedMemoryConnector(OmniConnectorBase):
                 t_write_start = t_write_end = t_serialize_end
                 # Inline small payloads to avoid the mmap + file-lock overhead
                 # that dominates codec chunk transfers.
-                metadata = {"inline_bytes": payload, "size": size}
+                # payload is a memoryview into a thread-local buffer; copy to
+                # bytes here since inline_bytes travels via IPC metadata.
+                metadata = {"inline_bytes": bytes(payload), "size": size}
                 self._metrics["inline_writes"] += 1
                 path = "inline"
 
@@ -122,14 +137,29 @@ class SharedMemoryConnector(OmniConnectorBase):
 
     def _get_data_with_lock(self, lock_file: str, shm_handle: dict):
         obj = None
+        shm = None
         try:
             t_read_start = time.perf_counter()
             with open(lock_file, "rb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX)
-                data_bytes = shm_read_bytes(shm_handle)
+                # Map the SHM segment inside the lock to guarantee the write is
+                # complete before we read.  We hold a memoryview into the
+                # mapping for decoding; msgspec copies binary fields (tensor
+                # data etc.) into bytes during decode, so the view can be
+                # released immediately after decode() returns.
+                shm = shm_pkg.SharedMemory(name=shm_handle["name"])
+                mv = memoryview(shm.buf)[: shm_handle["size"]]
                 fcntl.flock(lockf, fcntl.LOCK_UN)
             t_read_end = time.perf_counter()
-            obj = self.deserialize_obj(data_bytes)
+            # Decode directly from the SHM mapping — no intermediate bytes copy.
+            obj = self.deserialize_obj(mv)
+            del mv
+            shm.close()
+            try:
+                shm.unlink()
+            except Exception:
+                pass
+            shm = None
             t_deserialize_end = time.perf_counter()
             if PROFILE:
                 print(
@@ -145,7 +175,7 @@ class SharedMemoryConnector(OmniConnectorBase):
                             "args": {
                                 "shm_name": shm_handle.get("name"),
                                 "size": shm_handle.get("size", 0),
-                                "shm_read_us": (t_read_end - t_read_start) * 1_000_000,
+                                "shm_map_us": (t_read_end - t_read_start) * 1_000_000,
                                 "deserialize_us": (t_deserialize_end - t_read_end) * 1_000_000,
                             },
                         }
@@ -156,7 +186,12 @@ class SharedMemoryConnector(OmniConnectorBase):
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
             return None
         finally:
-            # If data has been received, delete lock_file.
+            if shm is not None:
+                shm.close()
+                try:
+                    shm.unlink()
+                except Exception:
+                    pass
             if obj and os.path.exists(lock_file):
                 os.remove(lock_file)
 

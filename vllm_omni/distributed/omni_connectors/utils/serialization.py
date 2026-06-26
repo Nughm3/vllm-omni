@@ -41,18 +41,40 @@ _OMNI_REQUEST_OUTPUT_KEYS = frozenset({"finished", "final_output_type"})
 class OmniMsgpackEncoder:
     """
     This implementation is adapted from vLLM’s MsgpackEncoder.
-    However, zero-copy support has not been implemented yet.
     Handles torch.Tensor, numpy.ndarray, PIL.Image, RequestOutput and
     CompletionOutput by converting them to serializable dict representations.
-    TODO: Enable zero-copy support.
+
+    Encoding is zero-copy for the caller: encode() returns a memoryview into a
+    thread-local bytearray that is reused across calls, avoiding a Python bytes
+    allocation per encode.  Callers that need to persist the result beyond the
+    next encode() call on the same thread must copy (bytes(view)).
     """
 
-    def __init__(self):
-        self.encoder = msgpack.Encoder(enc_hook=self._enc_hook)
+    # Initial per-thread encode buffer size; grows automatically via encode_into.
+    _INITIAL_BUF = 65536
 
-    def encode(self, obj: Any) -> bytes:
-        """Encode an object to bytes."""
-        return self.encoder.encode(obj)
+    def __init__(self):
+        self._local = threading.local()
+
+    def _get_encoder_and_buf(self) -> tuple[msgpack.Encoder, bytearray]:
+        """Return (or lazily create) the thread-local encoder + write buffer."""
+        loc = self._local
+        if not hasattr(loc, "encoder"):
+            loc.encoder = msgpack.Encoder(enc_hook=self._enc_hook)
+            loc.buf = bytearray(self._INITIAL_BUF)
+        return loc.encoder, loc.buf
+
+    def encode(self, obj: Any) -> memoryview:
+        """Encode an object.
+
+        Returns a memoryview into the thread-local buffer — zero allocation.
+        encode_into() truncates buf to the encoded length, so memoryview(buf)
+        is exactly the serialized bytes.  The view is valid until the next
+        encode() call on the same thread.
+        """
+        encoder, buf = self._get_encoder_and_buf()
+        encoder.encode_into(obj, buf)
+        return memoryview(buf)
 
     def _enc_hook(self, obj: Any) -> Any:
         """Custom encoding hook for non-standard types."""
@@ -341,11 +363,13 @@ class OmniMsgpackEncoder:
 class OmniMsgpackDecoder:
     """
     This implementation is adapted from vLLM’s MsgpackDecoder.
-    However, zero-copy support has not been implemented yet.
-
     Automatically reconstructs torch.Tensor, numpy.ndarray, PIL.Image,
     RequestOutput and CompletionOutput from their dict representations.
-    TODO: Enable zero-copy support.
+
+    decode() accepts bytes, bytearray, or memoryview — pass a memoryview of the
+    SHM buffer directly to avoid copying the full payload onto the Python heap.
+    Binary fields (tensor/ndarray data) are copied into bytes by msgspec during
+    decoding, so the input buffer can be released immediately after decode().
     """
 
     def __init__(self):
@@ -636,8 +660,13 @@ class OmniSerde:
         self.encoder = OmniMsgpackEncoder()
         self.decoder = OmniMsgpackDecoder()
 
-    def serialize(self, obj: Any) -> bytes:
-        """Serialize an object to bytes."""
+    def serialize(self, obj: Any) -> memoryview:
+        """Serialize an object.
+
+        Returns a memoryview into a thread-local buffer — zero allocation.
+        Valid until the next serialize() call on the same thread; callers that
+        need to persist the result must copy: bytes(view).
+        """
         return self.encoder.encode(obj)
 
     def deserialize(self, data: bytes | bytearray | memoryview) -> Any:

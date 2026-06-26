@@ -93,10 +93,10 @@ class OmniConnectorBase(ABC):
         """Serialize a Python object to bytes using centralized serializer."""
         from ..utils.serialization import OmniSerializer
 
-        return OmniSerializer.serialize(obj)
+        return bytes(OmniSerializer.serialize(obj))
 
     @staticmethod
-    def deserialize_obj(data: bytes) -> Any:
+    def deserialize_obj(data: bytes | bytearray | memoryview) -> Any:
         """Deserialize bytes to Python object using centralized serializer."""
         from ..utils.serialization import OmniSerializer
 

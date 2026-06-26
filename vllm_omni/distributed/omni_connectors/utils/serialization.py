@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import os
+import threading
+import time
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from typing import Any
@@ -11,6 +15,10 @@ import torch
 from msgspec import msgpack
 from PIL import Image
 from vllm.outputs import CompletionOutput, RequestOutput
+
+PROFILE_ENV = os.getenv("SHM_PROFILE", "0")
+PROFILE = PROFILE_ENV != "0"
+_PID = os.getpid()
 
 # Type markers for custom serialization
 _TENSOR_MARKER = "__tensor__"
@@ -84,40 +92,121 @@ class OmniMsgpackEncoder:
     def _encode_tensor(self, tensor: torch.Tensor) -> dict[str, Any]:
         """Encode torch.Tensor to dict."""
         t = tensor.detach().cpu()
+        start = time.perf_counter()
         # Handle 0-dimensional (scalar) tensors by reshaping to 1D first
+        called_reshape = False
+        called_contiguous = False
         if t.dim() == 0:
+            called_reshape = True
             t = t.reshape(1)
         if not t.is_contiguous():
+            called_contiguous = True
             t = t.contiguous()
         t = t.view(torch.uint8)
+        data = t.numpy().tobytes()
+        end = time.perf_counter()
+
+        if PROFILE:
+            print(
+                "SHM_PROFILE",
+                json.dumps(
+                    {
+                        "name": "_encode_tensor",
+                        "ph": "X",
+                        "ts": start * 1_000_000,
+                        "dur": (end - start) * 1_000_000,
+                        "pid": _PID,
+                        "tid": threading.get_ident(),
+                        "args": {
+                            "dtype": str(tensor.dtype).removeprefix("torch."),
+                            "shape": list(tensor.shape),
+                            "nbytes": tensor.nbytes,
+                            "device": str(tensor.device),
+                            "called_reshape": called_reshape,
+                            "called_contiguous": called_contiguous,
+                        },
+                    }
+                ),
+            )
+
         return {
             _TENSOR_MARKER: True,
             "dtype": str(tensor.dtype).removeprefix("torch."),
             "shape": list(tensor.shape),
-            "data": t.numpy().tobytes(),
+            "data": data,
         }
 
     def _encode_ndarray(self, arr: np.ndarray) -> dict[str, Any]:
         """Encode numpy.ndarray to dict."""
+        start = time.perf_counter()
+        called_contiguous = False
         if not arr.flags.c_contiguous:
+            called_contiguous = True
             arr = np.ascontiguousarray(arr)
+        data = arr.tobytes()
+        end = time.perf_counter()
+        if PROFILE:
+            print(
+                "SHM_PROFILE",
+                json.dumps(
+                    {
+                        "name": "_encode_ndarray",
+                        "ph": "X",
+                        "ts": start * 1_000_000,
+                        "dur": (end - start) * 1_000_000,
+                        "pid": _PID,
+                        "tid": threading.get_ident(),
+                        "args": {
+                            "dtype": arr.dtype.str,
+                            "shape": list(arr.shape),
+                            "nbytes": arr.nbytes,
+                            "called_contiguous": called_contiguous,
+                        },
+                    }
+                ),
+            )
         return {
             _NDARRAY_MARKER: True,
             "dtype": arr.dtype.str,
             "shape": list(arr.shape),
-            "data": arr.tobytes(),
+            "data": data,
         }
 
     def _encode_pil_image(self, img: Image.Image) -> dict[str, Any]:
         """Encode PIL.Image to dict."""
+        start = time.perf_counter()
+        called_contiguous = False
         arr = np.asarray(img, dtype=np.uint8)
         if not arr.flags.c_contiguous:
+            called_contiguous = True
             arr = np.ascontiguousarray(arr)
+        data = arr.tobytes()
+        end = time.perf_counter()
+        if PROFILE:
+            print(
+                "SHM_PROFILE",
+                json.dumps(
+                    {
+                        "name": "_encode_pil_image",
+                        "ph": "X",
+                        "ts": start * 1_000_000,
+                        "dur": (end - start) * 1_000_000,
+                        "pid": _PID,
+                        "tid": threading.get_ident(),
+                        "args": {
+                            "mode": img.mode,
+                            "shape": list(arr.shape),
+                            "nbytes": arr.nbytes,
+                            "called_contiguous": called_contiguous,
+                        },
+                    }
+                ),
+            )
         return {
             _PIL_IMAGE_MARKER: True,
             "mode": img.mode,
             "shape": list(arr.shape),
-            "data": arr.tobytes(),
+            "data": data,
         }
 
     def _encode_request_output(self, obj: RequestOutput) -> dict[str, Any]:
@@ -126,6 +215,7 @@ class OmniMsgpackEncoder:
         RequestOutput is not a dataclass, so we manually extract its attributes.
         Also handles dynamically added 'multimodal_output' attribute.
         """
+        start = time.perf_counter()
         # msgspec can serialize CompletionOutput dataclasses directly, but it
         # drops dynamic fields such as multimodal_output. Encode them manually
         # to preserve multimodal payloads across IPC.
@@ -158,10 +248,31 @@ class OmniMsgpackEncoder:
                 result["multimodal_output"] = dict(mm_output)
             else:
                 result["multimodal_output"] = mm_output
+        end = time.perf_counter()
+        if PROFILE:
+            print(
+                "SHM_PROFILE",
+                json.dumps(
+                    {
+                        "name": "_encode_request_output",
+                        "ph": "X",
+                        "ts": start * 1_000_000,
+                        "dur": (end - start) * 1_000_000,
+                        "pid": _PID,
+                        "tid": threading.get_ident(),
+                        "args": {
+                            "request_id": obj.request_id,
+                            "num_outputs": len(obj.outputs),
+                            "has_multimodal_output": mm_output is not None,
+                        },
+                    }
+                ),
+            )
         return result
 
     def _encode_completion_output(self, obj: CompletionOutput) -> dict[str, Any]:
         """Encode CompletionOutput to dict, preserving multimodal payloads."""
+        start = time.perf_counter()
         result = asdict(obj)
         mm_output = getattr(obj, "multimodal_output", None)
         if mm_output is not None:
@@ -170,6 +281,24 @@ class OmniMsgpackEncoder:
                 result["multimodal_output"] = dict(mm_output)
             else:
                 result["multimodal_output"] = mm_output
+        end = time.perf_counter()
+        if PROFILE:
+            print(
+                "SHM_PROFILE",
+                json.dumps(
+                    {
+                        "name": "_encode_completion_output",
+                        "ph": "X",
+                        "ts": start * 1_000_000,
+                        "dur": (end - start) * 1_000_000,
+                        "pid": _PID,
+                        "tid": threading.get_ident(),
+                        "args": {
+                            "has_multimodal_output": mm_output is not None,
+                        },
+                    }
+                ),
+            )
         return result
 
 
@@ -257,18 +386,39 @@ class OmniMsgpackDecoder:
         """
         from vllm_omni.outputs import OmniRequestOutput
 
+        start = time.perf_counter()
         try:
             # Use msgspec.convert for dataclass reconstruction
-            return msgspec.convert(obj, OmniRequestOutput)
+            result = msgspec.convert(obj, OmniRequestOutput)
         except Exception:
             try:
                 # Fallback: construct directly if msgspec.convert fails
                 # (e.g., if some fields are missing or have wrong types)
-                return OmniRequestOutput(**obj)
+                result = OmniRequestOutput(**obj)
             except Exception:
                 # If both attempts fail, return dict as-is (defensive fallback)
                 # This should rarely happen if _is_omni_request_output is correct
-                return obj
+                result = obj
+        end = time.perf_counter()
+        if PROFILE:
+            print(
+                "SHM_PROFILE",
+                json.dumps(
+                    {
+                        "name": "_decode_omni_request_output",
+                        "ph": "X",
+                        "ts": start * 1_000_000,
+                        "dur": (end - start) * 1_000_000,
+                        "pid": _PID,
+                        "tid": threading.get_ident(),
+                        "args": {
+                            "finished": obj.get("finished"),
+                            "final_output_type": obj.get("final_output_type"),
+                        },
+                    }
+                ),
+            )
+        return result
 
     def _decode_tensor(self, obj: dict[str, Any]) -> torch.Tensor:
         """Decode dict to torch.Tensor."""
@@ -276,35 +426,120 @@ class OmniMsgpackDecoder:
         shape = obj["shape"]
         data = obj["data"]
 
+        start = time.perf_counter()
         torch_dtype = getattr(torch, dtype_str)
         if not data:
-            return torch.empty(shape, dtype=torch_dtype)
-
-        buffer = bytearray(data) if isinstance(data, (bytes, memoryview)) else data
-        arr = torch.frombuffer(buffer, dtype=torch.uint8)
-        return arr.view(torch_dtype).reshape(shape)
+            result = torch.empty(shape, dtype=torch_dtype)
+        else:
+            buffer = bytearray(data) if isinstance(data, (bytes, memoryview)) else data
+            arr = torch.frombuffer(buffer, dtype=torch.uint8)
+            result = arr.view(torch_dtype).reshape(shape)
+        end = time.perf_counter()
+        if PROFILE:
+            print(
+                "SHM_PROFILE",
+                json.dumps(
+                    {
+                        "name": "_decode_tensor",
+                        "ph": "X",
+                        "ts": start * 1_000_000,
+                        "dur": (end - start) * 1_000_000,
+                        "pid": _PID,
+                        "tid": threading.get_ident(),
+                        "args": {
+                            "dtype": dtype_str,
+                            "shape": shape,
+                            "nbytes": len(data) if data else 0,
+                        },
+                    }
+                ),
+            )
+        return result
 
     def _decode_ndarray(self, obj: dict[str, Any]) -> np.ndarray:
         """Decode dict to numpy.ndarray."""
         dtype = obj["dtype"]
         shape = obj["shape"]
         data = obj["data"]
-        return np.frombuffer(data, dtype=dtype).reshape(shape)
+        start = time.perf_counter()
+        result = np.frombuffer(data, dtype=dtype).reshape(shape)
+        end = time.perf_counter()
+        if PROFILE:
+            print(
+                "SHM_PROFILE",
+                json.dumps(
+                    {
+                        "name": "_decode_ndarray",
+                        "ph": "X",
+                        "ts": start * 1_000_000,
+                        "dur": (end - start) * 1_000_000,
+                        "pid": _PID,
+                        "tid": threading.get_ident(),
+                        "args": {
+                            "dtype": dtype,
+                            "shape": shape,
+                            "nbytes": len(data) if data else 0,
+                        },
+                    }
+                ),
+            )
+        return result
 
     def _decode_pil_image(self, obj: dict[str, Any]) -> Image.Image:
         """Decode dict to PIL.Image."""
         mode = obj["mode"]
         shape = obj["shape"]
         data = obj["data"]
+        start = time.perf_counter()
         arr = np.frombuffer(data, dtype=np.uint8).reshape(shape)
-        return Image.fromarray(arr, mode=mode)
+        result = Image.fromarray(arr, mode=mode)
+        end = time.perf_counter()
+        if PROFILE:
+            print(
+                "SHM_PROFILE",
+                json.dumps(
+                    {
+                        "name": "_decode_pil_image",
+                        "ph": "X",
+                        "ts": start * 1_000_000,
+                        "dur": (end - start) * 1_000_000,
+                        "pid": _PID,
+                        "tid": threading.get_ident(),
+                        "args": {
+                            "mode": mode,
+                            "shape": shape,
+                            "nbytes": len(data) if data else 0,
+                        },
+                    }
+                ),
+            )
+        return result
 
     def _decode_completion_output(self, obj: dict[str, Any]) -> CompletionOutput:
         """Decode dict to CompletionOutput using msgspec.convert."""
         mm_output = obj.pop("multimodal_output", None)
+        start = time.perf_counter()
         co = msgspec.convert(obj, CompletionOutput)
         if mm_output is not None:
             setattr(co, "multimodal_output", mm_output)
+        end = time.perf_counter()
+        if PROFILE:
+            print(
+                "SHM_PROFILE",
+                json.dumps(
+                    {
+                        "name": "_decode_completion_output",
+                        "ph": "X",
+                        "ts": start * 1_000_000,
+                        "dur": (end - start) * 1_000_000,
+                        "pid": _PID,
+                        "tid": threading.get_ident(),
+                        "args": {
+                            "has_multimodal_output": mm_output is not None,
+                        },
+                    }
+                ),
+            )
         return co
 
     def _decode_request_output(self, obj: dict[str, Any]) -> RequestOutput:
@@ -322,6 +557,7 @@ class OmniMsgpackDecoder:
         mm_output = obj.pop("multimodal_output", None)
         multi_modal_placeholders = obj.pop("multi_modal_placeholders", None)
 
+        start = time.perf_counter()
         ro = RequestOutput(**obj)
 
         # Restore dynamic attributes that are not part of __init__.
@@ -329,6 +565,26 @@ class OmniMsgpackDecoder:
             setattr(ro, "multi_modal_placeholders", multi_modal_placeholders)
         if mm_output is not None:
             setattr(ro, "multimodal_output", mm_output)
+        end = time.perf_counter()
+        if PROFILE:
+            print(
+                "SHM_PROFILE",
+                json.dumps(
+                    {
+                        "name": "_decode_request_output",
+                        "ph": "X",
+                        "ts": start * 1_000_000,
+                        "dur": (end - start) * 1_000_000,
+                        "pid": _PID,
+                        "tid": threading.get_ident(),
+                        "args": {
+                            "request_id": obj.get("request_id"),
+                            "num_outputs": len(obj.get("outputs", [])),
+                            "has_multimodal_output": mm_output is not None,
+                        },
+                    }
+                ),
+            )
         return ro
 
 

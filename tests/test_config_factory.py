@@ -1202,7 +1202,7 @@ class TestMingFlashOmniPipeline:
 
         s = p.get_stage(1)
         assert isinstance(s, StagePipelineConfig)
-        module_path, _, attr = s.custom_process_input_func.rpartition(".")
+        module_path, _, attr = s.sync_process_input_func.rpartition(".")
         module = importlib.import_module(module_path)
         assert callable(getattr(module, attr))
 

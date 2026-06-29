@@ -57,7 +57,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         """
         from ..utils.serialization import OmniSerializer
 
-        return OmniSerializer.serialize(obj)
+        return OmniSerializer.serialize_view(obj)
 
     def put(
         self,
@@ -154,7 +154,10 @@ class SharedMemoryConnector(OmniConnectorBase):
             # Decode directly from the SHM mapping — no intermediate bytes copy.
             obj = self.deserialize_obj(mv)
             del mv
-            shm.close()
+            try:
+                shm.close()
+            except Exception:
+                pass
             try:
                 shm.unlink()
             except Exception:

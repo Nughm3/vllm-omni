@@ -5,7 +5,7 @@ import json
 import os
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Buffer, Mapping
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
@@ -375,7 +375,7 @@ class OmniMsgpackDecoder:
     def __init__(self):
         self.decoder = msgpack.Decoder()
 
-    def decode(self, data: bytes | bytearray | memoryview) -> Any:
+    def decode(self, data: Buffer) -> Any:
         """Decode bytes to object."""
         result = self.decoder.decode(data)
         return self._post_process(result)
@@ -660,16 +660,26 @@ class OmniSerde:
         self.encoder = OmniMsgpackEncoder()
         self.decoder = OmniMsgpackDecoder()
 
-    def serialize(self, obj: Any) -> memoryview:
+    def serialize(self, obj: Any) -> bytes:
         """Serialize an object.
 
+        This method allocates a bytes object from the buffer that the serializer
+        writes to, making it safe for general use.
+        """
+        return bytes(self.encoder.encode(obj))
+
+    def serialize_view(self, obj: Any) -> memoryview:
+        """Serialize an object into a memoryview.
+
         Returns a memoryview into a thread-local buffer — zero allocation.
-        Valid until the next serialize() call on the same thread; callers that
-        need to persist the result must copy: bytes(view).
+        Valid until the next serialize operation on the same thread.
+
+        If you need the object beyond this lifetime, use the serialize() method
+        instead.
         """
         return self.encoder.encode(obj)
 
-    def deserialize(self, data: bytes | bytearray | memoryview) -> Any:
+    def deserialize(self, data: Buffer) -> Any:
         """Deserialize bytes to an object."""
         return self.decoder.decode(data)
 

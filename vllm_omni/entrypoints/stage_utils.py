@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Buffer
 from multiprocessing import shared_memory as _shm
 from typing import Any
 
@@ -179,7 +180,7 @@ def serialize_obj(obj: Any) -> bytes:
     return OmniSerializer.serialize(obj)
 
 
-def shm_write_bytes(payload: bytes | bytearray | memoryview, name: str | None = None) -> dict[str, Any]:
+def shm_write_bytes(payload: Buffer, name: str | None = None) -> dict[str, Any]:
     """Write bytes into SharedMemory and return meta dict {name,size}.
 
     Caller should close the segment; the receiver should unlink.

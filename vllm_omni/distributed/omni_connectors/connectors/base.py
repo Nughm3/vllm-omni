@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
+from collections.abc import Buffer
 from typing import Any
 
 from ..utils.logging import get_connector_logger
@@ -89,14 +90,14 @@ class OmniConnectorBase(ABC):
         self.close()
 
     @staticmethod
-    def serialize_obj(obj: Any) -> bytes:
+    def serialize_obj(obj: Any) -> Buffer:
         """Serialize a Python object to bytes using centralized serializer."""
         from ..utils.serialization import OmniSerializer
 
-        return bytes(OmniSerializer.serialize(obj))
+        return OmniSerializer.serialize(obj)
 
     @staticmethod
-    def deserialize_obj(data: bytes | bytearray | memoryview) -> Any:
+    def deserialize_obj(data: Buffer) -> Any:
         """Deserialize bytes to Python object using centralized serializer."""
         from ..utils.serialization import OmniSerializer
 

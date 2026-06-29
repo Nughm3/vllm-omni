@@ -156,11 +156,13 @@ class SharedMemoryConnector(OmniConnectorBase):
             del mv
             try:
                 shm.close()
-            except Exception:
+            except Exception as e:
+                logger.error(f"Failed to close SHM in _get_data_with_lock: {e}")
                 pass
             try:
                 shm.unlink()
-            except Exception:
+            except Exception as e:
+                logger.error(f"Failed to unlink SHM in _get_data_with_lock: {e}")
                 pass
             shm = None
             t_deserialize_end = time.perf_counter()
@@ -190,7 +192,16 @@ class SharedMemoryConnector(OmniConnectorBase):
             return None
         finally:
             if shm is not None:
-                shm.close()
+                # shm.close() (munmap) may fail with BufferError if the decoded
+                # struct holds memoryview fields that alias shm.buf — this is
+                # expected when the typed decoder returns zero-copy views.  Swallow
+                # the error; the mmap is cleaned up automatically by Python's GC
+                # when the last reference (via the tensor/array reference chain) is
+                # released.  Always unlink the name so /dev/shm is not leaked.
+                try:
+                    shm.close()
+                except Exception:
+                    pass
                 try:
                     shm.unlink()
                 except Exception:

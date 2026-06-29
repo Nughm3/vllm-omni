@@ -37,7 +37,7 @@ class ScalarTensorPayload(msgspec.Struct, tag=True):
 
     dtype: str
     shape: list[int]
-    value: float  # torch will truncate floats to integers on decode
+    value: float | int | bool  # tensor.item() returns bool/int/float depending on dtype
 
 
 class TensorPayload(msgspec.Struct, tag=True):
@@ -126,6 +126,21 @@ class OmniMsgpackEncoder:
         encode() call on the same thread.
         """
         encoder, buf = self._get_encoder_and_buf()
+        # Native msgspec types bypass enc_hook and produce untagged roots.
+        # The typed decoder requires a tagged root.
+        #
+        # - Plain dict: wrap directly.
+        # - Untagged msgspec.Struct (e.g. OmniPayloadStruct, _StructBase subclasses):
+        #   extract fields into a plain dict preserving the original Python values,
+        #   then wrap.  Field values that are tensors/ndarrays will go through
+        #   enc_hook when msgspec encodes the DictPayload, so no special handling
+        #   is needed.  We cannot use msgspec.to_builtins() here because it cannot
+        #   convert torch.Tensor or numpy.ndarray.
+        if isinstance(obj, dict):
+            obj = DictPayload(obj)
+        elif isinstance(obj, msgspec.Struct) and not isinstance(obj, OmniConnectorPayload.__args__):
+            fields_dict = {fi.name: getattr(obj, fi.name) for fi in msgspec.structs.fields(obj)}
+            obj = DictPayload(fields_dict)
         encoder.encode_into(obj, buf)
         return memoryview(buf)
 
@@ -165,10 +180,6 @@ class OmniMsgpackEncoder:
         # Other dataclasses
         if is_dataclass(obj) and not isinstance(obj, type):
             return DictPayload(asdict(obj))
-
-        # dict
-        if isinstance(obj, dict):
-            return DictPayload(obj)
 
         raise TypeError(
             f"Object of type {type(obj).__name__} is not serializable. "
@@ -356,7 +367,7 @@ class OmniMsgpackEncoder:
         mm_output = getattr(obj, "multimodal_output", None)
         if mm_output is not None:
             if isinstance(mm_output, Mapping):
-                result["multimodal_output"] = dict(mm_output)
+                result["multimodal_output"] = DictPayload(dict(mm_output))
             else:
                 result["multimodal_output"] = mm_output
 
@@ -392,7 +403,7 @@ class OmniMsgpackEncoder:
         if mm_output is not None:
             # Convert MultimodalPayload to plain dict for wire format
             if isinstance(mm_output, Mapping):
-                result["multimodal_output"] = dict(mm_output)
+                result["multimodal_output"] = DictPayload(dict(mm_output))
             else:
                 result["multimodal_output"] = mm_output
 
@@ -431,149 +442,84 @@ class OmniMsgpackDecoder:
     """
 
     def __init__(self):
-        # Generic decoder: binary fields decode to bytes (copied, not referenced),
-        # so the input SHM buffer can be safely unmapped after decode() returns.
-        # A typed decoder (msgpack.Decoder(OmniConnectorPayload)) would return
-        # memoryview fields that alias the input buffer, causing BufferError on
-        # shm.close(), and would reject untagged root dicts with "missing field
-        # 'type'".  Tag-string dispatch in _post_process handles the Struct types.
-        self.decoder = msgpack.Decoder()
+        # Typed decoder: the root is always an OmniConnectorPayload (the encoder
+        # wraps plain dicts in DictPayload).  Binary fields (TensorPayload.data
+        # etc.) are decoded as memoryview objects that ALIAS the input buffer.
+        # When decoding from SHM, the connector must not munmap the SHM segment
+        # while objects derived from the payload (tensors, arrays) are still alive.
+        # See SharedMemoryConnector._get_data_with_lock for the lifetime contract.
+        self.decoder = msgpack.Decoder(OmniConnectorPayload)
 
     def decode(self, data: Buffer) -> Any:
         """Decode bytes to object."""
-        payload = self.decoder.decode(data)
-        return self._post_process(payload)
+        try:
+            return self._post_process(self.decoder.decode(data))
+        except msgspec.DecodeError:
+            # Root is not a tagged OmniConnectorPayload — most likely a bare
+            # msgspec.Struct (e.g. OmniPayloadStruct) which msgspec encodes
+            # natively as an untagged map without calling enc_hook.  Fall back
+            # to a generic decode and let _post_process handle the plain dict.
+            return self._post_process(msgpack.decode(data))
 
     def _post_process(self, obj: Any) -> Any:
         """Recursively restore typed objects from their wire representations."""
+        # Root-level Struct instances from the typed decoder — direct dispatch.
+        if isinstance(obj, ScalarTensorPayload):
+            return self._decode_scalar_tensor(obj)
+        if isinstance(obj, TensorPayload):
+            return self._decode_tensor(obj)
+        if isinstance(obj, NdarrayPayload):
+            return self._decode_ndarray(obj)
+        if isinstance(obj, ImagePayload):
+            return self._decode_pil_image(obj)
+        if isinstance(obj, SlicePayload):
+            return slice(obj.start, obj.stop, obj.step)
+        if isinstance(obj, BytesPayload):
+            return obj.payload
+        if isinstance(obj, DictPayload):
+            return self._post_process_dict(obj.payload)
+
+        # Nested raw values from DictPayload.payload (typed as Any by msgspec).
         if isinstance(obj, dict):
-            # Tagged-struct format: dispatch on the msgspec Struct tag field.
-            type_tag = obj.get("type")
-            if type_tag is not None:
-                if type_tag == "ScalarTensorPayload":
-                    return self._decode_scalar_tensor_dict(obj)
-                if type_tag == "TensorPayload":
-                    return self._decode_tensor_dict(obj)
-                if type_tag == "NdarrayPayload":
-                    return self._decode_ndarray_dict(obj)
-                if type_tag == "ImagePayload":
-                    return self._decode_pil_image_dict(obj)
-                if type_tag == "SlicePayload":
-                    return slice(obj["start"], obj["stop"], obj["step"])
-                if type_tag == "BytesPayload":
-                    return obj["payload"]
-                if type_tag == "DictPayload":
-                    return self._post_process(obj["payload"])
-                # Unknown tag: fall through to generic dict processing.
-
-            # Process values recursively first
-            processed = {k: self._post_process(v) for k, v in obj.items()}
-
-            # Check if this looks like an OmniRequestOutput (check before RequestOutput
-            # since OmniRequestOutput may also have some RequestOutput-like fields)
-            if self._is_omni_request_output(processed):
-                return self._decode_omni_request_output(processed)
-
-            # Check if this looks like a RequestOutput
-            if _REQUEST_OUTPUT_KEYS.issubset(processed.keys()):
-                return self._decode_request_output(processed)
-
-            # Check if this looks like a CompletionOutput
-            if _COMPLETION_OUTPUT_KEYS.issubset(processed.keys()):
-                return self._decode_completion_output(processed)
-
-            return processed
-
+            return self._post_process_dict(obj)
         if isinstance(obj, list):
             return [self._post_process(item) for item in obj]
-
         if isinstance(obj, tuple):
             return tuple(self._post_process(item) for item in obj)
-
         return obj
 
-    def _is_omni_request_output(self, obj: dict[str, Any]) -> bool:
-        """Check if a dict looks like an OmniRequestOutput.
+    def _post_process_dict(self, d: dict) -> Any:
+        """Process the values of a plain dict and reconstruct typed objects."""
+        processed = {k: self._convert_value(v) for k, v in d.items()}
 
-        OmniRequestOutput can be identified by:
-        - Having 'finished' and 'final_output_type' fields (unique to OmniRequestOutput)
-        - OR having 'finished' and 'images' fields (diffusion mode)
+        # Heuristic reconstruction of complex types not represented as tagged structs.
+        if self._is_omni_request_output(processed):
+            return self._decode_omni_request_output(processed)
+        if _REQUEST_OUTPUT_KEYS.issubset(processed.keys()):
+            return self._decode_request_output(processed)
+        if _COMPLETION_OUTPUT_KEYS.issubset(processed.keys()):
+            return self._decode_completion_output(processed)
+        return processed
+
+    def _convert_value(self, v: Any) -> Any:
+        """Convert a single value from DictPayload.payload.
+
+        Uses msgspec.convert for tagged dicts so nested payloads (tensors,
+        images, nested DictPayloads, etc.) are reconstructed with type
+        validation rather than heuristic string matching.
         """
-        # Must have 'finished' field
-        if "finished" not in obj:
-            return False
+        if isinstance(v, dict):
+            if "type" in v:
+                try:
+                    return self._post_process(msgspec.convert(v, OmniConnectorPayload, strict=False))
+                except msgspec.ValidationError:
+                    pass
+            return self._post_process_dict(v)
+        if isinstance(v, list):
+            return [self._convert_value(item) for item in v]
+        return v
 
-        # Check for unique identifier: 'final_output_type'
-        if "final_output_type" in obj:
-            return True
-
-        # Alternative: check for 'images' field (diffusion mode)
-        if "images" in obj:
-            return True
-
-        return False
-
-    def _decode_omni_request_output(self, obj: dict[str, Any]) -> Any:
-        """Decode dict to OmniRequestOutput.
-
-        OmniRequestOutput is a dataclass, so we can use msgspec.convert
-        or construct it directly.
-        """
-        from vllm_omni.outputs import OmniRequestOutput
-
-        start = time.perf_counter()
-        try:
-            # The dict contains already-reconstructed Python objects (tensors,
-            # ndarrays, etc.) so msgspec.convert won't work here — go straight
-            # to direct construction.
-            result = OmniRequestOutput(**obj)
-        except Exception:
-            # If construction fails, return dict as-is (defensive fallback)
-            result = obj
-        end = time.perf_counter()
-        if PROFILE:
-            print(
-                "SHM_PROFILE",
-                json.dumps(
-                    {
-                        "name": "_decode_omni_request_output",
-                        "ph": "X",
-                        "ts": start * 1_000_000,
-                        "dur": (end - start) * 1_000_000,
-                        "pid": _PID,
-                        "tid": threading.get_ident(),
-                        "args": {
-                            "finished": obj.get("finished"),
-                            "final_output_type": obj.get("final_output_type"),
-                        },
-                    }
-                ),
-            )
-        return result
-
-    # --- dict-based helpers (generic decoder returns raw dicts, not Struct instances) ---
-
-    def _decode_scalar_tensor_dict(self, obj: dict) -> torch.Tensor:
-        return torch.tensor(obj["value"], dtype=getattr(torch, obj["dtype"])).reshape(obj["shape"])
-
-    def _decode_tensor_dict(self, obj: dict) -> torch.Tensor:
-        dtype_str, shape, data = obj["dtype"], obj["shape"], obj["data"]
-        torch_dtype = getattr(torch, dtype_str)
-        if not data:
-            return torch.empty(shape, dtype=torch_dtype)
-        # Copy into bytearray is necessary as the tensor may be mutated, aliasing the memoryview
-        buffer = bytearray(data) if isinstance(data, bytes | memoryview) else data
-        arr = torch.frombuffer(buffer, dtype=torch.uint8)
-        return arr.view(torch_dtype).reshape(shape)
-
-    def _decode_ndarray_dict(self, obj: dict) -> np.ndarray:
-        return np.frombuffer(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"])
-
-    def _decode_pil_image_dict(self, obj: dict) -> Image.Image:
-        arr = np.frombuffer(obj["data"], dtype=np.uint8).reshape(obj["shape"])
-        return Image.fromarray(arr, mode=obj["mode"])
-
-    # --- Struct-typed helpers (kept for direct use if a typed decoder is re-introduced) ---
+    # --- Struct-typed decode methods (primary path with typed decoder) ---
 
     def _decode_scalar_tensor(self, payload: ScalarTensorPayload) -> torch.Tensor:
         """Decode a scalar-encoded tensor back to a torch.Tensor."""
@@ -743,6 +689,65 @@ class OmniMsgpackDecoder:
                 ),
             )
         return ro
+
+    def _is_omni_request_output(self, obj: dict[str, Any]) -> bool:
+        """Check if a dict looks like an OmniRequestOutput.
+
+        OmniRequestOutput can be identified by:
+        - Having 'finished' and 'final_output_type' fields (unique to OmniRequestOutput)
+        - OR having 'finished' and 'images' fields (diffusion mode)
+        """
+        # Must have 'finished' field
+        if "finished" not in obj:
+            return False
+
+        # Check for unique identifier: 'final_output_type'
+        if "final_output_type" in obj:
+            return True
+
+        # Alternative: check for 'images' field (diffusion mode)
+        if "images" in obj:
+            return True
+
+        return False
+
+    def _decode_omni_request_output(self, obj: dict[str, Any]) -> Any:
+        """Decode dict to OmniRequestOutput.
+
+        OmniRequestOutput is a dataclass, so we can use msgspec.convert
+        or construct it directly.
+        """
+        from vllm_omni.outputs import OmniRequestOutput
+
+        start = time.perf_counter()
+        try:
+            # The dict contains already-reconstructed Python objects (tensors,
+            # ndarrays, etc.) so msgspec.convert won't work here — go straight
+            # to direct construction.
+            result = OmniRequestOutput(**obj)
+        except Exception:
+            # If construction fails, return dict as-is (defensive fallback)
+            result = obj
+        end = time.perf_counter()
+        if PROFILE:
+            print(
+                "SHM_PROFILE",
+                json.dumps(
+                    {
+                        "name": "_decode_omni_request_output",
+                        "ph": "X",
+                        "ts": start * 1_000_000,
+                        "dur": (end - start) * 1_000_000,
+                        "pid": _PID,
+                        "tid": threading.get_ident(),
+                        "args": {
+                            "finished": obj.get("finished"),
+                            "final_output_type": obj.get("final_output_type"),
+                        },
+                    }
+                ),
+            )
+        return result
 
 
 class OmniSerde:

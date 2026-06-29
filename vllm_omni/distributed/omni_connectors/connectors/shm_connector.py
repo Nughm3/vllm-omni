@@ -31,12 +31,16 @@ class SharedMemoryConnector(OmniConnectorBase):
     the connector silently falls back to key-based lookup.
     """
 
+    # Initial buffer size for thread-local encode buffer
+    _INITIAL_BUF = 65536
+
     def __init__(self, config: dict[str, Any]):
         self.config = config
         self.stage_id = config.get("stage_id", -1)
         self.device = config.get("device", "cuda:0")
         self.threshold = int(config.get("shm_threshold_bytes", 65536))
         self.inline_small_payloads = bool(config.get("inline_small_payloads", False))
+        self._local = threading.local()
         self._pending_keys: set[str] = set()
         self._metrics = {
             "puts": 0,
@@ -46,18 +50,21 @@ class SharedMemoryConnector(OmniConnectorBase):
             "inline_writes": 0,
         }
 
-    @staticmethod
-    def serialize_obj(obj: Any) -> memoryview:
-        """Return a memoryview into the thread-local encode buffer — zero allocation.
+    def _serialize(self, obj: Any) -> memoryview:
+        """Serialize obj into the connector's thread-local buffer and return a view.
 
-        Valid until the next serialize_obj() call on the same thread.  The SHM
-        write path (shm_write_bytes) consumes this synchronously before returning,
-        so the view is always released before re-encoding.  The inline path copies
-        to bytes explicitly since that metadata travels via IPC.
+        The returned memoryview is valid only until the next _serialize() call
+        on the same thread.  The SHM write path (shm_write_bytes) consumes the
+        view synchronously before returning, so the invariant holds in put().
+        The inline path copies to bytes explicitly before storing in metadata.
         """
         from ..utils.serialization import OmniSerializer
 
-        return OmniSerializer.serialize_view(obj)
+        if not hasattr(self._local, "encode_buf"):
+            self._local.encode_buf = bytearray(self._INITIAL_BUF)
+        buf = self._local.encode_buf
+        OmniSerializer.serialize_into(obj, buf)
+        return memoryview(buf)
 
     def put(
         self,
@@ -72,7 +79,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             # we might double-serialize if we're not careful, but here we assume
             # if it's huge we use SHM, or if Ray, threshold is maxsize.
             t_serialize_start = time.perf_counter()
-            payload = self.serialize_obj(data)
+            payload = self._serialize(data)
             t_serialize_end = time.perf_counter()
             size = len(payload)
 

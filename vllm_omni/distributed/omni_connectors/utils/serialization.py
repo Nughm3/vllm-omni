@@ -44,37 +44,41 @@ class OmniMsgpackEncoder:
     Handles torch.Tensor, numpy.ndarray, PIL.Image, RequestOutput and
     CompletionOutput by converting them to serializable dict representations.
 
-    Encoding is zero-copy for the caller: encode() returns a memoryview into a
-    thread-local bytearray that is reused across calls, avoiding a Python bytes
-    allocation per encode.  Callers that need to persist the result beyond the
-    next encode() call on the same thread must copy (bytes(view)).
+    The encoder instance itself is shared; buffer ownership is left to the
+    caller.  Use encode_into() to write into a caller-owned buffer (e.g. a
+    connector’s thread-local bytearray) for zero-copy paths, or encode() for
+    a one-shot bytearray when convenience matters more than allocation count.
     """
 
-    # Initial per-thread encode buffer size; grows automatically via encode_into.
-    _INITIAL_BUF = 65536
-
     def __init__(self):
-        self._local = threading.local()
+        self.encoder = msgpack.Encoder(enc_hook=self._enc_hook)
 
-    def _get_encoder_and_buf(self) -> tuple[msgpack.Encoder, bytearray]:
-        """Return (or lazily create) the thread-local encoder + write buffer."""
-        loc = self._local
-        if not hasattr(loc, "encoder"):
-            loc.encoder = msgpack.Encoder(enc_hook=self._enc_hook)
-            loc.buf = bytearray(self._INITIAL_BUF)
-        return loc.encoder, loc.buf
+    def encode(self, obj: Any) -> bytes:
+        """Encode obj and return a new bytes object containing the result.
 
-    def encode(self, obj: Any) -> memoryview:
-        """Encode an object.
-
-        Returns a memoryview into the thread-local buffer — zero allocation.
-        encode_into() truncates buf to the encoded length, so memoryview(buf)
-        is exactly the serialized bytes.  The view is valid until the next
-        encode() call on the same thread.
+        Allocates a new bytes object. For a hot path use encode_into() with a
+        pre-allocated caller-owned buffer instead.
         """
-        encoder, buf = self._get_encoder_and_buf()
-        encoder.encode_into(obj, buf)
-        return memoryview(buf)
+        return self.encoder.encode(obj)
+
+    def encode_into(self, obj: Any, buf: bytearray) -> None:
+        """Encode obj into buf in-place.
+
+        buf is grown automatically if the encoded output exceeds its current
+        length, and truncated to the encoded length on success.  The caller
+        owns buf and controls its lifetime; a memoryview(buf) taken after this
+        call is valid as long as no further encode_into call on the same buf
+        occurs (which would resize it and invalidate open exports).
+
+        Thread safety: encode_into() must not be called concurrently on the
+        same OmniMsgpackEncoder instance from multiple threads — the underlying
+        msgpack.Encoder may have internal scratch state that is not protected by
+        the GIL when encoding large binary payloads.  encode() is safe to call
+        concurrently because each call allocates its own output buffer.  In
+        practice encode_into() is only called from the SHM connector's single
+        save_thread, so no additional synchronisation is required today.
+        """
+        self.encoder.encode_into(obj, buf)
 
     def _enc_hook(self, obj: Any) -> Any:
         """Custom encoding hook for non-standard types."""
@@ -661,23 +665,24 @@ class OmniSerde:
         self.decoder = OmniMsgpackDecoder()
 
     def serialize(self, obj: Any) -> bytes:
-        """Serialize an object.
+        """Serialize obj and return an owned bytes object.
 
-        This method allocates a bytes object from the buffer that the serializer
-        writes to, making it safe for general use.
+        Allocates a bytearray, encodes into it, then copies to bytes.  Safe for
+        general use: the result can be stored indefinitely.  One allocation per
+        call; prefer serialize_into() with a caller-owned buffer on hot paths.
         """
         return bytes(self.encoder.encode(obj))
 
-    def serialize_view(self, obj: Any) -> memoryview:
-        """Serialize an object into a memoryview.
+    def serialize_into(self, obj: Any, buf: bytearray) -> None:
+        """Serialize obj into caller-owned buf in-place.
 
-        Returns a memoryview into a thread-local buffer — zero allocation.
-        Valid until the next serialize operation on the same thread.
-
-        If you need the object beyond this lifetime, use the serialize() method
-        instead.
+        buf is grown automatically and truncated to the encoded length on
+        success.  The caller is responsible for buf's lifetime.  Taking a
+        memoryview(buf) after this call gives a zero-copy view of the encoded
+        bytes; that view is only valid until the next serialize_into call on
+        the same buf.
         """
-        return self.encoder.encode(obj)
+        self.encoder.encode_into(obj, buf)
 
     def deserialize(self, data: Buffer) -> Any:
         """Deserialize bytes to an object."""

@@ -20,12 +20,6 @@ PROFILE_ENV = os.getenv("SHM_PROFILE", "0")
 PROFILE = PROFILE_ENV != "0"
 _PID = os.getpid()
 
-# Type markers for custom serialization
-_TENSOR_MARKER = "__tensor__"
-_SCALAR_TENSOR_MARKER = "__scalar_tensor__"
-_NDARRAY_MARKER = "__ndarray__"
-_PIL_IMAGE_MARKER = "__pil_image__"
-
 # Keys that identify a RequestOutput dict (for reconstruction)
 _REQUEST_OUTPUT_KEYS = frozenset({"request_id", "prompt", "prompt_token_ids", "outputs", "finished"})
 
@@ -36,6 +30,65 @@ _COMPLETION_OUTPUT_KEYS = frozenset({"index", "text", "token_ids", "finish_reaso
 # OmniRequestOutput has 'final_output_type' which is unique, or can be identified by
 # having 'finished' and ('images' or 'final_output_type')
 _OMNI_REQUEST_OUTPUT_KEYS = frozenset({"finished", "final_output_type"})
+
+
+class ScalarTensorPayload(msgspec.Struct, tag=True):
+    """PyTorch tensor payload specialized to avoid overhead for scalar tensors."""
+
+    dtype: str
+    shape: list[int]
+    value: float  # torch will truncate floats to integers on decode
+
+
+class TensorPayload(msgspec.Struct, tag=True):
+    """PyTorch tensor payload."""
+
+    dtype: str
+    shape: list[int]
+    data: memoryview
+
+
+class NdarrayPayload(msgspec.Struct, tag=True):
+    """NumPy ndarray payload."""
+
+    dtype: str
+    shape: list[int]
+    data: memoryview
+
+
+class ImagePayload(msgspec.Struct, tag=True):
+    """PIL image payload."""
+
+    mode: str
+    shape: list[int]
+    data: memoryview
+
+
+class SlicePayload(msgspec.Struct, tag=True):
+    """Slice object payload."""
+
+    start: int | None
+    stop: int | None
+    step: int | None
+
+
+class BytesPayload(msgspec.Struct, tag=True):
+    """Bytes payload."""
+
+    payload: bytes
+
+
+# TODO: add type hint
+class DictPayload(msgspec.Struct, tag=True):
+    """Fallback payload for encoding arbitrary dict-shaped data."""
+
+    # Need to wrap dict in a tagged Struct to enable tagged union optimizations
+    payload: dict[str, Any]
+
+
+OmniConnectorPayload = (
+    ScalarTensorPayload | TensorPayload | NdarrayPayload | ImagePayload | BytesPayload | SlicePayload | DictPayload
+)
 
 
 class OmniMsgpackEncoder:
@@ -76,7 +129,7 @@ class OmniMsgpackEncoder:
         encoder.encode_into(obj, buf)
         return memoryview(buf)
 
-    def _enc_hook(self, obj: Any) -> Any:
+    def _enc_hook(self, obj: Any) -> OmniConnectorPayload:
         """Custom encoding hook for non-standard types."""
         # torch.Tensor — single-element tensors skip the heavy encode path
         if isinstance(obj, torch.Tensor):
@@ -92,6 +145,15 @@ class OmniMsgpackEncoder:
         if isinstance(obj, Image.Image):
             return self._encode_pil_image(obj)
 
+        # byte-like objects — modern msgspec encodes memoryview/bytearray natively
+        # as msgpack bin without reaching this hook; this is a compatibility fallback.
+        if isinstance(obj, (memoryview, bytearray)):
+            return BytesPayload(bytes(obj))
+
+        # slice
+        if isinstance(obj, slice):
+            return SlicePayload(start=obj.start, stop=obj.stop, step=obj.step)
+
         # RequestOutput (not a dataclass, needs special handling)
         if isinstance(obj, RequestOutput):
             return self._encode_request_output(obj)
@@ -102,16 +164,11 @@ class OmniMsgpackEncoder:
 
         # Other dataclasses
         if is_dataclass(obj) and not isinstance(obj, type):
-            return asdict(obj)
+            return DictPayload(asdict(obj))
 
-        # slice
-        if isinstance(obj, slice):
-            return (obj.start, obj.stop, obj.step)
-
-        # byte-like objects — modern msgspec encodes memoryview/bytearray natively
-        # as msgpack bin without reaching this hook; this is a compatibility fallback.
-        if isinstance(obj, (memoryview, bytearray)):
-            return bytes(obj)
+        # dict
+        if isinstance(obj, dict):
+            return DictPayload(obj)
 
         raise TypeError(
             f"Object of type {type(obj).__name__} is not serializable. "
@@ -119,16 +176,14 @@ class OmniMsgpackEncoder:
             "RequestOutput, and standard Python types (dict, list, str, int, float, bool, None, bytes)."
         )
 
-    def _encode_scalar_tensor(self, tensor: torch.Tensor) -> dict[str, Any]:
+    def _encode_scalar_tensor(self, tensor: torch.Tensor) -> ScalarTensorPayload:
         """Encode a single-element tensor as a Python scalar — avoids detach/cpu/view/numpy overhead."""
-        return {
-            _SCALAR_TENSOR_MARKER: True,
-            "dtype": str(tensor.dtype).removeprefix("torch."),
-            "shape": list(tensor.shape),
-            "value": tensor.item(),
-        }
+        tensor = tensor.detach().cpu()
+        return ScalarTensorPayload(
+            dtype=str(tensor.dtype).removeprefix("torch."), shape=list(tensor.shape), value=tensor.item()
+        )
 
-    def _encode_tensor(self, tensor: torch.Tensor) -> dict[str, Any]:
+    def _encode_tensor(self, tensor: torch.Tensor) -> TensorPayload:
         """Encode torch.Tensor to dict."""
         called_reshape = False
         called_contiguous = False
@@ -177,14 +232,13 @@ class OmniMsgpackEncoder:
                 ),
             )
 
-        return {
-            _TENSOR_MARKER: True,
-            "dtype": str(tensor.dtype).removeprefix("torch."),
-            "shape": list(tensor.shape),
-            "data": data,
-        }
+        return TensorPayload(
+            dtype=str(tensor.dtype).removeprefix("torch."),
+            shape=list(tensor.shape),
+            data=data,
+        )
 
-    def _encode_ndarray(self, arr: np.ndarray) -> dict[str, Any]:
+    def _encode_ndarray(self, arr: np.ndarray) -> NdarrayPayload:
         """Encode numpy.ndarray to dict."""
         called_contiguous = False
 
@@ -218,14 +272,13 @@ class OmniMsgpackEncoder:
                 ),
             )
 
-        return {
-            _NDARRAY_MARKER: True,
-            "dtype": arr.dtype.str,
-            "shape": list(arr.shape),
-            "data": data,
-        }
+        return NdarrayPayload(
+            dtype=arr.dtype.str,
+            shape=list(arr.shape),
+            data=data,
+        )
 
-    def _encode_pil_image(self, img: Image.Image) -> dict[str, Any]:
+    def _encode_pil_image(self, img: Image.Image) -> ImagePayload:
         """Encode PIL.Image to dict."""
         called_contiguous = False
 
@@ -260,14 +313,14 @@ class OmniMsgpackEncoder:
                     }
                 ),
             )
-        return {
-            _PIL_IMAGE_MARKER: True,
-            "mode": img.mode,
-            "shape": list(arr.shape),
-            "data": data,
-        }
 
-    def _encode_request_output(self, obj: RequestOutput) -> dict[str, Any]:
+        return ImagePayload(
+            mode=img.mode,
+            shape=list(arr.shape),
+            data=data,
+        )
+
+    def _encode_request_output(self, obj: RequestOutput) -> DictPayload:
         """Encode RequestOutput to dict.
 
         RequestOutput is not a dataclass, so we manually extract its attributes.
@@ -306,6 +359,7 @@ class OmniMsgpackEncoder:
                 result["multimodal_output"] = dict(mm_output)
             else:
                 result["multimodal_output"] = mm_output
+
         end = time.perf_counter()
         if PROFILE:
             print(
@@ -326,11 +380,13 @@ class OmniMsgpackEncoder:
                     }
                 ),
             )
-        return result
 
-    def _encode_completion_output(self, obj: CompletionOutput) -> dict[str, Any]:
+        return DictPayload(result)
+
+    def _encode_completion_output(self, obj: CompletionOutput) -> DictPayload:
         """Encode CompletionOutput to dict, preserving multimodal payloads."""
         start = time.perf_counter()
+
         result = asdict(obj)
         mm_output = getattr(obj, "multimodal_output", None)
         if mm_output is not None:
@@ -339,6 +395,7 @@ class OmniMsgpackEncoder:
                 result["multimodal_output"] = dict(mm_output)
             else:
                 result["multimodal_output"] = mm_output
+
         end = time.perf_counter()
         if PROFILE:
             print(
@@ -357,7 +414,8 @@ class OmniMsgpackEncoder:
                     }
                 ),
             )
-        return result
+
+        return DictPayload(result)
 
 
 class OmniMsgpackDecoder:
@@ -373,25 +431,40 @@ class OmniMsgpackDecoder:
     """
 
     def __init__(self):
+        # Generic decoder: binary fields decode to bytes (copied, not referenced),
+        # so the input SHM buffer can be safely unmapped after decode() returns.
+        # A typed decoder (msgpack.Decoder(OmniConnectorPayload)) would return
+        # memoryview fields that alias the input buffer, causing BufferError on
+        # shm.close(), and would reject untagged root dicts with "missing field
+        # 'type'".  Tag-string dispatch in _post_process handles the Struct types.
         self.decoder = msgpack.Decoder()
 
     def decode(self, data: Buffer) -> Any:
         """Decode bytes to object."""
-        result = self.decoder.decode(data)
-        return self._post_process(result)
+        payload = self.decoder.decode(data)
+        return self._post_process(payload)
 
     def _post_process(self, obj: Any) -> Any:
-        """Recursively restore tensor/ndarray/image/RequestOutput/OmniRequestOutput from their dict representations."""
+        """Recursively restore typed objects from their wire representations."""
         if isinstance(obj, dict):
-            # Check for type markers first
-            if obj.get(_SCALAR_TENSOR_MARKER):
-                return self._decode_scalar_tensor(obj)
-            if obj.get(_TENSOR_MARKER):
-                return self._decode_tensor(obj)
-            if obj.get(_NDARRAY_MARKER):
-                return self._decode_ndarray(obj)
-            if obj.get(_PIL_IMAGE_MARKER):
-                return self._decode_pil_image(obj)
+            # Tagged-struct format: dispatch on the msgspec Struct tag field.
+            type_tag = obj.get("type")
+            if type_tag is not None:
+                if type_tag == "ScalarTensorPayload":
+                    return self._decode_scalar_tensor_dict(obj)
+                if type_tag == "TensorPayload":
+                    return self._decode_tensor_dict(obj)
+                if type_tag == "NdarrayPayload":
+                    return self._decode_ndarray_dict(obj)
+                if type_tag == "ImagePayload":
+                    return self._decode_pil_image_dict(obj)
+                if type_tag == "SlicePayload":
+                    return slice(obj["start"], obj["stop"], obj["step"])
+                if type_tag == "BytesPayload":
+                    return obj["payload"]
+                if type_tag == "DictPayload":
+                    return self._post_process(obj["payload"])
+                # Unknown tag: fall through to generic dict processing.
 
             # Process values recursively first
             processed = {k: self._post_process(v) for k, v in obj.items()}
@@ -450,17 +523,13 @@ class OmniMsgpackDecoder:
 
         start = time.perf_counter()
         try:
-            # Use msgspec.convert for dataclass reconstruction
-            result = msgspec.convert(obj, OmniRequestOutput)
+            # The dict contains already-reconstructed Python objects (tensors,
+            # ndarrays, etc.) so msgspec.convert won't work here — go straight
+            # to direct construction.
+            result = OmniRequestOutput(**obj)
         except Exception:
-            try:
-                # Fallback: construct directly if msgspec.convert fails
-                # (e.g., if some fields are missing or have wrong types)
-                result = OmniRequestOutput(**obj)
-            except Exception:
-                # If both attempts fail, return dict as-is (defensive fallback)
-                # This should rarely happen if _is_omni_request_output is correct
-                result = obj
+            # If construction fails, return dict as-is (defensive fallback)
+            result = obj
         end = time.perf_counter()
         if PROFILE:
             print(
@@ -482,23 +551,45 @@ class OmniMsgpackDecoder:
             )
         return result
 
-    def _decode_scalar_tensor(self, obj: dict[str, Any]) -> torch.Tensor:
-        """Decode a scalar-encoded tensor back to a torch.Tensor."""
+    # --- dict-based helpers (generic decoder returns raw dicts, not Struct instances) ---
+
+    def _decode_scalar_tensor_dict(self, obj: dict) -> torch.Tensor:
         return torch.tensor(obj["value"], dtype=getattr(torch, obj["dtype"])).reshape(obj["shape"])
 
-    def _decode_tensor(self, obj: dict[str, Any]) -> torch.Tensor:
-        """Decode dict to torch.Tensor."""
-        dtype_str = obj["dtype"]
-        shape = obj["shape"]
-        data = obj["data"]
-
-        start = time.perf_counter()
+    def _decode_tensor_dict(self, obj: dict) -> torch.Tensor:
+        dtype_str, shape, data = obj["dtype"], obj["shape"], obj["data"]
         torch_dtype = getattr(torch, dtype_str)
         if not data:
-            result = torch.empty(shape, dtype=torch_dtype)
+            return torch.empty(shape, dtype=torch_dtype)
+        # Copy into bytearray is necessary as the tensor may be mutated, aliasing the memoryview
+        buffer = bytearray(data) if isinstance(data, bytes | memoryview) else data
+        arr = torch.frombuffer(buffer, dtype=torch.uint8)
+        return arr.view(torch_dtype).reshape(shape)
+
+    def _decode_ndarray_dict(self, obj: dict) -> np.ndarray:
+        return np.frombuffer(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"])
+
+    def _decode_pil_image_dict(self, obj: dict) -> Image.Image:
+        arr = np.frombuffer(obj["data"], dtype=np.uint8).reshape(obj["shape"])
+        return Image.fromarray(arr, mode=obj["mode"])
+
+    # --- Struct-typed helpers (kept for direct use if a typed decoder is re-introduced) ---
+
+    def _decode_scalar_tensor(self, payload: ScalarTensorPayload) -> torch.Tensor:
+        """Decode a scalar-encoded tensor back to a torch.Tensor."""
+        return torch.tensor(payload.value, dtype=getattr(torch, payload.dtype)).reshape(payload.shape)
+
+    def _decode_tensor(self, payload: TensorPayload) -> torch.Tensor:
+        """Decode dict to torch.Tensor."""
+        start = time.perf_counter()
+
+        torch_dtype = getattr(torch, payload.dtype)
+        if not payload.data:
+            result = torch.empty(payload.shape, dtype=torch_dtype)
         else:
-            arr = torch.frombuffer(data, dtype=torch.uint8)
-            result = arr.view(torch_dtype).reshape(shape)
+            arr = torch.frombuffer(payload.data, dtype=torch.uint8)
+            result = arr.view(torch_dtype).reshape(payload.shape)
+
         end = time.perf_counter()
         if PROFILE:
             print(
@@ -512,22 +603,22 @@ class OmniMsgpackDecoder:
                         "pid": _PID,
                         "tid": threading.get_ident(),
                         "args": {
-                            "dtype": dtype_str,
-                            "shape": shape,
-                            "nbytes": len(data) if data else 0,
+                            "dtype": payload.dtype,
+                            "shape": payload.shape,
+                            "nbytes": len(payload.data) if payload.data else 0,
                         },
                     }
                 ),
             )
+
         return result
 
-    def _decode_ndarray(self, obj: dict[str, Any]) -> np.ndarray:
+    def _decode_ndarray(self, payload: NdarrayPayload) -> np.ndarray:
         """Decode dict to numpy.ndarray."""
-        dtype = obj["dtype"]
-        shape = obj["shape"]
-        data = obj["data"]
         start = time.perf_counter()
-        result = np.frombuffer(data, dtype=dtype).reshape(shape)
+
+        result = np.frombuffer(payload.data, dtype=payload.dtype).reshape(payload.shape)
+
         end = time.perf_counter()
         if PROFILE:
             print(
@@ -541,23 +632,23 @@ class OmniMsgpackDecoder:
                         "pid": _PID,
                         "tid": threading.get_ident(),
                         "args": {
-                            "dtype": dtype,
-                            "shape": shape,
-                            "nbytes": len(data) if data else 0,
+                            "dtype": payload.dtype,
+                            "shape": payload.shape,
+                            "nbytes": len(payload.data) if payload.data else 0,
                         },
                     }
                 ),
             )
+
         return result
 
-    def _decode_pil_image(self, obj: dict[str, Any]) -> Image.Image:
+    def _decode_pil_image(self, payload: ImagePayload) -> Image.Image:
         """Decode dict to PIL.Image."""
-        mode = obj["mode"]
-        shape = obj["shape"]
-        data = obj["data"]
         start = time.perf_counter()
-        arr = np.frombuffer(data, dtype=np.uint8).reshape(shape)
-        result = Image.fromarray(arr, mode=mode)
+
+        arr = np.frombuffer(payload.data, dtype=np.uint8).reshape(payload.shape)
+        result = Image.fromarray(arr, mode=payload.mode)
+
         end = time.perf_counter()
         if PROFILE:
             print(
@@ -571,13 +662,14 @@ class OmniMsgpackDecoder:
                         "pid": _PID,
                         "tid": threading.get_ident(),
                         "args": {
-                            "mode": mode,
-                            "shape": shape,
-                            "nbytes": len(data) if data else 0,
+                            "mode": payload.mode,
+                            "shape": payload.shape,
+                            "nbytes": len(payload.data) if payload.data else 0,
                         },
                     }
                 ),
             )
+
         return result
 
     def _decode_completion_output(self, obj: dict[str, Any]) -> CompletionOutput:

@@ -102,15 +102,24 @@ def test_put_get_shm(mocker: MockerFixture, shm_connector, monkeypatch: pytest.M
     # Create data larger than 100 bytes
     data = {"large": "x" * 200}
 
-    # Mock SHM return values
-    mock_handle = {"name": "req_2", "size": 200}
+    # Pre-serialize to know the exact size the mock SHM should report
+    serialized_data = shm_connector.serialize_obj(data)
+    actual_size = len(serialized_data)
+
+    # Mock shm_write_bytes — no real SHM segment is created
+    mock_handle = {"name": "req_2", "size": actual_size}
     mock_write = mocker.MagicMock(return_value=mock_handle)
     monkeypatch.setattr("vllm_omni.distributed.omni_connectors.connectors.shm_connector.shm_write_bytes", mock_write)
 
-    # When reading, return the serialized bytes of the data
-    serialized_data = shm_connector.serialize_obj(data)
-    mock_read = mocker.MagicMock(return_value=serialized_data)
-    monkeypatch.setattr("vllm_omni.distributed.omni_connectors.connectors.shm_connector.shm_read_bytes", mock_read)
+    # Mock SharedMemory to return a buffer containing the serialized payload.
+    # _get_data_with_lock maps the segment directly via shm_pkg.SharedMemory;
+    # .buf must support the buffer protocol (bytearray satisfies this).
+    mock_shm = mocker.MagicMock()
+    mock_shm.buf = bytearray(serialized_data)
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.connectors.shm_connector.shm_pkg.SharedMemory",
+        return_value=mock_shm,
+    )
 
     # Put
     success, size, metadata = shm_connector.put("stage_0", "stage_1", "req_2", data)
@@ -127,7 +136,6 @@ def test_put_get_shm(mocker: MockerFixture, shm_connector, monkeypatch: pytest.M
     retrieved_data, ret_size = shm_connector.get("stage_0", "stage_1", "req_2", metadata)
 
     assert data == retrieved_data
-    mock_read.assert_called_once_with(mock_handle)
 
 
 def test_get_invalid_metadata(shm_connector):

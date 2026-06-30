@@ -31,11 +31,6 @@ _REQUEST_OUTPUT_KEYS = frozenset({"request_id", "prompt", "prompt_token_ids", "o
 # Keys that identify a CompletionOutput dict (for reconstruction)
 _COMPLETION_OUTPUT_KEYS = frozenset({"index", "text", "token_ids", "finish_reason"})
 
-# Keys that identify an OmniRequestOutput dict (for reconstruction)
-# OmniRequestOutput has 'final_output_type' which is unique, or can be identified by
-# having 'finished' and ('images' or 'final_output_type')
-_OMNI_REQUEST_OUTPUT_KEYS = frozenset({"finished", "final_output_type"})
-
 
 class OmniMsgpackEncoder:
     """
@@ -73,9 +68,11 @@ class OmniMsgpackEncoder:
         same OmniMsgpackEncoder instance from multiple threads — the underlying
         msgpack.Encoder may have internal scratch state that is not protected by
         the GIL when encoding large binary payloads.  encode() is safe to call
-        concurrently because each call allocates its own output buffer.  In
-        practice encode_into() is only called from the SHM connector's single
-        save_thread, so no additional synchronisation is required today.
+        concurrently because each call allocates its own output buffer.  The
+        caller is responsible for ensuring at most one thread calls encode_into()
+        on a given instance at a time; SharedMemoryConnector upholds this by
+        holding one OmniSerde per connector instance and calling put() from a
+        single thread.
         """
         self.encoder.encode_into(obj, buf)
 
@@ -127,19 +124,15 @@ class OmniMsgpackEncoder:
 
         start = time.perf_counter()
 
-        t = tensor.detach()
-
-        # Perform contiguous on GPU if possible
-        if not t.is_contiguous():
-            t = t.contiguous()
-            called_contiguous = True
-
-        t = t.cpu()
+        t = tensor.detach().cpu()
 
         # Handle 0-dimensional (scalar) tensors by reshaping to 1D first
         if t.dim() == 0:
             called_reshape = True
             t = t.reshape(1)
+        if not t.is_contiguous():
+            t = t.contiguous()
+            called_contiguous = True
 
         t = t.view(torch.uint8)
         data = memoryview(t.numpy())
@@ -483,7 +476,9 @@ class OmniMsgpackDecoder:
         if not data:
             result = torch.empty(shape, dtype=torch_dtype)
         else:
-            arr = torch.frombuffer(data, dtype=torch.uint8)
+            # To prevent undefined behavior when downstream stages mutate the tensor, a copy is necessary.
+            buffer = bytearray(data) if isinstance(data, (bytes, memoryview)) else data
+            arr = torch.frombuffer(buffer, dtype=torch.uint8)
             result = arr.view(torch_dtype).reshape(shape)
         end = time.perf_counter()
         if PROFILE:

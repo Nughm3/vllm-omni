@@ -22,7 +22,6 @@ _PID = os.getpid()
 
 # Type markers for custom serialization
 _TENSOR_MARKER = "__tensor__"
-_SCALAR_TENSOR_MARKER = "__scalar_tensor__"
 _NDARRAY_MARKER = "__ndarray__"
 _PIL_IMAGE_MARKER = "__pil_image__"
 
@@ -84,8 +83,6 @@ class OmniMsgpackEncoder:
         """Custom encoding hook for non-standard types."""
         # torch.Tensor — single-element tensors skip the heavy encode path
         if isinstance(obj, torch.Tensor):
-            if obj.numel() == 1:
-                return self._encode_scalar_tensor(obj)
             return self._encode_tensor(obj)
 
         # numpy.ndarray (exclude object/void dtypes)
@@ -122,15 +119,6 @@ class OmniMsgpackEncoder:
             "Supported types: torch.Tensor, np.ndarray, PIL.Image, dataclass, "
             "RequestOutput, and standard Python types (dict, list, str, int, float, bool, None, bytes)."
         )
-
-    def _encode_scalar_tensor(self, tensor: torch.Tensor) -> dict[str, Any]:
-        """Encode a single-element tensor as a Python scalar — avoids detach/cpu/view/numpy overhead."""
-        return {
-            _SCALAR_TENSOR_MARKER: True,
-            "dtype": str(tensor.dtype).removeprefix("torch."),
-            "shape": list(tensor.shape),
-            "value": tensor.item(),
-        }
 
     def _encode_tensor(self, tensor: torch.Tensor) -> dict[str, Any]:
         """Encode torch.Tensor to dict."""
@@ -388,8 +376,6 @@ class OmniMsgpackDecoder:
         """Recursively restore tensor/ndarray/image/RequestOutput/OmniRequestOutput from their dict representations."""
         if isinstance(obj, dict):
             # Check for type markers first
-            if obj.get(_SCALAR_TENSOR_MARKER):
-                return self._decode_scalar_tensor(obj)
             if obj.get(_TENSOR_MARKER):
                 return self._decode_tensor(obj)
             if obj.get(_NDARRAY_MARKER):
@@ -485,10 +471,6 @@ class OmniMsgpackDecoder:
                 ),
             )
         return result
-
-    def _decode_scalar_tensor(self, obj: dict[str, Any]) -> torch.Tensor:
-        """Decode a scalar-encoded tensor back to a torch.Tensor."""
-        return torch.tensor(obj["value"], dtype=getattr(torch, obj["dtype"])).reshape(obj["shape"])
 
     def _decode_tensor(self, obj: dict[str, Any]) -> torch.Tensor:
         """Decode dict to torch.Tensor."""

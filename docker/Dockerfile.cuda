@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=vllm/vllm-openai:v0.20.0
+ARG BASE_IMAGE=vllm/vllm-openai:v0.21.0
 FROM ${BASE_IMAGE}
 
 ARG COMMON_WORKDIR=/app
@@ -13,9 +13,15 @@ RUN apt-get update && \
 
 RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 
-# Step 2: Copy vllm-omni code and install
+# Step 2: Copy vllm-omni (PR #3770 rebased to vllm 0.21.0 APIs; see eb4e60ee / #3530).
 COPY . ${COMMON_WORKDIR}/vllm-omni
-RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
+RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir \
+        -e .
+
+# vllm-openai:v0.21.0 ships CUDA 13.0.2; use mooncake-transfer-engine-cuda13.
+RUN pip uninstall -y mooncake-transfer-engine mooncake-transfer-engine-non-cuda 2>/dev/null || true \
+    && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir \
+        "mooncake-transfer-engine-cuda13>=0.3.9"
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 

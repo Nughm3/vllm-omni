@@ -203,6 +203,7 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
             # Incoming edge → this stage is the receiver
             extra = dict(spec.extra) if spec.extra else {}
             extra.setdefault("role", "receiver")
+            extra.setdefault("stage_id", int(target_stage))
             if spec.name == "MooncakeTransferEngineConnector":
                 extra = apply_mooncake_stage_connector_extra(
                     extra, from_stage=from_stage, role="receiver"
@@ -213,6 +214,7 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
             # extraction (omni_stage.py), NOT for connector instantiation.
             extra = dict(spec.extra) if spec.extra else {}
             extra.setdefault("role", "sender")
+            extra.setdefault("stage_id", int(from_stage))
             if spec.name == "MooncakeTransferEngineConnector":
                 extra = apply_mooncake_stage_connector_extra(
                     extra, from_stage=from_stage, role="sender"
@@ -243,6 +245,7 @@ def get_worker_connector_specs_for_stage(
         if to_stage == target_stage and not input_spec:
             extra = dict(spec.extra) if spec.extra else {}
             extra.setdefault("role", "receiver")
+            extra.setdefault("stage_id", int(target_stage))
             if spec.name == "MooncakeTransferEngineConnector":
                 extra = apply_mooncake_stage_connector_extra(
                     extra,
@@ -254,6 +257,7 @@ def get_worker_connector_specs_for_stage(
         if from_stage == target_stage and not output_spec:
             extra = dict(spec.extra) if spec.extra else {}
             extra.setdefault("role", "sender")
+            extra.setdefault("stage_id", int(target_stage))
             if spec.name == "MooncakeTransferEngineConnector":
                 extra = apply_mooncake_stage_connector_extra(
                     extra,

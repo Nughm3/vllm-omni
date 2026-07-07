@@ -83,6 +83,14 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
     [
         (None, "SharedMemoryConnector", {}),
         (SimpleNamespace(name="YuanrongConnector", extra={"k": "v"}), "YuanrongConnector", {"k": "v"}),
+        (
+            {
+                "name": "MooncakeTransferEngineConnector",
+                "extra": {"role": "receiver", "stage_id": 1},
+            },
+            "SharedMemoryConnector",
+            {"stage_id": 1},
+        ),
     ],
 )
 def test_create_connector_config_parsing(monkeypatch, raw_cfg, expected_name, expected_extra):
@@ -105,6 +113,55 @@ def test_create_connector_config_parsing(monkeypatch, raw_cfg, expected_name, ex
     assert isinstance(captured["spec"], ConnectorSpec)
     assert captured["spec"].name == expected_name
     assert captured["spec"].extra == expected_extra
+
+
+def test_bootstrap_receiver_sender_info_calls_update_sender_info(monkeypatch):
+    calls: list[tuple[str, int]] = []
+    connector = SimpleNamespace(
+        stage_id=1,
+        can_put=False,
+        sender_host="auto",
+        sender_zmq_port=50051,
+        host="10.0.0.5",
+    )
+    connector.update_sender_info = lambda host, port: calls.append((host, port))
+
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter"
+        ".OmniConnectorFactory.create_connector",
+        lambda _spec: connector,
+    )
+    monkeypatch.setattr(OmniTransferAdapterBase, "__init__", lambda self, _config: None)
+
+    model_config = SimpleNamespace(
+        stage_connector_config={
+            "name": "MooncakeTransferEngineConnector",
+            "extra": {
+                "role": "receiver",
+                "stage_id": 1,
+                "sender_host": "auto",
+                "sender_zmq_port": 50051,
+            },
+        },
+        worker_type="ar",
+    )
+    scheduler_config = SimpleNamespace(max_num_seqs=2)
+    OmniChunkTransferAdapter(SimpleNamespace(model_config=model_config, scheduler_config=scheduler_config))
+
+    assert calls == [("10.0.0.5", 50051)]
+
+
+def test_load_async_applies_kv_sender_info(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    calls: list[tuple[str, int]] = []
+    connector.update_sender_info = lambda host, port: calls.append((host, port))
+    request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
+    request.kv_sender_info = {1: {"host": "10.1.2.3", "zmq_port": 50052}}
+
+    adapter.load_async(request)
+
+    assert calls == [("10.1.2.3", 50052)]
+    assert "req-1" in [req.request_id for req in adapter._pending_load_reqs]
 
 
 def test_load_poll(build_adapter):

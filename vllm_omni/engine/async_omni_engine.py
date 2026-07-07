@@ -217,6 +217,15 @@ def _apply_omni_final_stage_metadata(
     )
 
 
+def _runtime_devices(runtime_cfg: Any) -> str | int | None:
+    """Extract the stage device override from runtime config metadata."""
+    if runtime_cfg is None:
+        return None
+    if hasattr(runtime_cfg, "get"):
+        return runtime_cfg.get("devices")
+    return getattr(runtime_cfg, "devices", None)
+
+
 def _weak_shutdown_async_omni_engine(
     orchestrator_thread: threading.Thread | None,
     request_queue: janus.Queue[EngineQueueMessage] | None,
@@ -917,9 +926,22 @@ class AsyncOmniEngine:
                                     vllm_config=vllm_config,
                                     executor_class=executor_class,
                                     log_stats=False,
+                                    omni_stage_devices=_runtime_devices(plan.metadata.runtime_cfg),
                                 )
                             logger.info(
                                 "[AsyncOmniEngine] Stage %s engine launch started",
+                                plan.metadata.stage_id,
+                            )
+                            if self.single_stage_mode and self._omni_master_server is not None:
+                                launch_stack.close()
+                            else:
+                                assert proc is not None
+                                assert handshake_address is not None
+                                complete_stage_handshake(
+                                    proc, handshake_address, addresses, vllm_config, stage_init_timeout
+                                )
+                            logger.info(
+                                "[AsyncOmniEngine] Stage %s engine startup completed",
                                 plan.metadata.stage_id,
                             )
                         finally:
@@ -927,17 +949,6 @@ class AsyncOmniEngine:
                                 current_omni_platform.unset_device_control_env_var()
                             else:
                                 current_omni_platform.set_device_control_env_var(previous_visible_devices)
-
-                    if self.single_stage_mode and self._omni_master_server is not None:
-                        launch_stack.close()
-                    else:
-                        assert proc is not None
-                        assert handshake_address is not None
-                        complete_stage_handshake(proc, handshake_address, addresses, vllm_config, stage_init_timeout)
-                    logger.info(
-                        "[AsyncOmniEngine] Stage %s engine startup completed",
-                        plan.metadata.stage_id,
-                    )
 
                     client_addresses: dict[str, str] = {
                         "input_address": addresses.inputs[0],

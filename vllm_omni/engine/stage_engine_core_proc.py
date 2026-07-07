@@ -60,6 +60,7 @@ class StageEngineCoreProc(EngineCoreProc):
         omni_coordinator_address: str | None = None,
         omni_stage_id: int | None = None,
         omni_replica_id: int = 0,
+        omni_stage_devices: str | int | None = None,
         **kwargs: Any,
     ) -> None:
         """Launch StageEngineCoreProc busy loop in background process.
@@ -92,6 +93,18 @@ class StageEngineCoreProc(EngineCoreProc):
             set_process_title(f"StageEngineCoreProc_{stage_label}_replica{omni_replica_id}_DP{dp_rank}")
             decorate_logs()
             os.environ["VLLM_OMNI_REPLICA_ID"] = str(max(int(omni_replica_id), 0))
+
+            if omni_stage_devices is not None and omni_stage_id is not None:
+                from vllm_omni.engine.stage_init_utils import setup_stage_devices
+
+                setup_stage_devices(omni_stage_id, {"devices": omni_stage_devices})
+            device_env = os.environ.get("CUDA_VISIBLE_DEVICES", os.environ.get("ASCEND_RT_VISIBLE_DEVICES", ""))
+            logger.info(
+                "StageEngineCoreProc stage=%s replica=%s device_env=%r",
+                omni_stage_id,
+                omni_replica_id,
+                device_env,
+            )
 
             engine_core = StageEngineCoreProc(
                 *args,
@@ -174,6 +187,7 @@ def spawn_stage_core(
     vllm_config: VllmConfig,
     executor_class: type[Executor],
     log_stats: bool = False,
+    omni_stage_devices: str | int | None = None,
 ) -> tuple[EngineZmqAddresses, BaseProcess, str]:
     """Spawn a *StageEngineCoreProc* subprocess without performing the handshake.
 
@@ -186,18 +200,24 @@ def spawn_stage_core(
     handshake_address = get_open_zmq_ipc_path()
 
     ctx = get_mp_context()
+    omni_stage_id = getattr(vllm_config.model_config, "stage_id", None)
+    proc_kwargs: dict[str, Any] = {
+        "vllm_config": vllm_config,
+        "local_client": True,
+        "handshake_address": handshake_address,
+        "executor_class": executor_class,
+        "log_stats": log_stats,
+        "dp_rank": 0,
+        "local_dp_rank": 0,
+    }
+    if omni_stage_id is not None:
+        proc_kwargs["omni_stage_id"] = omni_stage_id
+    if omni_stage_devices is not None:
+        proc_kwargs["omni_stage_devices"] = omni_stage_devices
     proc = ctx.Process(
         target=StageEngineCoreProc.run_stage_core,
         name="StageEngineCoreProc",
-        kwargs={
-            "vllm_config": vllm_config,
-            "local_client": True,
-            "handshake_address": handshake_address,
-            "executor_class": executor_class,
-            "log_stats": log_stats,
-            "dp_rank": 0,
-            "local_dp_rank": 0,
-        },
+        kwargs=proc_kwargs,
     )
     proc.start()
     return addresses, proc, handshake_address

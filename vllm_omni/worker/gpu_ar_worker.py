@@ -84,6 +84,12 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
             # take current memory snapshot
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
+            logger.info(
+                "GPUARWorker memory preflight: device=%s cuda_visible=%r snapshot=%r",
+                self.device,
+                os.environ.get("CUDA_VISIBLE_DEVICES"),
+                init_snapshot,
+            )
             self.requested_memory = request_memory(init_snapshot, self.cache_config)
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug("worker requested memory: %sGiB", format_gib(self.requested_memory))

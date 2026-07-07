@@ -128,6 +128,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         }
 
         self.config = config
+        try:
+            self.stage_id = int(config.get("stage_id", -1))
+        except (TypeError, ValueError):
+            self.stage_id = -1
         host_config = config.get("host")
         host_value = "auto" if host_config is None else str(host_config)
         # Default sender/receiver bootstrap to a routable local IP so the
@@ -644,15 +648,18 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         _t0 = _time_mod.perf_counter()
 
         if not metadata:
-            # Path 3: no metadata at all — query default sender
-            metadata = self._query_metadata_from_sender(get_key)
-            if not metadata:
+            # Path 3: no metadata at all — query default sender (KV/chunk polling).
+            endpoint = self._resolve_sender_endpoint()
+            if endpoint is None:
                 raise RuntimeError(
                     f"get(metadata=None) requires sender info to be resolved, "
                     f"but sender_host={self.sender_host!r}, sender_zmq_port={self.sender_zmq_port!r}, "
                     f"resolved_local_host={getattr(self, 'host', None)!r}. "
                     f"Call update_sender_info(host, port) before using get() without metadata."
                 )
+            metadata = self._query_metadata_at(get_key, *endpoint)
+            if not metadata:
+                return None
         elif "data_size" not in metadata:
             # Path 2: partial metadata (host/port only) — query that sender
             partial_host = metadata.get("source_host")

@@ -170,9 +170,11 @@ def test_mooncake_connector_defaults_missing_host_to_detected_ip(monkeypatch: py
         {
             "zmq_port": 50051,
             "memory_pool_size": 4096,
+            "stage_id": 1,
         }
     )
     try:
+        assert connector.stage_id == 1
         assert connector.host == "10.20.30.40"
         assert connector.engine.host == "10.20.30.40"
         assert connector.get_connection_info()["host"] == "10.20.30.40"

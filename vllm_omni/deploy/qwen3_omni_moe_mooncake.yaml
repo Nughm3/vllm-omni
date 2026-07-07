@@ -24,7 +24,7 @@ connectors:
       host: "auto"
       zmq_port: 50051
       protocol: "rdma"
-      device_name: ""
+      device_name: "mlx5_0"
       memory_pool_size: 4294967296
       memory_pool_device: "cpu"
       # Chunk-transfer knobs consumed by talker2code2wav_async_chunk; kept

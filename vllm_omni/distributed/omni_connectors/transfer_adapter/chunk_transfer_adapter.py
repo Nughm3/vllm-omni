@@ -41,6 +41,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         model_config = vllm_config.model_config
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.connector = self.create_connector(model_config)
+        self._bootstrap_receiver_sender_info(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
@@ -83,23 +84,132 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         except (TypeError, ValueError):
             stage_id_int = 0
 
-        # Stage-0 GPU workers own Mooncake ZMQ bind for async_chunk puts.
-        # The engine-core scheduler must not bind the same port.
-        if (
-            name == "MooncakeTransferEngineConnector"
-            and stage_id_int == 0
-            and str(extra.get("role", "sender")).lower() == "sender"
-        ):
+        # Legacy scheduler chunk adapter cannot use Mooncake end-to-end:
+        # stage-0 must not bind the worker's ZMQ port (falls back to SHM),
+        # and downstream schedulers must receive via the same SHM path.
+        # Mooncake remains on GPU worker connectors for future worker-side
+        # transport; cross-node async_chunk needs that path wired up.
+        if name == "MooncakeTransferEngineConnector":
+            role = str(extra.get("role", "sender")).lower()
             logger.info(
-                "Stage-0 scheduler uses SharedMemoryConnector instead of "
-                "MooncakeTransferEngineConnector to avoid ZMQ port collision "
-                "with the stage worker sender."
+                "Stage-%s scheduler chunk adapter uses SharedMemoryConnector "
+                "instead of MooncakeTransferEngineConnector (role=%s).",
+                stage_id_int,
+                role,
             )
             name = "SharedMemoryConnector"
             extra = {"stage_id": stage_id_int}
 
+        extra["stage_id"] = stage_id_int
         connector_specs = ConnectorSpec(name=name, extra=extra)
         return OmniConnectorFactory.create_connector(connector_specs)
+
+    @staticmethod
+    def _resolve_sender_info_entry(
+        sender_info: dict[str, Any] | None,
+        sender_stage_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        if not sender_info:
+            return None
+        if "host" in sender_info:
+            return sender_info
+        if not isinstance(sender_info, dict):
+            return None
+
+        preferred_keys: list[str | int] = []
+        if sender_stage_id is not None:
+            preferred_keys.append(sender_stage_id)
+            preferred_keys.append(str(sender_stage_id))
+            try:
+                preferred_keys.append(int(sender_stage_id))
+            except (TypeError, ValueError):
+                pass
+
+        for key in dict.fromkeys(preferred_keys):
+            info = sender_info.get(key)
+            if isinstance(info, dict) and "host" in info:
+                return info
+
+        candidates = [info for info in sender_info.values() if isinstance(info, dict) and "host" in info]
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    @staticmethod
+    def _resolve_sender_host(host: Any, connector: Any) -> str | None:
+        host_str = str(host).strip() if host is not None else ""
+        if host_str.lower() in {"", "auto", "*", "0.0.0.0", "::"}:
+            fallback = getattr(connector, "host", None)
+            return str(fallback) if fallback else None
+        if host_str.lower() in {"localhost", "127.0.0.1"}:
+            fallback = getattr(connector, "host", None)
+            if fallback and str(fallback) not in {"127.0.0.1", "localhost"}:
+                return str(fallback)
+        return host_str
+
+    def _apply_sender_info(
+        self,
+        sender_info: dict[str, Any] | None,
+        sender_stage_id: int | None = None,
+    ) -> None:
+        connector = self.connector
+        if not hasattr(connector, "update_sender_info"):
+            return
+
+        resolved = self._resolve_sender_info_entry(sender_info, sender_stage_id)
+        if not resolved:
+            return
+
+        sender_host = self._resolve_sender_host(resolved.get("host"), connector)
+        sender_port = resolved.get("zmq_port")
+        if sender_host is None or sender_port is None:
+            return
+
+        connector.update_sender_info(sender_host, int(sender_port))
+
+    def _bootstrap_receiver_sender_info(self, model_config: Any) -> None:
+        """Resolve upstream Mooncake sender endpoint before chunk polling."""
+        connector = self.connector
+        if not hasattr(connector, "update_sender_info"):
+            return
+        if getattr(connector, "can_put", True):
+            return
+
+        stage_id = getattr(connector, "stage_id", 0)
+        if stage_id == 0:
+            return
+
+        connector_config = getattr(model_config, "stage_connector_config", None)
+        if connector_config is None:
+            connector_config = {}
+        elif not isinstance(connector_config, dict):
+            connector_config = {
+                "name": getattr(connector_config, "name", None),
+                "extra": getattr(connector_config, "extra", {}),
+            }
+
+        extra = dict(connector_config.get("extra", {}) or {})
+        sender_host = extra.get("sender_host", getattr(connector, "sender_host", None))
+        sender_port = extra.get("sender_zmq_port", getattr(connector, "sender_zmq_port", None))
+        if sender_port is None:
+            return
+
+        resolved_host = self._resolve_sender_host(sender_host, connector)
+        if resolved_host is None:
+            logger.warning(
+                "Stage-%s chunk receiver could not resolve Mooncake sender_host=%r",
+                stage_id,
+                sender_host,
+            )
+            return
+
+        connector.update_sender_info(resolved_host, int(sender_port))
+        logger.info(
+            "Stage-%s chunk adapter bootstrapped Mooncake sender endpoint: %s:%s",
+            stage_id,
+            resolved_host,
+            sender_port,
+        )
 
     def load_async(self, request: Request):
         """Register a request for asynchronous chunk retrieval.
@@ -117,6 +227,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if stage_id == 0:
             return
+        kv_sender_info = getattr(request, "kv_sender_info", None)
+        if kv_sender_info:
+            self._apply_sender_info(kv_sender_info, sender_stage_id=stage_id - 1)
         if not hasattr(request, "additional_information"):
             request.additional_information = None
         self._cancelled_load_reqs.discard(request.request_id)
@@ -174,7 +287,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 connector_get_key,
             )
         except Exception as e:
-            logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
+            connector_name = type(self.connector).__name__
+            logger.error("%s get failed for req %s: %s", connector_name, connector_get_key, e)
             return False
 
         if result is None:

@@ -290,12 +290,16 @@ def _parse_dtype(dtype_str: str) -> torch.dtype:
     return getattr(torch, dtype_str)
 
 
-def _packed_u8_from_connector_result(data: Any, *, to_cpu: bool = True) -> torch.Tensor:
+def _packed_u8_from_connector_result(data: Any, *, to_cpu: bool = False) -> torch.Tensor:
     """Return a standalone 1D uint8 tensor from a connector ``get()`` result.
 
-    For a ``ManagedBuffer`` (RDMA pool memory) the bytes are copied out before
-    the buffer is released, so reconstructed tensor views never alias pool
-    memory that the receive path may recycle for the next transfer.
+    The tensor is kept on the device the connector delivered it on (e.g. the
+    RDMA pool's GPU); device placement is the consumer's concern, so we avoid a
+    forced host round-trip that would defeat GPU-direct RDMA. For a
+    ``ManagedBuffer`` the bytes are copied out (on that same device) before the
+    buffer is released, so reconstructed views never alias pool memory the
+    receive path may recycle. Pass ``to_cpu=True`` only when a specific
+    consumer genuinely needs host tensors.
     """
     managed_buffer_cls = None
     try:
@@ -351,12 +355,14 @@ def reconstruct_qwen3_full_payload(
     sidecar: dict[str, Any],
     get_packed: Callable[[str], Any],
     *,
-    to_cpu: bool = True,
+    to_cpu: bool = False,
 ) -> dict[str, Any]:
     """Rebuild the semantic payload dict from a sidecar and one packed fetch.
 
     ``get_packed`` is invoked at most once, with the packed-buffer key, and
     returns the connector's raw result (a ``ManagedBuffer`` or ``torch.Tensor``).
+    Reconstructed tensors keep the connector's delivery device by default; pass
+    ``to_cpu=True`` only when a consumer requires host tensors.
     """
     if sidecar.get("packet_version") != PACKET_VERSION:
         raise ValueError(f"Unsupported packet_version: {sidecar.get('packet_version')!r}")
@@ -412,6 +418,6 @@ def reconstruct_thinker_to_talker_full_payload(
     sidecar: dict[str, Any],
     get_packed: Callable[[str], Any],
     *,
-    to_cpu: bool = True,
+    to_cpu: bool = False,
 ) -> dict[str, Any]:
     return reconstruct_qwen3_full_payload(sidecar, get_packed, to_cpu=to_cpu)

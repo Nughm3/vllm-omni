@@ -790,7 +790,7 @@ class OmniConnectorModelRunnerMixin:
         )
 
         mode = packet_mode or MODE_ASYNC_CHUNK
-        tensor_puts, sidecar = split_qwen3_full_payload(
+        packed, sidecar = split_qwen3_full_payload(
             payload,
             request_id=req_id,
             external_req_id=external_req_id,
@@ -801,13 +801,17 @@ class OmniConnectorModelRunnerMixin:
         )
         tasks: list[dict[str, Any]] = []
         send_connector = self._get_send_connector()
-        for put_key, tensor in tensor_puts:
+        # One put for the whole packed tensor buffer (skipped when the payload
+        # carries no tensors, e.g. a finish sentinel), followed by the small
+        # sidecar. The sidecar is enqueued last so that once the receiver sees
+        # it, the packed buffer has already been put() and is available to pull.
+        if packed is not None:
             tasks.append(
                 {
                     "stage_id": self._stage_id,
                     "next_stage_id": next_stage_id,
-                    "put_key": put_key,
-                    "data": tensor,
+                    "put_key": sidecar["packed_key"],
+                    "data": packed,
                     "request_id": req_id,
                     "connector": send_connector,
                 }
@@ -839,14 +843,14 @@ class OmniConnectorModelRunnerMixin:
             reconstruct_qwen3_full_payload,
         )
 
-        def get_tensor(transfer_key: str) -> Any:
-            result = connector.get(from_stage, to_stage, transfer_key)
+        def get_packed(packed_key: str) -> Any:
+            result = connector.get(from_stage, to_stage, packed_key)
             if result is None:
                 return None
             data, _size = result
             return data
 
-        return reconstruct_qwen3_full_payload(sidecar, get_tensor)
+        return reconstruct_qwen3_full_payload(sidecar, get_packed)
 
     @staticmethod
     def _new_full_payload_accumulator(output: dict[str, Any]):

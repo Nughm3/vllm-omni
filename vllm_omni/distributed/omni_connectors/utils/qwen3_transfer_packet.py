@@ -30,9 +30,17 @@ _THINKER_TO_TALKER_TENSOR_PATHS: tuple[str, ...] = (
     "hidden_states.output",
 )
 
-_TALKER_TO_CODE2WAV_TENSOR_PATHS: tuple[str, ...] = (
-    "codes.audio",
-)
+_TALKER_TO_CODE2WAV_TENSOR_PATHS: tuple[str, ...] = ("codes.audio",)
+
+
+# Byte alignment for each tensor within the packed buffer. Must be >= the
+# largest tensor element size (8 bytes covers float64/int64) so that slicing
+# the packed uint8 buffer and calling ``.view(dtype)`` is always valid.
+_TENSOR_ALIGNMENT = 8
+
+
+def _align_up(n: int, alignment: int = _TENSOR_ALIGNMENT) -> int:
+    return (n + alignment - 1) // alignment * alignment
 
 
 def build_full_payload_base_key(external_req_id: str, from_stage: int, chunk_id: int) -> str:
@@ -40,8 +48,9 @@ def build_full_payload_base_key(external_req_id: str, from_stage: int, chunk_id:
     return f"{external_req_id}_{from_stage}_{chunk_id}"
 
 
-def build_tensor_transfer_key(base_key: str, entry_name: str) -> str:
-    return f"{base_key}@tensor/{entry_name}"
+def build_packed_tensor_key(base_key: str) -> str:
+    """Connector key for the single packed tensor buffer that accompanies a sidecar."""
+    return f"{base_key}@packed"
 
 
 def is_packet_sidecar(data: Any) -> bool:
@@ -97,15 +106,69 @@ def _set_nested(target: dict[str, Any], path: str, value: Any) -> None:
     cur[parts[-1]] = value
 
 
-def _tensor_entry_descriptor(name: str, tensor: torch.Tensor, transfer_key: str) -> dict[str, Any]:
-    return {
-        "name": name,
-        "dtype": str(tensor.dtype),
-        "shape": list(tensor.shape),
-        "device": tensor.device.type,
-        "layout": "contiguous",
-        "transfer_key": transfer_key,
-    }
+def _resolve_edge(from_stage_id: int, to_stage_id: int) -> tuple[str, str, tuple[str, ...]]:
+    """Return ``(payload_kind, edge_id, tensor_paths)`` for a stage edge."""
+    if from_stage_id == 1 and to_stage_id == 2:
+        return (
+            PAYLOAD_KIND_TALKER_TO_CODE2WAV_FULL,
+            EDGE_TALKER_TO_CODE2WAV,
+            _TALKER_TO_CODE2WAV_TENSOR_PATHS,
+        )
+    return (
+        PAYLOAD_KIND_THINKER_TO_TALKER_FULL,
+        EDGE_THINKER_TO_TALKER,
+        _THINKER_TO_TALKER_TENSOR_PATHS,
+    )
+
+
+def _pack_tensors(
+    payload: dict[str, Any],
+    tensor_paths: tuple[str, ...],
+) -> tuple[torch.Tensor | None, list[dict[str, Any]]]:
+    """Pack the payload's tensor fields into one contiguous uint8 buffer.
+
+    Returns ``(packed_uint8_1d, entries)`` where ``entries`` is the layout
+    table (``name``/``dtype``/``shape``/``offset``/``nbytes``) needed to slice
+    the buffer back apart on the receiver. Returns ``(None, [])`` when the
+    payload carries no tensor fields (e.g. a finish sentinel).
+
+    Each tensor is copied once into its aligned slot; there is no per-element
+    serialization. The single buffer is transferred in one connector put(),
+    collapsing the previous one-put-per-tensor pattern.
+    """
+    regions: list[tuple[int, torch.Tensor]] = []
+    entries: list[dict[str, Any]] = []
+    offset = 0
+    device: torch.device | None = None
+    for path in tensor_paths:
+        tensor = _coerce_tensor_payload_value(_get_nested(payload, path))
+        if tensor is None:
+            continue
+        if device is None:
+            device = tensor.device
+        # ``tensor`` is already detached + contiguous (see _coerce). Reinterpret
+        # its bytes as a flat uint8 view for a straight memcpy into the buffer.
+        flat_u8 = tensor.reshape(-1).view(torch.uint8)
+        nbytes = int(flat_u8.numel())
+        entries.append(
+            {
+                "name": path,
+                "dtype": str(tensor.dtype),
+                "shape": list(tensor.shape),
+                "offset": offset,
+                "nbytes": nbytes,
+            }
+        )
+        regions.append((offset, flat_u8))
+        offset = _align_up(offset + nbytes)
+
+    if not entries:
+        return None, []
+
+    packed = torch.empty(offset, dtype=torch.uint8, device=device)
+    for region_offset, flat_u8 in regions:
+        packed[region_offset : region_offset + flat_u8.numel()].copy_(flat_u8)
+    return packed, entries
 
 
 def _coerce_tensor_payload_value(value: Any) -> torch.Tensor | None:
@@ -166,27 +229,18 @@ def split_qwen3_full_payload(
     to_stage_id: int,
     chunk_id: int,
     mode: str = MODE_ASYNC_CHUNK,
-) -> tuple[list[tuple[str, torch.Tensor]], dict[str, Any]]:
-    """Split a Qwen3 full payload into tensor puts and a sidecar."""
-    base_key = build_full_payload_base_key(external_req_id, from_stage_id, chunk_id)
-    tensor_puts: list[tuple[str, torch.Tensor]] = []
-    tensor_entries: list[dict[str, Any]] = []
-    payload_kind = PAYLOAD_KIND_THINKER_TO_TALKER_FULL
-    edge_id = EDGE_THINKER_TO_TALKER
-    tensor_paths = _THINKER_TO_TALKER_TENSOR_PATHS
-    if from_stage_id == 1 and to_stage_id == 2:
-        payload_kind = PAYLOAD_KIND_TALKER_TO_CODE2WAV_FULL
-        edge_id = EDGE_TALKER_TO_CODE2WAV
-        tensor_paths = _TALKER_TO_CODE2WAV_TENSOR_PATHS
+) -> tuple[torch.Tensor | None, dict[str, Any]]:
+    """Pack a Qwen3 full payload into one contiguous tensor buffer + sidecar.
 
-    for path in tensor_paths:
-        value = _get_nested(payload, path)
-        tensor = _coerce_tensor_payload_value(value)
-        if tensor is None:
-            continue
-        transfer_key = build_tensor_transfer_key(base_key, path)
-        tensor_puts.append((transfer_key, tensor))
-        tensor_entries.append(_tensor_entry_descriptor(path, tensor, transfer_key))
+    Returns ``(packed_buffer, sidecar)``. ``packed_buffer`` is a single
+    contiguous uint8 tensor holding every tensor field back-to-back (or
+    ``None`` when the payload carries no tensors, e.g. a finish sentinel).
+    ``sidecar`` carries the layout table plus scalar metadata needed to slice
+    the buffer apart and rebuild the nested payload on the receiver.
+    """
+    base_key = build_full_payload_base_key(external_req_id, from_stage_id, chunk_id)
+    payload_kind, edge_id, tensor_paths = _resolve_edge(from_stage_id, to_stage_id)
+    packed, tensor_entries = _pack_tensors(payload, tensor_paths)
 
     sidecar = {
         "packet_version": PACKET_VERSION,
@@ -199,12 +253,14 @@ def split_qwen3_full_payload(
         "payload_kind": payload_kind,
         "sequence_id": chunk_id,
         "is_terminal": True,
-        "is_empty": len(tensor_entries) == 0,
+        "is_empty": packed is None,
         "sidecar_put_key": base_key,
+        "packed_key": build_packed_tensor_key(base_key),
+        "packed_nbytes": int(packed.numel()) if packed is not None else 0,
         "tensor_entries": tensor_entries,
         "metadata": _extract_sidecar_metadata(payload),
     }
-    return tensor_puts, sidecar
+    return packed, sidecar
 
 
 def split_thinker_to_talker_full_payload(
@@ -216,7 +272,7 @@ def split_thinker_to_talker_full_payload(
     to_stage_id: int,
     chunk_id: int,
     mode: str = MODE_ASYNC_CHUNK,
-) -> tuple[list[tuple[str, torch.Tensor]], dict[str, Any]]:
+) -> tuple[torch.Tensor | None, dict[str, Any]]:
     return split_qwen3_full_payload(
         payload,
         request_id=request_id,
@@ -234,15 +290,13 @@ def _parse_dtype(dtype_str: str) -> torch.dtype:
     return getattr(torch, dtype_str)
 
 
-def _tensor_from_connector_result(
-    data: Any,
-    entry: dict[str, Any],
-    *,
-    to_cpu: bool = True,
-) -> torch.Tensor:
-    dtype = _parse_dtype(str(entry["dtype"]))
-    shape = tuple(int(x) for x in entry["shape"])
+def _packed_u8_from_connector_result(data: Any, *, to_cpu: bool = True) -> torch.Tensor:
+    """Return a standalone 1D uint8 tensor from a connector ``get()`` result.
 
+    For a ``ManagedBuffer`` (RDMA pool memory) the bytes are copied out before
+    the buffer is released, so reconstructed tensor views never alias pool
+    memory that the receive path may recycle for the next transfer.
+    """
     managed_buffer_cls = None
     try:
         from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector import (
@@ -255,31 +309,55 @@ def _tensor_from_connector_result(
 
     if managed_buffer_cls is not None and isinstance(data, managed_buffer_cls):
         try:
-            tensor = data.as_tensor(dtype, shape)
-            if to_cpu:
-                tensor = tensor.detach().cpu().clone()
-            else:
-                tensor = tensor.detach().clone()
-            return tensor
+            buf = data.tensor.detach()  # 1D uint8 view into the pool
+            if to_cpu and buf.device.type != "cpu":
+                return buf.cpu()
+            return buf.clone()
         finally:
             data.release()
 
     if isinstance(data, torch.Tensor):
-        tensor = data.to(dtype).reshape(shape)
-        if to_cpu:
-            return tensor.detach().cpu()
-        return tensor.detach()
+        buf = data.detach().reshape(-1)
+        if buf.dtype != torch.uint8:
+            buf = buf.view(torch.uint8)
+        return buf.cpu() if to_cpu else buf
 
     raise TypeError(f"Unsupported connector tensor payload type: {type(data)!r}")
 
 
+def _unpack_tensors(packed_u8: torch.Tensor, entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Slice a packed uint8 buffer back into a nested payload of tensors.
+
+    Each slice is a zero-copy view over ``packed_u8``; ``packed_u8`` must
+    already be a standalone tensor (see ``_packed_u8_from_connector_result``).
+    """
+    payload: dict[str, Any] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not name:
+            continue
+        offset = int(entry["offset"])
+        nbytes = int(entry["nbytes"])
+        dtype = _parse_dtype(str(entry["dtype"]))
+        shape = tuple(int(x) for x in entry["shape"])
+        region = packed_u8[offset : offset + nbytes]
+        _set_nested(payload, str(name), region.view(dtype).reshape(shape))
+    return payload
+
+
 def reconstruct_qwen3_full_payload(
     sidecar: dict[str, Any],
-    get_tensor: Callable[[str], Any],
+    get_packed: Callable[[str], Any],
     *,
     to_cpu: bool = True,
 ) -> dict[str, Any]:
-    """Rebuild the semantic payload dict from a sidecar and tensor fetches."""
+    """Rebuild the semantic payload dict from a sidecar and one packed fetch.
+
+    ``get_packed`` is invoked at most once, with the packed-buffer key, and
+    returns the connector's raw result (a ``ManagedBuffer`` or ``torch.Tensor``).
+    """
     if sidecar.get("packet_version") != PACKET_VERSION:
         raise ValueError(f"Unsupported packet_version: {sidecar.get('packet_version')!r}")
     payload_kind = sidecar.get("payload_kind")
@@ -289,18 +367,17 @@ def reconstruct_qwen3_full_payload(
     }:
         raise ValueError(f"Unsupported payload_kind: {payload_kind!r}")
 
+    entries = sidecar.get("tensor_entries") or []
     payload: dict[str, Any] = {}
-    for entry in sidecar.get("tensor_entries", []):
-        if not isinstance(entry, dict):
-            continue
-        name = entry.get("name")
-        transfer_key = entry.get("transfer_key")
-        if not name or not transfer_key:
-            continue
-        raw = get_tensor(str(transfer_key))
+    if entries:
+        packed_key = sidecar.get("packed_key")
+        if not packed_key:
+            packed_key = build_packed_tensor_key(str(sidecar.get("sidecar_put_key", "")))
+        raw = get_packed(str(packed_key))
         if raw is None:
-            raise KeyError(f"Missing tensor entry for transfer_key={transfer_key!r}")
-        _set_nested(payload, str(name), _tensor_from_connector_result(raw, entry, to_cpu=to_cpu))
+            raise KeyError(f"Missing packed tensor buffer for key={packed_key!r}")
+        packed_u8 = _packed_u8_from_connector_result(raw, to_cpu=to_cpu)
+        payload = _unpack_tensors(packed_u8, entries)
 
     metadata = sidecar.get("metadata")
     if isinstance(metadata, dict):
@@ -333,8 +410,8 @@ def reconstruct_qwen3_full_payload(
 
 def reconstruct_thinker_to_talker_full_payload(
     sidecar: dict[str, Any],
-    get_tensor: Callable[[str], Any],
+    get_packed: Callable[[str], Any],
     *,
     to_cpu: bool = True,
 ) -> dict[str, Any]:
-    return reconstruct_qwen3_full_payload(sidecar, get_tensor, to_cpu=to_cpu)
+    return reconstruct_qwen3_full_payload(sidecar, get_packed, to_cpu=to_cpu)

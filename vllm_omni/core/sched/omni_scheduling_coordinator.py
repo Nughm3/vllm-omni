@@ -12,6 +12,7 @@ transport half lives in OmniConnectorModelRunnerMixin.
 
 from __future__ import annotations
 
+import os
 import time
 from collections import deque
 from typing import Any
@@ -20,6 +21,13 @@ from vllm.logger import init_logger
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+_WAIT_PROFILE = os.environ.get("OMNI_STAGE_XFER_PROFILE", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
 
 
 def uses_qwen3_omni_full_payload_input_coordinator(model_config: Any) -> bool:
@@ -145,7 +153,16 @@ class OmniSchedulingCoordinator:
         for request in self._waiting_for_input:
             if request.request_id in stage_recv_req_ids:
                 request.status = RequestStatus.WAITING
-                self._waiting_since.pop(request.request_id, None)
+                started = self._waiting_since.pop(request.request_id, None)
+                if _WAIT_PROFILE and started is not None:
+                    wait_ms = (time.monotonic() - started) * 1000.0
+                    logger.info(
+                        "[STAGE XFER WAIT] stage%s/%s: wait_for_input=%.1fms, total=%.1fms",
+                        self._stage_id,
+                        request.request_id,
+                        wait_ms,
+                        wait_ms,
+                    )
                 waiting_queue.add_request(request)
             else:
                 remaining.append(request)
@@ -170,7 +187,16 @@ class OmniSchedulingCoordinator:
                 elif request.status == RequestStatus.WAITING_FOR_INPUT:
                     if request.request_id in stage_recv_req_ids:
                         request.status = RequestStatus.WAITING
-                        self._waiting_since.pop(request.request_id, None)
+                        started = self._waiting_since.pop(request.request_id, None)
+                        if _WAIT_PROFILE and started is not None:
+                            wait_ms = (time.monotonic() - started) * 1000.0
+                            logger.info(
+                                "[STAGE XFER WAIT] stage%s/%s: wait_for_input=%.1fms, total=%.1fms",
+                                self._stage_id,
+                                request.request_id,
+                                wait_ms,
+                                wait_ms,
+                            )
                     else:
                         to_remove.append(request)
                         self._waiting_for_input.append(request)
@@ -398,7 +424,16 @@ class OmniSchedulingCoordinator:
                 if request.request_id in chunk_ready_req_ids:
                     request.status = target_status
                     self.requests_with_ready_chunks.add(request.request_id)
-                    self._waiting_since.pop(request.request_id, None)
+                    started = self._waiting_since.pop(request.request_id, None)
+                    if _WAIT_PROFILE and started is not None:
+                        wait_ms = (time.monotonic() - started) * 1000.0
+                        logger.info(
+                            "[STAGE XFER WAIT] stage%s/%s: wait_for_chunk=%.1fms, total=%.1fms",
+                            self._stage_id,
+                            request.request_id,
+                            wait_ms,
+                            wait_ms,
+                        )
                     continue
             queue.remove(request)
             waiting_for_chunk_list.append(request)

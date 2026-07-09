@@ -29,6 +29,12 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors,
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
+from vllm_omni.distributed.omni_connectors.utils.stage_xfer_profile import (
+    log_stage_xfer,
+    ms_since,
+    now,
+    stage_xfer_profile_enabled,
+)
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -1100,6 +1106,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             return
         lock = getattr(self, "_lock", None)
         ctx = lock if lock is not None else contextlib.nullcontext()
+        t0 = now() if stage_xfer_profile_enabled() else None
         with ctx:
             if not cache:
                 return
@@ -1114,6 +1121,16 @@ class OmniGPUModelRunner(GPUModelRunner):
                 cache.pop(req_id, None)
         for req_id, payload in staged.items():
             self._update_intermediate_buffer(req_id, payload)
+        if t0 is not None and staged:
+            log_stage_xfer(
+                "STAGE XFER BUFFER",
+                f"stage{getattr(self, '_stage_id', '?')}",
+                {
+                    "sync": ms_since(t0),
+                    "n_reqs": len(staged),
+                    "total": ms_since(t0),
+                },
+            )
 
     def _build_model_kwargs_extra(self) -> dict:
         """Build extra keyword arguments passed to the model for this step."""

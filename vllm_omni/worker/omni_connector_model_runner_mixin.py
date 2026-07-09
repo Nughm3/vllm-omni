@@ -16,6 +16,7 @@ import importlib
 import inspect
 import os
 import threading
+import time
 from collections import defaultdict, deque
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -27,6 +28,13 @@ from vllm.logger import init_logger
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+from vllm_omni.distributed.omni_connectors.utils.stage_xfer_profile import (
+    StageXferSpan,
+    log_stage_xfer,
+    ms_since,
+    now,
+    stage_xfer_profile_enabled,
+)
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.payload_span import (
     get_tensor_span,
@@ -790,6 +798,7 @@ class OmniConnectorModelRunnerMixin:
         )
 
         mode = packet_mode or MODE_ASYNC_CHUNK
+        t_pack = now() if stage_xfer_profile_enabled() else None
         packed, sidecar = split_qwen3_full_payload(
             payload,
             request_id=req_id,
@@ -799,8 +808,23 @@ class OmniConnectorModelRunnerMixin:
             chunk_id=chunk_id,
             mode=mode,
         )
+        pack_ms = ms_since(t_pack) if t_pack is not None else None
+        if pack_ms is not None:
+            packed_nbytes = int(sidecar.get("packed_nbytes", 0)) if isinstance(sidecar, dict) else 0
+            log_stage_xfer(
+                "STAGE XFER PACK",
+                connector_put_key,
+                {
+                    "pack": pack_ms,
+                    "packed_mb": f"{packed_nbytes / (1024 * 1024):.2f}",
+                    "has_packed": packed is not None,
+                    "mode": mode,
+                    "total": pack_ms,
+                },
+            )
         tasks: list[dict[str, Any]] = []
         send_connector = self._get_send_connector()
+        enqueue_ts = time.perf_counter()
         # One put for the whole packed tensor buffer (skipped when the payload
         # carries no tensors, e.g. a finish sentinel), followed by the small
         # sidecar. The sidecar is enqueued last so that once the receiver sees
@@ -814,6 +838,7 @@ class OmniConnectorModelRunnerMixin:
                     "data": packed,
                     "request_id": req_id,
                     "connector": send_connector,
+                    "enqueue_ts": enqueue_ts,
                 }
             )
         tasks.append(
@@ -824,6 +849,7 @@ class OmniConnectorModelRunnerMixin:
                 "data": sidecar,
                 "request_id": req_id,
                 "connector": send_connector,
+                "enqueue_ts": enqueue_ts,
             }
         )
         with self._lock:
@@ -838,19 +864,41 @@ class OmniConnectorModelRunnerMixin:
         sidecar: dict[str, Any],
         from_stage: str,
         to_stage: str,
+        *,
+        profile_key: str | None = None,
     ) -> dict[str, Any]:
         from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
             reconstruct_qwen3_full_payload,
         )
 
+        span = (
+            StageXferSpan("STAGE XFER RECONSTRUCT", profile_key or "packet")
+            if stage_xfer_profile_enabled()
+            else None
+        )
+        get_ms = 0.0
+
         def get_packed(packed_key: str) -> Any:
+            nonlocal get_ms
+            t0 = now() if span is not None else None
             result = connector.get(from_stage, to_stage, packed_key)
+            if t0 is not None:
+                get_ms += ms_since(t0)
             if result is None:
                 return None
             data, _size = result
             return data
 
-        return reconstruct_qwen3_full_payload(sidecar, get_packed)
+        t_unpack = now() if span is not None else None
+        payload = reconstruct_qwen3_full_payload(sidecar, get_packed)
+        if span is not None:
+            # reconstruct includes get_packed; isolate unpack as residual after get.
+            total_ms = ms_since(t_unpack) if t_unpack is not None else 0.0
+            span.set("get_packed", get_ms)
+            span.set("unpack", max(0.0, total_ms - get_ms))
+            span.set("entries", len(sidecar.get("tensor_entries") or []))
+            span.finish()
+        return payload
 
     @staticmethod
     def _new_full_payload_accumulator(output: dict[str, Any]):
@@ -870,10 +918,27 @@ class OmniConnectorModelRunnerMixin:
         if len(entry) == 2:
             return entry
         chunks, latest, _rows, request = entry
+        t0 = now() if stage_xfer_profile_enabled() else None
         output = dict(latest)
+        n_cats = 0
         for k, tensors in chunks.items():
             if tensors:
-                output[k] = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
+                if len(tensors) == 1:
+                    output[k] = tensors[0]
+                else:
+                    output[k] = torch.cat(tensors, dim=0)
+                    n_cats += 1
+        if t0 is not None:
+            log_stage_xfer(
+                "STAGE XFER ACCUM",
+                "materialize",
+                {
+                    "cat": ms_since(t0),
+                    "n_cats": n_cats,
+                    "n_keys": len(output),
+                    "total": ms_since(t0),
+                },
+            )
         return output, request
 
     def accumulate_full_payload_output(
@@ -936,6 +1001,7 @@ class OmniConnectorModelRunnerMixin:
             finished_req_ids,
             list(self._pending_full_payload_send.keys()),
         )
+        t_flush = now() if stage_xfer_profile_enabled() else None
         to_send: dict[str, tuple[Any, Any]] = {}
         for req_id in finished_req_ids:
             entry = self._pending_full_payload_send.pop(req_id, None)
@@ -944,6 +1010,15 @@ class OmniConnectorModelRunnerMixin:
         logger.info("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
         if to_send:
             self.send_full_payload_outputs(scheduler_output=None, outputs=to_send)
+        if t_flush is not None and to_send:
+            log_stage_xfer(
+                "STAGE XFER FLUSH",
+                f"stage{self._stage_id}",
+                {
+                    "n_reqs": len(to_send),
+                    "total": ms_since(t_flush),
+                },
+            )
 
     def send_full_payload_outputs(
         self,
@@ -973,6 +1048,11 @@ class OmniConnectorModelRunnerMixin:
         sent_ids: list[str] = []
         next_stage_id = self._next_stage_id
         for req_id, value in outputs.items():
+            span = (
+                StageXferSpan("STAGE XFER SEND", f"stage{self._stage_id}->{next_stage_id}/{req_id}")
+                if stage_xfer_profile_enabled()
+                else None
+            )
             if isinstance(value, tuple) and len(value) == 2:
                 raw_output, request = value
             else:
@@ -980,13 +1060,19 @@ class OmniConnectorModelRunnerMixin:
 
             payload = raw_output
             if self._custom_process_func is not None:
+                if span is not None:
+                    span.mark("build")
                 payload = self._build_custom_process_payload(
                     request_id=req_id,
                     request=request,
                     pooling_output=raw_output,
                 )
+                if span is not None:
+                    span.lap("payload_build", since="build")
                 if payload is None:
                     continue
+            elif span is not None:
+                span.set("payload_build", 0.0)
             if payload is None:
                 logger.info("[Stage-%s] send_full_payload_outputs: payload is None for %s", self._stage_id, req_id)
                 continue
@@ -1056,10 +1142,14 @@ class OmniConnectorModelRunnerMixin:
                     "data": payload,
                     "request_id": req_id,
                     "connector": self._get_send_connector(),
+                    "enqueue_ts": time.perf_counter(),
                 }
                 with self._lock:
                     self._pending_save_reqs.setdefault(req_id, deque()).append(task)
                     self._pending_save_counts[req_id] += 1
+            if span is not None:
+                span.set("packet", use_packet)
+                span.finish()
             sent_ids.append(req_id)
         if sent_ids:
             self._work_available.set()
@@ -1232,6 +1322,7 @@ class OmniConnectorModelRunnerMixin:
                 "data": payload_data,
                 "request_id": request_id,
                 "connector": self._get_send_connector(),
+                "enqueue_ts": time.perf_counter(),
             }
             with self._lock:
                 self._pending_save_reqs.setdefault(request_id, deque()).append(task)
@@ -1846,6 +1937,7 @@ class OmniConnectorModelRunnerMixin:
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
+        t_get = now() if stage_xfer_profile_enabled() else None
         if self._async_chunk:
             result = self._recv_async_chunk_result(
                 connector,
@@ -1860,6 +1952,7 @@ class OmniConnectorModelRunnerMixin:
                 str(self._stage_id),
                 connector_get_key,
             )
+        get_ms = ms_since(t_get) if t_get is not None else None
 
         if result is None:
             return False
@@ -1868,17 +1961,21 @@ class OmniConnectorModelRunnerMixin:
         if not payload_data:
             return False
 
+        reconstruct_ms = None
         if isinstance(payload_data, dict) and self._should_use_qwen3_thinker_to_talker_packet_path(for_recv=True):
             from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import is_packet_sidecar
 
             if is_packet_sidecar(payload_data):
                 try:
+                    t_recon = now() if stage_xfer_profile_enabled() else None
                     payload_data = self._reconstruct_qwen3_packet_payload(
                         connector,
                         payload_data,
                         str(target_stage_id),
                         str(self._stage_id),
+                        profile_key=connector_get_key,
                     )
+                    reconstruct_ms = ms_since(t_recon) if t_recon is not None else None
                 except Exception:
                     logger.warning(
                         "[Stage-%s] failed to reconstruct Qwen3 packet payload for req=%s key=%s",
@@ -1888,6 +1985,18 @@ class OmniConnectorModelRunnerMixin:
                         exc_info=True,
                     )
                     return False
+
+        if get_ms is not None:
+            log_stage_xfer(
+                "STAGE XFER RECV",
+                connector_get_key,
+                {
+                    "get": get_ms,
+                    "reconstruct": reconstruct_ms,
+                    "size": _size,
+                    "total": get_ms + (reconstruct_ms or 0.0),
+                },
+            )
 
         if isinstance(payload_data, dict):
             logger.info(
@@ -2071,13 +2180,33 @@ class OmniConnectorModelRunnerMixin:
                 pooling_output=task.get("pooling_output"),
             )
         put_key = task.get("put_key")
+        enqueue_ts = task.get("enqueue_ts")
+        queue_wait_ms = (
+            (time.perf_counter() - enqueue_ts) * 1000.0
+            if isinstance(enqueue_ts, (int, float)) and stage_xfer_profile_enabled()
+            else None
+        )
 
+        t_put = now() if stage_xfer_profile_enabled() else None
         success, _size, _metadata = connector.put(
             from_stage=str(task["stage_id"]),
             to_stage=str(task["next_stage_id"]),
             put_key=put_key,
             data=payload_data,
         )
+        put_ms = ms_since(t_put) if t_put is not None else None
+        if queue_wait_ms is not None or put_ms is not None:
+            log_stage_xfer(
+                "STAGE XFER ENQUEUE",
+                str(put_key),
+                {
+                    "queue_wait": queue_wait_ms,
+                    "put": put_ms,
+                    "size": _size,
+                    "success": success,
+                    "total": (queue_wait_ms or 0.0) + (put_ms or 0.0),
+                },
+            )
         logger.info(
             "[Stage-%s] _send_single_request: put_key=%s success=%s size=%s",
             task["stage_id"],

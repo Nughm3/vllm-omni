@@ -387,11 +387,15 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         put_key = self._make_key(put_key, from_stage, to_stage)
 
         try:
+            from ..utils.stage_xfer_profile import StageXferSpan, stage_xfer_profile_enabled
+
+            span = StageXferSpan("RDMA PUT", put_key) if stage_xfer_profile_enabled() else None
             src_addr = 0
             size = 0
             holder = None
             is_fast_path = True
             should_release_holder = False
+            path = "zerocopy"
 
             # Reject empty data early — alloc(0) has undefined behaviour and
             # would leave a zombie entry in _local_buffers that the receiver
@@ -407,8 +411,13 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             # This avoids the previous recursive put() pattern and keeps
             # _local_buffers writes atomic (single write, no override needed).
             if not isinstance(data, (ManagedBuffer, torch.Tensor, bytes)):
+                if span is not None:
+                    span.mark("ser")
                 data = OmniSerializer.serialize(data)
                 is_fast_path = False  # Receiver must deserialize
+                path = "serialize"
+                if span is not None:
+                    span.lap("serialize", since="ser")
 
             if isinstance(data, ManagedBuffer):
                 # Zero-Copy Path
@@ -418,17 +427,22 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     # torch.Tensor branch below handle the copy.
                     logger.warning("ManagedBuffer from different pool detected. Falling back to copy path.")
                     data = data.tensor.contiguous()
+                    path = "copy"
                     # Fall through to torch.Tensor branch
                 else:
                     src_addr = self.base_ptr + data.offset
                     size = data.size
                     holder = data  # Keep the buffer alive
                     should_release_holder = False  # Caller owns it
+                    if span is not None:
+                        span.set("alloc", 0.0)
+                        span.set("copy", 0.0)
 
             # Use 'if' (not 'elif') so the ManagedBuffer fallback above can
             # convert to Tensor and flow into this branch seamlessly.
             if isinstance(data, (torch.Tensor, bytes)):
                 # Copy Path
+                path = "copy" if path == "zerocopy" else path
                 # 1. Determine size
                 if isinstance(data, torch.Tensor):
                     size = data.nbytes
@@ -440,6 +454,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     tensor_data = torch.frombuffer(bytearray(data), dtype=torch.uint8)
 
                 # 2. Alloc from pool
+                if span is not None:
+                    span.mark("alloc")
                 try:
                     offset = self.allocator.alloc(size)
                     holder = ManagedBuffer(self.allocator, offset, size, self.pool)
@@ -447,9 +463,13 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 except MemoryError:
                     logger.error(f"Pool exhausted, cannot put data size {size}")
                     return False, 0, None
+                if span is not None:
+                    span.lap("alloc", since="alloc")
 
                 # 3. Copy data to pool
                 # Handle device mismatch for copy
+                if span is not None:
+                    span.mark("copy")
                 try:
                     dst_tensor = holder.tensor
                     if isinstance(data, torch.Tensor):
@@ -485,6 +505,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     holder.release()
                     logger.error(f"Failed to copy data to pool: {e}")
                     return False, 0, None
+                if span is not None:
+                    span.lap("copy", since="copy")
 
                 src_addr = self.base_ptr + offset
 
@@ -527,6 +549,12 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
+
+            if span is not None:
+                _mb = size / (1024 * 1024)
+                span.set("size_mb", f"{_mb:.2f}")
+                span.set("fast_path", is_fast_path)
+                span.finish(extra=f"({path})")
 
             return True, size, metadata
 

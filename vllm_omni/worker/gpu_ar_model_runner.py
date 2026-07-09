@@ -43,12 +43,6 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
-from vllm_omni.distributed.omni_connectors.utils.stage_xfer_profile import (
-    log_stage_xfer,
-    ms_since,
-    now,
-    stage_xfer_profile_enabled,
-)
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -921,7 +915,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
         if needs_pooler_payload:
-            t_d2h = now() if stage_xfer_profile_enabled() else None
             num_valid_tokens = min(
                 int(scheduler_output.total_num_scheduled_tokens),
                 int(hidden_states.shape[0]),
@@ -930,17 +923,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 hidden_states_cpu = hidden_states[:num_valid_tokens].detach().to("cpu").contiguous()
             else:
                 req_hidden_states_cpu = {}
-            if t_d2h is not None and hidden_states_cpu is not None:
-                log_stage_xfer(
-                    "STAGE XFER D2H",
-                    f"stage{getattr(self, '_stage_id', '?')}/hidden",
-                    {
-                        "d2h": ms_since(t_d2h),
-                        "tokens": num_valid_tokens,
-                        "n_reqs": len(downstream_req_ids),
-                        "total": ms_since(t_d2h),
-                    },
-                )
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
         if num_scheduled_tokens_np is None:
             req_ids = self.input_batch.req_ids
@@ -965,18 +947,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 )
             # Otherwise we don't have the mm CPU data yet, so we still need to build it
             if self.omni_prefix_cache is None:
-                t_mm = now() if stage_xfer_profile_enabled() else None
                 mm_cpu = build_mm_cpu(flatten_payload(multimodal_outputs))
-                if t_mm is not None:
-                    log_stage_xfer(
-                        "STAGE XFER D2H",
-                        f"stage{getattr(self, '_stage_id', '?')}/mm",
-                        {
-                            "d2h": ms_since(t_mm),
-                            "n_keys": len(mm_cpu) if isinstance(mm_cpu, dict) else 0,
-                            "total": ms_since(t_mm),
-                        },
-                    )
 
             self._process_additional_information_updates(
                 hidden_states,

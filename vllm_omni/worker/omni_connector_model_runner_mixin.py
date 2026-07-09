@@ -794,12 +794,12 @@ class OmniConnectorModelRunnerMixin:
     ) -> None:
         from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
             MODE_ASYNC_CHUNK,
-            split_qwen3_full_payload,
+            pack_qwen3_full_payload,
         )
 
         mode = packet_mode or MODE_ASYNC_CHUNK
         t_pack = now() if stage_xfer_profile_enabled() else None
-        packed, sidecar = split_qwen3_full_payload(
+        packed, sidecar = pack_qwen3_full_payload(
             payload,
             request_id=req_id,
             external_req_id=external_req_id,
@@ -872,9 +872,7 @@ class OmniConnectorModelRunnerMixin:
         )
 
         span = (
-            StageXferSpan("STAGE XFER RECONSTRUCT", profile_key or "packet")
-            if stage_xfer_profile_enabled()
-            else None
+            StageXferSpan("STAGE XFER RECONSTRUCT", profile_key or "packet") if stage_xfer_profile_enabled() else None
         )
         get_ms = 0.0
 

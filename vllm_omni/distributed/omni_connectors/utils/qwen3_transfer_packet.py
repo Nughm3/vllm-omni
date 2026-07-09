@@ -220,7 +220,7 @@ def payload_has_packet_tensors(payload: dict[str, Any]) -> bool:
     return False
 
 
-def split_qwen3_full_payload(
+def pack_qwen3_full_payload(
     payload: dict[str, Any],
     *,
     request_id: str,
@@ -273,7 +273,7 @@ def split_thinker_to_talker_full_payload(
     chunk_id: int,
     mode: str = MODE_ASYNC_CHUNK,
 ) -> tuple[torch.Tensor | None, dict[str, Any]]:
-    return split_qwen3_full_payload(
+    return pack_qwen3_full_payload(
         payload,
         request_id=request_id,
         external_req_id=external_req_id,

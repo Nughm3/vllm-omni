@@ -154,7 +154,7 @@ def test_talker_to_code2wav_split_and_reconstruct_roundtrip() -> None:
         "codes": {"audio": [1, 2, 3, 4]},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool), "left_context_size": 25},
     }
-    packed, sidecar = pkt.split_qwen3_full_payload(
+    packed, sidecar = pkt.pack_qwen3_full_payload(
         payload,
         request_id="req-2",
         external_req_id="ext-2",

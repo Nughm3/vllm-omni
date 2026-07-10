@@ -8,12 +8,12 @@ overhead can be grepped without PyTorch profiler noise.
 
 Enable/disable with ``OMNI_STAGE_XFER_PROFILE`` (default: on).
 
-Key tags (do not conflate the two queues):
+Notes:
 - ``STAGE XFER ENQUEUE.send_queue_wait``: stage send path, enqueue → put()
-- ``MTE SENDER TPE.tpe_queue_wait``: Mooncake sender ThreadPoolExecutor,
-  listener submit → handler thread start
 - ``RDMA GET.pull_wait``: receiver blocked on ZMQ pull reply (includes
-  sender TPE + RDMA write + reply drain — not pure wire RDMA)
+  sender handle + RDMA write + reply — not pure wire RDMA)
+- Do not log per ZMQ metadata-query / TPE task: that path is polled
+  hundreds of times per transfer and floods serve.log.
 """
 
 from __future__ import annotations

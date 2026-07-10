@@ -124,12 +124,6 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self._worker_local = threading.local()
         self._last_ttl_check: float = _time_mod.monotonic()
         self._sender_endpoints: dict[int, tuple[str, int]] = {}
-        # Outstanding sender-TPE tasks (queued + running). Used for
-        # [MTE SENDER TPE] depth / queue_wait profiling — distinct from
-        # STAGE XFER ENQUEUE send_queue_wait (stage send path → put()).
-        self._tpe_outstanding = 0
-        self._tpe_lock = threading.Lock()
-        self._sender_threads = MOONCAKE_SENDER_THREADS
 
         self._metrics = {
             "puts": 0,
@@ -234,7 +228,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             f"  Local: host={self.host}, zmq_port={self.zmq_port}, rpc_port={self.rpc_port}\n"
             f"  Remote: sender_host={self.sender_host}, sender_zmq_port={self.sender_zmq_port}\n"
             f"  Role: can_put={self.can_put}, configured_role={config.get('role', 'sender')}\n"
-            f"  Sender TPE workers: {self._sender_threads} (MOONCAKE_SENDER_THREADS)"
+            f"  Sender TPE workers: {MOONCAKE_SENDER_THREADS} (MOONCAKE_SENDER_THREADS)"
         )
 
         # Only sender needs ZMQ listener to handle pull requests
@@ -769,9 +763,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # its memory, causing the sender's in-flight write to fail with ret=-1.
         #
         # Timing note: recv() blocks until the sender finishes RDMA write and
-        # replies TRANS_DONE. So pull_wait ≈ sender TPE queue + handle + RDMA
-        # write + reply drain — not pure wire RDMA. See [MTE SENDER TPE] for
-        # the sender-side breakdown.
+        # replies TRANS_DONE. So pull_wait ≈ sender handle + RDMA write + reply
+        # path — not pure wire RDMA.
         _base_timeout_ms = 30000
         _size_timeout_ms = max(0, (data_size // (100 * 1024 * 1024))) * 5000
         _total_timeout_ms = _base_timeout_ms + _size_timeout_ms
@@ -1034,11 +1027,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         poller.register(socket, zmq.POLLIN)
         poller.register(notify_recv, zmq.POLLIN)
 
-        # Response queue for thread-safe socket operations.
-        # Items are (identity, response_bytes, reply_enqueued_at|None).
+        # Response queue for thread-safe socket operations
         response_queue: queue.Queue = queue.Queue()
-
-        from ..utils.stage_xfer_profile import log_stage_xfer, stage_xfer_profile_enabled
 
         try:
             while not self._stop_event.is_set():
@@ -1057,20 +1047,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     # Process any pending responses (non-blocking)
                     while True:
                         try:
-                            identity, response, reply_enqueued_at = response_queue.get_nowait()
-                            _t_drain0 = _time_mod.perf_counter()
+                            identity, response = response_queue.get_nowait()
                             socket.send_multipart([identity, b"", response])
-                            _t_drain1 = _time_mod.perf_counter()
-                            if reply_enqueued_at is not None and stage_xfer_profile_enabled():
-                                log_stage_xfer(
-                                    "MTE ZMQ REPLY",
-                                    "drain",
-                                    {
-                                        "reply_drain": (_t_drain0 - reply_enqueued_at) * 1000.0,
-                                        "send": (_t_drain1 - _t_drain0) * 1000.0,
-                                        "total": (_t_drain1 - reply_enqueued_at) * 1000.0,
-                                    },
-                                )
                         except queue.Empty:
                             break
 
@@ -1084,18 +1062,12 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     if socket in events:
                         frames = socket.recv_multipart()
                         if len(frames) >= 2:
-                            submit_ts = _time_mod.perf_counter()
-                            with self._tpe_lock:
-                                self._tpe_outstanding += 1
-                                tpe_depth = self._tpe_outstanding
                             self._sender_executor.submit(
                                 self._handle_pull_request,
                                 response_queue,
                                 notify_addr,
                                 frames[0],
                                 frames[-1],
-                                submit_ts,
-                                tpe_depth,
                             )
                 except zmq.ContextTerminated:
                     break
@@ -1108,69 +1080,34 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             except Exception:
                 pass  # Best-effort cleanup during listener shutdown
 
-    def _handle_pull_request(
-        self,
-        response_queue: queue.Queue,
-        notify_addr: str,
-        identity,
-        payload,
-        submit_ts: float | None = None,
-        tpe_depth: int | None = None,
-    ):
+    def _handle_pull_request(self, response_queue: queue.Queue, notify_addr: str, identity, payload):
         """
         Handle pull request or query request in worker thread.
         Results are put into response_queue and listener is notified via inproc.
-
-        ``submit_ts`` / ``tpe_depth`` are for [MTE SENDER TPE] profiling
-        (sender ThreadPoolExecutor queue — not STAGE XFER ENQUEUE send_queue_wait).
         """
-        from ..utils.stage_xfer_profile import log_stage_xfer, stage_xfer_profile_enabled
-
-        profile = stage_xfer_profile_enabled() and submit_ts is not None
-        t_start = _time_mod.perf_counter()
-        tpe_queue_wait_ms = (t_start - submit_ts) * 1000.0 if submit_ts is not None else None
-        msg_type = "query" if payload.startswith(QUERY_INFO) else "pull"
-        profile_key = "unknown"
-        rdma_write_ms = None
-        handle_ms = None
-        size_mb = None
-        ok = 0
-
         try:
-            if msg_type == "query":
-                profile_key, ok, size_mb = self._handle_query_request(
-                    response_queue, identity, payload[len(QUERY_INFO) :], profile=profile
-                )
-                handle_ms = (_time_mod.perf_counter() - t_start) * 1000.0
+            if payload.startswith(QUERY_INFO):
+                self._handle_query_request(response_queue, notify_addr, identity, payload[len(QUERY_INFO) :])
                 return
 
-            # Normal RDMA transfer request
             meta = msgspec.msgpack.decode(payload, type=MooncakeAgentMetadata)
-            profile_key = meta.request_id
 
             with self._local_buffers_lock:
                 item = self._local_buffers.get(meta.request_id)
 
             if not item:
-                t_reply = _time_mod.perf_counter()
-                response_queue.put((identity, TRANS_ERROR, t_reply if profile else None))
-                handle_ms = (t_reply - t_start) * 1000.0
+                response_queue.put((identity, TRANS_ERROR))
+                self._notify_listener(notify_addr)
                 return
 
             src_addrs, src_lengths, _, _, _, _ = item
             remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
-            size_mb = (src_lengths[0] if src_lengths else 0) / (1024 * 1024)
 
-            t_rdma0 = _time_mod.perf_counter()
             ret = self.engine.batch_transfer_sync_write(remote_session, src_addrs, meta.dst_addrs, src_lengths)
-            t_rdma1 = _time_mod.perf_counter()
-            rdma_write_ms = (t_rdma1 - t_rdma0) * 1000.0
 
             if ret == 0:
                 self.cleanup(meta.request_id)
-                t_reply = _time_mod.perf_counter()
-                response_queue.put((identity, TRANS_DONE, t_reply if profile else None))
-                ok = 1
+                response_queue.put((identity, TRANS_DONE))
             else:
                 # Keep buffer in _local_buffers so receiver can retry on transient failures.
                 # Buffer will be cleaned up when: (a) a retry succeeds, (b) close() is called,
@@ -1179,83 +1116,39 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     f"RDMA write failed for {meta.request_id} to {remote_session} "
                     f"(ret={ret}). Buffer retained for retry."
                 )
-                t_reply = _time_mod.perf_counter()
-                response_queue.put((identity, TRANS_ERROR, t_reply if profile else None))
-
-            handle_ms = (t_reply - t_start) * 1000.0
+                response_queue.put((identity, TRANS_ERROR))
 
         except Exception as e:
             logger.error(f"Push failed: {e}")
-            t_reply = _time_mod.perf_counter()
-            response_queue.put((identity, TRANS_ERROR, t_reply if profile else None))
-            handle_ms = (t_reply - t_start) * 1000.0
+            response_queue.put((identity, TRANS_ERROR))
 
-        finally:
-            # Always wake the listener from here (query + pull) so reply drain
-            # and outstanding accounting stay in one place.
-            self._notify_listener(notify_addr)
-            with self._tpe_lock:
-                self._tpe_outstanding = max(0, self._tpe_outstanding - 1)
-            if profile:
-                total_ms = (_time_mod.perf_counter() - submit_ts) * 1000.0
-                parts: dict[str, Any] = {
-                    "tpe_queue_wait": tpe_queue_wait_ms,
-                    "handle": handle_ms,
-                    "rdma_write": rdma_write_ms,
-                    "tpe_depth": tpe_depth,
-                    "workers": self._sender_threads,
-                    "msg_type": msg_type,
-                    "ok": ok,
-                    "total": total_ms,
-                }
-                if size_mb is not None:
-                    parts["size_mb"] = f"{size_mb:.2f}"
-                log_stage_xfer("MTE SENDER TPE", profile_key, parts)
+        self._notify_listener(notify_addr)
 
-    def _handle_query_request(
-        self,
-        response_queue: queue.Queue,
-        identity,
-        payload,
-        *,
-        profile: bool = False,
-    ) -> tuple[str, int, float | None]:
-        """Handle metadata query request.
-
-        Returns ``(request_id, ok, size_mb)`` for profiling.
-        Listener notify is owned by ``_handle_pull_request``'s finally.
-        """
-        profile_key = "query"
-        ok = 0
-        size_mb = None
+    def _handle_query_request(self, response_queue: queue.Queue, notify_addr: str, identity, payload):
+        """Handle metadata query request."""
         try:
             query = msgspec.msgpack.decode(payload, type=QueryRequest)
-            profile_key = query.request_id
 
             with self._local_buffers_lock:
                 item = self._local_buffers.get(query.request_id)
 
             if not item:
-                response_queue.put((identity, INFO_NOT_FOUND, _time_mod.perf_counter() if profile else None))
+                response_queue.put((identity, INFO_NOT_FOUND))
             else:
                 _src_addrs, src_lengths, _, _, is_fast_path, _ = item
-                size_mb = (src_lengths[0] if src_lengths else 0) / (1024 * 1024)
 
                 resp = QueryResponse(
                     request_id=query.request_id,
                     data_size=src_lengths[0] if src_lengths else 0,
                     is_fast_path=is_fast_path,
                 )
-                response_queue.put(
-                    (identity, msgspec.msgpack.encode(resp), _time_mod.perf_counter() if profile else None)
-                )
-                ok = 1
+                response_queue.put((identity, msgspec.msgpack.encode(resp)))
 
         except Exception as e:
             logger.error(f"Query request failed: {e}")
-            response_queue.put((identity, INFO_NOT_FOUND, _time_mod.perf_counter() if profile else None))
+            response_queue.put((identity, INFO_NOT_FOUND))
 
-        return profile_key, ok, size_mb
+        self._notify_listener(notify_addr)
 
     def _notify_listener(self, notify_addr: str):
         """Send notification to wake up listener thread.

@@ -27,6 +27,12 @@ try:
 except ImportError:
     TransferEngine = None
 
+MOONCAKE_SENDER_THREADS_ENV_VAR = os.getenv("MOONCAKE_SENDER_THREADS", "4")
+if not MOONCAKE_SENDER_THREADS_ENV_VAR.isnumeric():
+    raise ValueError(f"MOONCAKE_SENDER_THREADS={MOONCAKE_SENDER_THREADS_ENV_VAR} must be an integer")
+MOONCAKE_SENDER_THREADS = int(MOONCAKE_SENDER_THREADS_ENV_VAR)
+logger.info(f"Using {MOONCAKE_SENDER_THREADS} sender threads")
+
 # Stale buffer TTL: buffers older than this are automatically reclaimed
 # to prevent memory leaks when receiver crashes or gives up.
 _BUFFER_TTL_SECONDS = 300  # 5 minutes
@@ -214,7 +220,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # Most fields already initialized at the top of __init__ for teardown
         # safety.  Only create the real ZMQ context and thread pool here.
         self.zmq_ctx = zmq.Context()
-        self._sender_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mooncake-sender")
+        self._sender_executor = ThreadPoolExecutor(max_workers=MOONCAKE_SENDER_THREADS, thread_name_prefix="mooncake-sender")
 
         # Log complete connector configuration for debugging
         logger.info(

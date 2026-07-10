@@ -819,6 +819,8 @@ class OmniConnectorModelRunnerMixin:
                     "packed_mb": f"{packed_nbytes / (1024 * 1024):.2f}",
                     "has_packed": packed is not None,
                     "mode": mode,
+                    "edge": f"{self._stage_id}->{next_stage_id}",
+                    "path": "packet",
                     "total": pack_ms,
                 },
             )
@@ -1147,6 +1149,8 @@ class OmniConnectorModelRunnerMixin:
                     self._pending_save_counts[req_id] += 1
             if span is not None:
                 span.set("packet", use_packet)
+                span.set("edge", f"{self._stage_id}->{next_stage_id}")
+                span.set("path", "packet" if use_packet else "serialize")
                 span.finish()
             sent_ids.append(req_id)
         if sent_ids:
@@ -1992,6 +1996,8 @@ class OmniConnectorModelRunnerMixin:
                     "get": get_ms,
                     "reconstruct": reconstruct_ms,
                     "size": _size,
+                    "path": "packet" if reconstruct_ms is not None else "raw",
+                    "edge": f"->{self._stage_id}",
                     "total": get_ms + (reconstruct_ms or 0.0),
                 },
             )
@@ -2194,14 +2200,18 @@ class OmniConnectorModelRunnerMixin:
         )
         put_ms = ms_since(t_put) if t_put is not None else None
         if queue_wait_ms is not None or put_ms is not None:
+            # send_queue_wait: stage send-path queue (enqueue_ts → put()).
+            # Distinct from [MTE SENDER TPE] tpe_queue_wait (listener submit →
+            # handler thread start on the Mooncake sender ThreadPoolExecutor).
             log_stage_xfer(
                 "STAGE XFER ENQUEUE",
                 str(put_key),
                 {
-                    "queue_wait": queue_wait_ms,
+                    "send_queue_wait": queue_wait_ms,
                     "put": put_ms,
                     "size": _size,
                     "success": success,
+                    "edge": f"{task['stage_id']}->{task['next_stage_id']}",
                     "total": (queue_wait_ms or 0.0) + (put_ms or 0.0),
                 },
             )

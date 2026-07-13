@@ -1058,7 +1058,8 @@ def get_stage_connector_spec(
 
     Middle stages with both inbound and outbound transfer-engine edges get a
     single duplex spec (``can_put`` and ``can_get`` OR-merged, listen port from
-    the outbound edge, query endpoint from the inbound edge).
+    the outbound edge, query endpoint from the inbound edge). Heterogeneous
+    inbound/outbound transports become a ``CompositeOmniConnector``.
     """
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config
     from vllm_omni.distributed.omni_connectors.utils.initialization import (

@@ -210,7 +210,8 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
     - outbound → can_put=True  (legacy role=sender)
 
     Middle stages receive both keys; ``get_stage_connector_spec`` merges them
-    into one duplex MooncakeTransferEngineConnector instance.
+    into one duplex connector (same type) or a CompositeOmniConnector when
+    inbound/outbound transports differ.
     """
     if not transfer_config:
         return {}
@@ -262,40 +263,60 @@ def merge_stage_connector_specs(stage_connectors_cfg: dict[str, Any]) -> dict[st
     Incoming edges contribute ``can_get`` + ``sender_host`` / ``sender_zmq_port``.
     Outgoing edges contribute ``can_put`` + local listen ``zmq_port``.
     Capabilities are OR-merged so a middle stage becomes duplex.
+
+    When inbound and outbound edges use different connector types (e.g.
+    Mooncake receive + SharedMemory send on a colocated middle stage), return
+    a ``CompositeOmniConnector`` wrapping both instead of raising.
     """
     if not stage_connectors_cfg:
         return {}
 
-    merged_name: str | None = None
+    edge_specs: list[tuple[str, dict[str, Any], bool, bool]] = []
+    for cfg in stage_connectors_cfg.values():
+        spec = cfg.get("spec") or {}
+        name = spec.get("name")
+        if not name:
+            continue
+        extra = dict(spec.get("extra") or {})
+        edge_specs.append(
+            (
+                name,
+                extra,
+                bool(extra.get("can_put", False)),
+                bool(extra.get("can_get", False)),
+            )
+        )
+
+    if not edge_specs:
+        return {}
+
+    names = {name for name, _, _, _ in edge_specs}
+    if len(names) > 1:
+        return _merge_heterogeneous_stage_connector_specs(edge_specs)
+
+    merged_name = edge_specs[0][0]
     merged_extra: dict[str, Any] = {}
     can_put = False
     can_get = False
 
-    for cfg in stage_connectors_cfg.values():
-        spec = cfg.get("spec") or {}
-        name = spec.get("name")
-        extra = dict(spec.get("extra") or {})
-        if not name:
-            continue
-
-        if merged_name is None:
-            merged_name = name
+    for name, extra, edge_can_put, edge_can_get in edge_specs:
+        if not merged_extra:
             merged_extra = extra
-        elif name != merged_name:
-            raise ValueError(
-                f"Cannot merge duplex connector specs with mismatched types: "
-                f"{merged_name!r} vs {name!r}"
-            )
         else:
             # Keep shared backend knobs from the first edge; direction-specific
             # fields are overwritten below from the matching edge.
             for key, value in extra.items():
-                if key in {"can_put", "can_get", "role", "zmq_port", "sender_host", "sender_zmq_port"}:
+                if key in {
+                    "can_put",
+                    "can_get",
+                    "role",
+                    "zmq_port",
+                    "sender_host",
+                    "sender_zmq_port",
+                }:
                     continue
                 merged_extra.setdefault(key, value)
 
-        edge_can_put = bool(extra.get("can_put", False))
-        edge_can_get = bool(extra.get("can_get", False))
         can_put = can_put or edge_can_put
         can_get = can_get or edge_can_get
 
@@ -306,9 +327,6 @@ def merge_stage_connector_specs(stage_connectors_cfg: dict[str, Any]) -> dict[st
                 merged_extra["sender_host"] = extra["sender_host"]
             if extra.get("sender_zmq_port") is not None:
                 merged_extra["sender_zmq_port"] = extra["sender_zmq_port"]
-
-    if merged_name is None:
-        return {}
 
     merged_extra["can_put"] = can_put
     merged_extra["can_get"] = can_get
@@ -321,6 +339,44 @@ def merge_stage_connector_specs(stage_connectors_cfg: dict[str, Any]) -> dict[st
         merged_extra.pop("role", None)
 
     return {"name": merged_name, "extra": merged_extra}
+
+
+def _merge_heterogeneous_stage_connector_specs(
+    edge_specs: list[tuple[str, dict[str, Any], bool, bool]],
+) -> dict[str, Any]:
+    """Build a CompositeOmniConnector spec for mixed inbound/outbound types."""
+    get_connector: dict[str, Any] | None = None
+    put_connector: dict[str, Any] | None = None
+
+    for name, extra, edge_can_put, edge_can_get in edge_specs:
+        child = {"name": name, "extra": extra}
+        if edge_can_get:
+            if get_connector is not None and get_connector["name"] != name:
+                raise ValueError(
+                    "Cannot merge multiple inbound connectors with mismatched "
+                    f"types: {get_connector['name']!r} vs {name!r}"
+                )
+            get_connector = child
+        if edge_can_put:
+            if put_connector is not None and put_connector["name"] != name:
+                raise ValueError(
+                    "Cannot merge multiple outbound connectors with mismatched "
+                    f"types: {put_connector['name']!r} vs {name!r}"
+                )
+            put_connector = child
+
+    if get_connector is None and put_connector is None:
+        return {}
+
+    return {
+        "name": "CompositeOmniConnector",
+        "extra": {
+            "can_put": put_connector is not None,
+            "can_get": get_connector is not None,
+            "get_connector": get_connector,
+            "put_connector": put_connector,
+        },
+    }
 
 
 def load_omni_transfer_config(

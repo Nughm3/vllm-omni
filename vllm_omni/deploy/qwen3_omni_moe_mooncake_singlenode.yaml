@@ -12,13 +12,14 @@
 
 async_chunk: false
 
-# zmq_port is a *base* port (listen = base+stage_id). sender_host is omitted so
-# receivers inherit the local auto-resolved host on the same node.
+# zmq_port is a *base* port (listen = base+stage_id). sender_host: auto resolves
+# to the local RDMA IP so full-payload get(metadata=None) can query the sender.
 connectors:
   thinker2talker_mooncake:
     name: MooncakeTransferEngineConnector
     extra:
       host: "auto"
+      sender_host: "auto"
       zmq_port: 50051
       protocol: "rdma"
       device_name: "mlx5_0"
@@ -29,6 +30,7 @@ connectors:
     name: MooncakeTransferEngineConnector
     extra:
       host: "auto"
+      sender_host: "auto"
       zmq_port: 50051
       protocol: "rdma"
       device_name: "mlx5_0"

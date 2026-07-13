@@ -157,8 +157,20 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self.pool_device = config.get("memory_pool_device", "cpu")
 
         # --- Sender Configuration (for receiver to query without metadata) ---
-        # When receiver doesn't have metadata, it uses these to connect to sender
-        self.sender_host = config.get("sender_host", None)
+        # Full-payload mixin calls get() without metadata, so receivers must
+        # resolve sender_host here. "auto"/missing => same-node local IP
+        # (cross-node deploys set an explicit remote sender_host).
+        raw_sender_host = config.get("sender_host", None)
+        if raw_sender_host is None or str(raw_sender_host).lower() in {
+            "",
+            "auto",
+            "*",
+            "0.0.0.0",
+            "::",
+        }:
+            self.sender_host = self.host
+        else:
+            self.sender_host = str(raw_sender_host)
         self.sender_zmq_port = config.get("sender_zmq_port", None)
 
         # --- Role ---

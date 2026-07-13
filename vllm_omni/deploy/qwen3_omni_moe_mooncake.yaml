@@ -1,7 +1,7 @@
-# Qwen3-Omni-MoE deploy using Mooncake Transfer Engine for stage-to-stage
-# streaming.  Topology, sampling params, GPU layout, and async_chunk gating
-# match ``qwen3_omni_moe.yaml``; only the inter-stage connector is swapped
-# from ``SharedMemoryConnector`` to ``MooncakeTransferEngineConnector``.
+# Qwen3-Omni-MoE hybrid cross-node deploy: Mooncake for thinker→talker (0→1),
+# SharedMemory for colocated talker→code2wav (1→2 on the worker node).
+# Topology, sampling params, GPU layout, and async_chunk gating match
+# ``qwen3_omni_moe.yaml``.
 #
 # Layout: 2 nodes (stage 0 on node 0, stages 1+2 on node 1).
 # Mooncake also supports cross-node stage placement when RDMA (or TCP fallback)
@@ -60,17 +60,12 @@ connectors:
       memory_pool_size: 4294967296
       memory_pool_device: "cpu"
 
-  talker2code2wav_mooncake:
-    name: MooncakeTransferEngineConnector
+  talker2code2wav_shm:
+    name: SharedMemoryConnector
     extra:
-      host: "auto"
-      zmq_port: 50051
-      # Stage 2 (receiver) queries talker on node 1 (colocated with stage 2).
-      sender_host: "10.248.12.86" # hk01dgx012
-      protocol: "rdma"
-      device_name: "mlx5_0"
-      memory_pool_size: 4294967296
-      memory_pool_device: "cpu"
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
 
 stages:
   - stage_id: 0
@@ -96,7 +91,7 @@ stages:
     input_connectors:
       from_stage_0: thinker2talker_mooncake
     output_connectors:
-      to_stage_2: talker2code2wav_mooncake
+      to_stage_2: talker2code2wav_shm
     default_sampling_params:
       temperature: 0.9
       top_k: 50
@@ -115,7 +110,7 @@ stages:
     async_scheduling: false
     devices: "1"
     input_connectors:
-      from_stage_1: talker2code2wav_mooncake
+      from_stage_1: talker2code2wav_shm
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

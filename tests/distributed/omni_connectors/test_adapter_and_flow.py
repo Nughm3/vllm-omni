@@ -199,23 +199,88 @@ def test_get_connectors_for_stage():
     # Config has edges: 0->1, 1->2
     config = OmniTransferConfig(connectors={("0", "1"): ConnectorSpec(name="C1"), ("1", "2"): ConnectorSpec(name="C2")})
 
-    # Get config for Stage 1
-    # Stage 1 receives from 0 (input) and sends to 2 (output)
-    # get_connectors_config_for_stage ONLY returns INPUT connectors for the worker to initialize
-
+    # Stage 1 receives from 0 and sends to 2 — both edges are returned so
+    # get_stage_connector_spec can merge them into a duplex connector.
     stage_config = get_connectors_config_for_stage(config, stage_id=1)
 
-    # Should contain "from_stage_0"
     assert "from_stage_0" in stage_config
     assert stage_config["from_stage_0"]["spec"]["name"] == "C1"
+    assert stage_config["from_stage_0"]["spec"]["extra"]["can_get"] is True
+    assert stage_config["from_stage_0"]["spec"]["extra"]["can_put"] is False
 
-    # Should NOT contain "from_stage_1" or related to output
+    assert "to_stage_2" in stage_config
+    assert stage_config["to_stage_2"]["spec"]["name"] == "C2"
+    assert stage_config["to_stage_2"]["spec"]["extra"]["can_put"] is True
+    assert stage_config["to_stage_2"]["spec"]["extra"]["can_get"] is False
+
+    # Unrelated edges must not appear.
     assert "from_stage_1" not in stage_config
 
-    # Verify Stage 2
     stage_2_config = get_connectors_config_for_stage(config, stage_id=2)
     assert "from_stage_1" in stage_2_config
     assert stage_2_config["from_stage_1"]["spec"]["name"] == "C2"
+    assert "to_stage_2" not in stage_2_config
+
+    stage_0_config = get_connectors_config_for_stage(config, stage_id=0)
+    assert "to_stage_1" in stage_0_config
+    assert stage_0_config["to_stage_1"]["spec"]["extra"]["can_put"] is True
+    assert "from_stage_0" not in stage_0_config
+
+
+def test_merge_stage_connector_specs_duplex_mooncake():
+    """Middle stage merges inbound+outbound Mooncake edges into one duplex spec."""
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        merge_stage_connector_specs,
+    )
+
+    config = OmniTransferConfig(
+        connectors={
+            ("0", "1"): ConnectorSpec(
+                name="MooncakeTransferEngineConnector",
+                extra={
+                    "host": "auto",
+                    "zmq_port": 50051,
+                    "sender_host": "10.248.12.80",
+                    "protocol": "rdma",
+                },
+            ),
+            ("1", "2"): ConnectorSpec(
+                name="MooncakeTransferEngineConnector",
+                extra={
+                    "host": "auto",
+                    "zmq_port": 50051,
+                    "sender_host": "10.248.12.86",
+                    "protocol": "rdma",
+                },
+            ),
+        }
+    )
+
+    stage_1 = get_connectors_config_for_stage(config, stage_id=1)
+    merged = merge_stage_connector_specs(stage_1)
+
+    assert merged["name"] == "MooncakeTransferEngineConnector"
+    extra = merged["extra"]
+    assert extra["can_put"] is True
+    assert extra["can_get"] is True
+    assert "role" not in extra
+    # Listen on base+stage1; query stage0's listen port.
+    assert extra["zmq_port"] == 50052
+    assert extra["sender_host"] == "10.248.12.80"
+    assert extra["sender_zmq_port"] == 50051
+
+    stage_0 = merge_stage_connector_specs(get_connectors_config_for_stage(config, stage_id=0))
+    assert stage_0["extra"]["can_put"] is True
+    assert stage_0["extra"]["can_get"] is False
+    assert stage_0["extra"]["zmq_port"] == 50051
+    assert stage_0["extra"]["role"] == "sender"
+
+    stage_2 = merge_stage_connector_specs(get_connectors_config_for_stage(config, stage_id=2))
+    assert stage_2["extra"]["can_put"] is False
+    assert stage_2["extra"]["can_get"] is True
+    assert stage_2["extra"]["sender_host"] == "10.248.12.86"
+    assert stage_2["extra"]["sender_zmq_port"] == 50052
+    assert stage_2["extra"]["role"] == "receiver"
 
 
 def test_recv_with_missing_metadata(mocker: MockerFixture):

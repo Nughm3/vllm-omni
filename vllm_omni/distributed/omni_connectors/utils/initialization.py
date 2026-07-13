@@ -113,6 +113,8 @@ def create_connectors_from_config(
 
                 if is_sender is not None:
                     extra["role"] = "sender" if is_sender else "receiver"
+                    extra["can_put"] = bool(is_sender)
+                    extra["can_get"] = not bool(is_sender)
                     if not is_sender:
                         extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))
                         extra.setdefault("sender_zmq_port", adjusted_port)
@@ -120,14 +122,24 @@ def create_connectors_from_config(
                     caller_str = str(caller_stage_id)
                     if caller_str == from_stage:
                         extra["role"] = "sender"
+                        extra["can_put"] = True
+                        extra["can_get"] = False
                     elif caller_str == to_stage:
                         extra["role"] = "receiver"
+                        extra["can_put"] = False
+                        extra["can_get"] = True
                         extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))
                         extra.setdefault("sender_zmq_port", adjusted_port)
                     else:
                         extra["role"] = "sender"
+                        extra["can_put"] = True
+                        extra["can_get"] = False
                 else:
                     extra["role"] = extra.get("role", "auto")
+                    if "can_put" not in extra and "can_get" not in extra:
+                        role = extra.get("role")
+                        extra["can_put"] = role == "sender"
+                        extra["can_get"] = role == "receiver"
 
                 connector = OmniConnectorFactory.create_connector(ConnectorSpec(name=connector_spec.name, extra=extra))
             else:
@@ -145,46 +157,170 @@ def create_connectors_from_config(
     return connectors
 
 
+def _stage_port_offset(stage_id: str | int) -> int:
+    try:
+        return int(stage_id)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _apply_transfer_engine_ports(
+    extra: dict[str, Any],
+    *,
+    from_stage: str,
+    can_put: bool,
+    can_get: bool,
+) -> None:
+    """Resolve listen / query ZMQ ports for transfer-engine connectors.
+
+    ``zmq_port`` in YAML is treated as a *base* port.  The local listen port
+    (used when ``can_put``) is ``base + from_stage`` for the outbound edge, i.e.
+    ``base + this_stage``.  The upstream query port (used when ``can_get``) is
+    ``base + upstream_stage`` unless ``sender_zmq_port`` is already set.
+    """
+    base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
+    local_rank = get_connector_local_rank()
+    rank_offset = local_rank * KV_RANK_PORT_STRIDE
+
+    if can_put:
+        # Outbound edge: from_stage is this stage — bind base + this_stage (+ rank).
+        extra["zmq_port"] = base_port + _stage_port_offset(from_stage) + rank_offset
+    if can_get:
+        # Inbound edge: query the upstream sender's listen port.
+        computed_sender_port = base_port + _stage_port_offset(from_stage) + rank_offset
+        if extra.get("sender_zmq_port") is None:
+            extra["sender_zmq_port"] = computed_sender_port
+        else:
+            extra["sender_zmq_port"] = expand_env_int(extra["sender_zmq_port"], "sender_zmq_port")
+        extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))
+
+
 def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, stage_id: str | int) -> dict[str, Any]:
     """
     Extract connector configurations relevant for a specific stage worker.
 
-    Returns a dict compatible with worker initialization:
+    Returns a dict keyed by edge direction for edges that touch this stage:
     {
-        "from_stage_X": {
-            "spec": {
-                "name": "ConnectorName",
-                "extra": {...}
-            }
-        },
-        ...
+        "from_stage_X": {"spec": {"name": ..., "extra": {...}}},  # inbound
+        "to_stage_Y":   {"spec": {"name": ..., "extra": {...}}},  # outbound
     }
+
+    Each edge entry is role-aware for this stage:
+    - inbound  → can_get=True  (legacy role=receiver)
+    - outbound → can_put=True  (legacy role=sender)
+
+    Middle stages receive both keys; ``get_stage_connector_spec`` merges them
+    into one duplex MooncakeTransferEngineConnector instance.
     """
     if not transfer_config:
         return {}
 
-    stage_connectors_config = {}
+    stage_connectors_config: dict[str, Any] = {}
     target_stage = str(stage_id)
 
-    # Iterate through all configured edges and inject direction-specific role.
-    # The shared edge-level ConnectorSpec is role-neutral; each stage gets
-    # the correct role ("sender" or "receiver") based on its position in
-    # the edge so that MooncakeTransferEngineConnector (and any future
-    # role-aware connector) initializes correctly.
     for (from_stage, to_stage), spec in transfer_config.connectors.items():
-        if to_stage == target_stage:
-            # Incoming edge → this stage is the receiver
-            extra = dict(spec.extra) if spec.extra else {}
-            extra.setdefault("role", "receiver")
-            stage_connectors_config[f"from_stage_{from_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
-        elif from_stage == target_stage and target_stage == "0":
-            # Outgoing edge for stage 0 — included for async_chunk spec
-            # extraction (omni_stage.py), NOT for connector instantiation.
-            extra = dict(spec.extra) if spec.extra else {}
+        is_put = from_stage == target_stage
+        is_get = to_stage == target_stage
+        if not is_put and not is_get:
+            continue
+
+        extra = dict(spec.extra) if spec.extra else {}
+        extra["can_put"] = is_put
+        extra["can_get"] = is_get
+
+        # Legacy role for Mori / Yuanrong (single-direction connectors).
+        if is_put and not is_get:
             extra.setdefault("role", "sender")
-            stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
+        elif is_get and not is_put:
+            extra.setdefault("role", "receiver")
+
+        if spec.name in TRANSFER_ENGINE_CONNECTOR_NAMES:
+            _apply_transfer_engine_ports(
+                extra,
+                from_stage=from_stage,
+                can_put=is_put,
+                can_get=is_get,
+            )
+
+        if is_get:
+            stage_connectors_config[f"from_stage_{from_stage}"] = {
+                "spec": {"name": spec.name, "extra": extra}
+            }
+        if is_put:
+            # Outbound edges for every stage (not only stage 0) so middle-stage
+            # duplex merge and stage-0 sender spec extraction both work.
+            stage_connectors_config[f"to_stage_{to_stage}"] = {
+                "spec": {"name": spec.name, "extra": dict(extra)}
+            }
 
     return stage_connectors_config
+
+
+def merge_stage_connector_specs(stage_connectors_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Merge per-edge stage connector entries into one duplex-capable spec.
+
+    Incoming edges contribute ``can_get`` + ``sender_host`` / ``sender_zmq_port``.
+    Outgoing edges contribute ``can_put`` + local listen ``zmq_port``.
+    Capabilities are OR-merged so a middle stage becomes duplex.
+    """
+    if not stage_connectors_cfg:
+        return {}
+
+    merged_name: str | None = None
+    merged_extra: dict[str, Any] = {}
+    can_put = False
+    can_get = False
+
+    for cfg in stage_connectors_cfg.values():
+        spec = cfg.get("spec") or {}
+        name = spec.get("name")
+        extra = dict(spec.get("extra") or {})
+        if not name:
+            continue
+
+        if merged_name is None:
+            merged_name = name
+            merged_extra = extra
+        elif name != merged_name:
+            raise ValueError(
+                f"Cannot merge duplex connector specs with mismatched types: "
+                f"{merged_name!r} vs {name!r}"
+            )
+        else:
+            # Keep shared backend knobs from the first edge; direction-specific
+            # fields are overwritten below from the matching edge.
+            for key, value in extra.items():
+                if key in {"can_put", "can_get", "role", "zmq_port", "sender_host", "sender_zmq_port"}:
+                    continue
+                merged_extra.setdefault(key, value)
+
+        edge_can_put = bool(extra.get("can_put", False))
+        edge_can_get = bool(extra.get("can_get", False))
+        can_put = can_put or edge_can_put
+        can_get = can_get or edge_can_get
+
+        if edge_can_put and "zmq_port" in extra:
+            merged_extra["zmq_port"] = extra["zmq_port"]
+        if edge_can_get:
+            if extra.get("sender_host") is not None:
+                merged_extra["sender_host"] = extra["sender_host"]
+            if extra.get("sender_zmq_port") is not None:
+                merged_extra["sender_zmq_port"] = extra["sender_zmq_port"]
+
+    if merged_name is None:
+        return {}
+
+    merged_extra["can_put"] = can_put
+    merged_extra["can_get"] = can_get
+    if can_put and not can_get:
+        merged_extra["role"] = "sender"
+    elif can_get and not can_put:
+        merged_extra["role"] = "receiver"
+    else:
+        # Duplex: Mooncake uses can_put/can_get; drop a single-direction role.
+        merged_extra.pop("role", None)
+
+    return {"name": merged_name, "extra": merged_extra}
 
 
 def load_omni_transfer_config(
@@ -506,7 +642,8 @@ def resolve_omni_kv_config_for_stage(
     omni_to = None
 
     # Prioritize outgoing (Sender) if exists, else check incoming (Receiver).
-    # Inject direction-specific role so the connector initializes correctly.
+    # Inject direction-specific role / can_put / can_get so the connector
+    # initializes correctly (Mooncake uses can_*; Mori/Yuanrong use role).
     if outgoing:
         if len(outgoing) > 1:
             logger.debug(
@@ -518,6 +655,8 @@ def resolve_omni_kv_config_for_stage(
         to_s, spec = outgoing[0]
         omni_conn_cfg = {"type": spec.name, **(spec.extra or {})}
         omni_conn_cfg.setdefault("role", "sender")
+        omni_conn_cfg["can_put"] = True
+        omni_conn_cfg["can_get"] = False
         omni_from = stage_id_str
         omni_to = str(to_s)
     elif incoming:
@@ -526,6 +665,8 @@ def resolve_omni_kv_config_for_stage(
         from_s, spec = incoming[0]
         omni_conn_cfg = {"type": spec.name, **(spec.extra or {})}
         omni_conn_cfg.setdefault("role", "receiver")
+        omni_conn_cfg["can_put"] = False
+        omni_conn_cfg["can_get"] = True
         omni_from = str(from_s)
         omni_to = stage_id_str
 

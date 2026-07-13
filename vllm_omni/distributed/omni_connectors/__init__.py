@@ -31,6 +31,7 @@ from .utils.initialization import (
     initialize_connectors_from_config,
     initialize_orchestrator_connectors,
     load_omni_transfer_config,
+    merge_stage_connector_specs,
 )
 
 # Backward-compatible alias: MooncakeConnector was renamed to MooncakeStoreConnector.
@@ -60,5 +61,6 @@ __all__ = [
     # Manager helpers
     "initialize_orchestrator_connectors",
     "get_stage_connector_config",
+    "merge_stage_connector_specs",
     "build_stage_connectors",
 ]

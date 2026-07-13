@@ -713,8 +713,8 @@ def build_engine_args_dict(
     # Stage id must come from stage config instead of inherited CLI kwargs
     # (e.g. `--stage-id` defaulting to None).
     engine_args_dict["stage_id"] = stage_id
-    if engine_args_dict.get("async_chunk", False):
-        engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
+    # if engine_args_dict.get("async_chunk", False):
+    engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
 
     if stage_type == "diffusion":
         from vllm_omni.diffusion.data import parse_attention_config
@@ -1054,16 +1054,23 @@ def get_stage_connector_spec(
     stage_id: int,
     async_chunk: bool,
 ) -> dict[str, Any]:
-    """Return the first connector spec for the stage when async chunking is enabled."""
-    from vllm_omni.distributed.omni_connectors import get_stage_connector_config
+    """Return the merged connector spec for this stage.
 
-    if not async_chunk:
-        return {}
+    Middle stages with both inbound and outbound transfer-engine edges get a
+    single duplex spec (``can_put`` and ``can_get`` OR-merged, listen port from
+    the outbound edge, query endpoint from the inbound edge).
+    """
+    from vllm_omni.distributed.omni_connectors import get_stage_connector_config
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        merge_stage_connector_specs,
+    )
+
+    # Full-payload Mooncake also needs a stage connector; do not gate on
+    # async_chunk (async chunk remains unsupported for this cross-node path).
+    _ = async_chunk
 
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
-    for cfg in stage_connectors_cfg.values():
-        return dict(cfg.get("spec", {}))
-    return {}
+    return merge_stage_connector_specs(stage_connectors_cfg)
 
 
 def build_diffusion_config(

@@ -162,16 +162,21 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self.sender_zmq_port = config.get("sender_zmq_port", None)
 
         # --- Role ---
-        # "sender": bind ZMQ listener, accept put() calls.
-        # "receiver": skip ZMQ bind, only accept get() calls.
-        # The orchestration layer (get_connectors_config_for_stage /
-        # kv_transfer_manager) is responsible for injecting the correct role.
-        role = str(config.get("role", "sender")).lower()
-        if role not in {"sender", "receiver"}:
-            raise ValueError(
-                f"Invalid role={role!r} for MooncakeTransferEngineConnector. Expected 'sender' or 'receiver'."
-            )
-        self.can_put = role == "sender"
+        # Prefer explicit can_put / can_get (duplex-capable). Fall back to legacy
+        # role=sender|receiver for callers that have not been migrated yet.
+        self.can_put = bool(config.get("can_put", False))
+        self.can_get = bool(config.get("can_get", False))
+        if not self.can_put and not self.can_get:
+            role = config.get("role")
+            if role == "sender":
+                self.can_put = True
+            elif role == "receiver":
+                self.can_get = True
+            else:
+                raise ValueError(
+                    "MooncakeTransferEngineConnector must have can_put and/or can_get "
+                    f"set to True (or legacy role=sender|receiver); got role={role!r}."
+                )
 
         self.engine_id = str(uuid.uuid4())
 
@@ -218,7 +223,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             f"MooncakeTransferEngineConnector config summary:\n"
             f"  Local: host={self.host}, zmq_port={self.zmq_port}, rpc_port={self.rpc_port}\n"
             f"  Remote: sender_host={self.sender_host}, sender_zmq_port={self.sender_zmq_port}\n"
-            f"  Role: can_put={self.can_put}, configured_role={config.get('role', 'sender')}"
+            f"  Role: can_put={self.can_put}, can_get={self.can_get}"
         )
 
         # Only sender needs ZMQ listener to handle pull requests
@@ -968,7 +973,6 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         except zmq.ZMQError as exc:
             # Any bind failure (EADDRINUSE, EADDRNOTAVAIL, EACCES, etc.)
             # is fatal for a sender — fail fast so __init__ propagates the error.
-            # There is no silent receiver fallback; roles are explicitly assigned.
             logger.error(f"ZMQ bind failed on {self.host}:{self.zmq_port}: {exc} (errno={exc.errno})")
             self.can_put = False
             self._bind_error = exc

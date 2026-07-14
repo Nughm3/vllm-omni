@@ -31,9 +31,17 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 class MockConnector:
     """In-memory connector for testing (mimics OmniConnectorBase)."""
 
+    supports_raw_data: bool = False
+
     def __init__(self, stage_id: int = 0):
         self.stage_id = stage_id
         self._store: dict[str, Any] = {}
+
+    def supports_raw_put(self) -> bool:
+        return bool(self.supports_raw_data)
+
+    def supports_raw_get(self) -> bool:
+        return bool(self.supports_raw_data)
 
     def put(self, from_stage, to_stage, put_key, data):
         key = f"{from_stage}_{to_stage}_{put_key}"
@@ -49,6 +57,10 @@ class MockConnector:
 
     def close(self):
         pass
+
+
+class RawDataMockConnector(MockConnector):
+    supports_raw_data = True
 
 
 def _make_model_config(
@@ -77,25 +89,7 @@ def _make_request(req_id: str, external_req_id: str | None = None):
 
 
 class MixinHost(OmniConnectorModelRunnerMixin):
-    """Minimal class that mixes in the mixin for testing.
-
-    Exposes a back-compat ``_omni_connector`` property: the mixin now holds
-    separate ``_recv_connector`` / ``_send_connector`` (one duplex instance
-    for same-type stages, two for hybrid). Tests that inject a single mock via
-    ``host._omni_connector = mock`` still work — the setter points both
-    directions at it, and the getter returns the send connector (falling back
-    to recv), matching the old single-connector semantics.
-    """
-
-    @property
-    def _omni_connector(self):
-        send = getattr(self, "_send_connector", None)
-        return send if send is not None else getattr(self, "_recv_connector", None)
-
-    @_omni_connector.setter
-    def _omni_connector(self, connector):
-        self._recv_connector = connector
-        self._send_connector = connector
+    """Minimal class that mixes in the mixin for testing."""
 
 
 class _FakeTPGroup:
@@ -128,7 +122,7 @@ class TestMixinAsyncChunkSendRecv:
             vllm_config=None,
             model_config=_make_model_config(stage_id=0, async_chunk=True),
         )
-        sender._omni_connector = connector
+        sender._send_connector = connector
         sender._stage_id = 0
         sender._async_chunk = True
 
@@ -165,7 +159,7 @@ class TestMixinAsyncChunkSendRecv:
             vllm_config=None,
             model_config=_make_model_config(stage_id=0, async_chunk=True),
         )
-        sender._omni_connector = connector
+        sender._send_connector = connector
         sender._stage_id = 0
         sender._async_chunk = True
 
@@ -325,7 +319,8 @@ class TestMixinNoConnector:
             vllm_config=None,
             model_config=_make_model_config(),
         )
-        assert host._omni_connector is None
+        assert host._recv_connector is None
+        assert host._send_connector is None
 
         results = host.recv_full_payload_inputs(scheduler_output=None)
         assert results is None
@@ -404,7 +399,7 @@ class TestFullPayloadSendWithCustomFunc:
             vllm_config=None,
             model_config=_make_model_config(),
         )
-        host._omni_connector = MockConnector(stage_id=0)
+        host._send_connector = MockConnector(stage_id=0)
         host._stage_id = 0
         host._custom_process_func = full_payload_func
 
@@ -416,7 +411,7 @@ class TestFullPayloadSendWithCustomFunc:
         )
         assert sent == ["req-1"]
         assert seen == {
-            "connector": host._omni_connector,
+            "connector": host._send_connector,
             "is_finished": True,
             "data": {"raw": 100},
             "rid": "req-1",
@@ -436,7 +431,7 @@ class TestFullPayloadSendWithCustomFunc:
             vllm_config=None,
             model_config=_make_model_config(),
         )
-        host._omni_connector = MockConnector(stage_id=0)
+        host._send_connector = MockConnector(stage_id=0)
         host._stage_id = 0
         host._custom_process_func = full_payload_func
 
@@ -451,6 +446,210 @@ class TestFullPayloadSendWithCustomFunc:
 
         time.sleep(0.1)
         host.shutdown_omni_connectors()
+
+
+def _make_qwen3_async_chunk_model_config(stage_id: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        stage_connector_config=None,
+        async_chunk=True,
+        worker_type="ar",
+        model_arch="Qwen3OmniMoeForConditionalGeneration",
+        model_stage="thinker" if stage_id == 0 else "talker",
+        custom_process_next_stage_input_func=None,
+    )
+
+
+def _make_qwen3_full_payload_model_config(stage_id: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        stage_connector_config=None,
+        async_chunk=False,
+        worker_type="ar",
+        model_arch="Qwen3OmniMoeForConditionalGeneration",
+        model_stage="thinker" if stage_id == 0 else "talker",
+        custom_process_next_stage_input_func=None,
+    )
+
+
+def _drain_pending_connector_sends(host: MixinHost) -> None:
+    for _ in range(64):
+        task = None
+        with host._lock:
+            for req_id in list(host._pending_save_reqs.keys()):
+                dq = host._pending_save_reqs.get(req_id)
+                if dq:
+                    task = dq.popleft()
+                    if not dq:
+                        del host._pending_save_reqs[req_id]
+                    break
+        if task is None:
+            return
+        host._send_single_request(task)
+
+
+class TestQwen3PacketAsyncChunk:
+    """Thinker→talker async_chunk packet path over a raw-data-capable connector."""
+
+    def test_packet_send_recv_roundtrip(self):
+        payload = {
+            "embed": {"prefill": torch.ones(2, 3), "tts_bos": torch.zeros(1, 3)},
+            "hidden_states": {"output": torch.full((2, 3), 2.0)},
+            "ids": {"all": [1, 2, 3], "prompt": [1, 2]},
+            "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+            "next_stage_prompt_len": 5,
+        }
+        connector = RawDataMockConnector(stage_id=0)
+
+        sender = MixinHost()
+        sender.model_config = _make_qwen3_async_chunk_model_config(0)
+        sender.init_omni_connectors(
+            vllm_config=None,
+            model_config=sender.model_config,
+        )
+        sender._send_connector = connector
+        sender._stage_id = 0
+        sender._next_stage_id = 1
+        sender._custom_process_func = lambda **kwargs: payload
+
+        req = _make_request("req-1")
+        assert sender.send_chunk(req, pooling_output={})
+        _drain_pending_connector_sends(sender)
+        assert len(connector._store) > 1
+        assert any("@packed" in key for key in connector._store)
+
+        receiver = MixinHost()
+        receiver.model_config = _make_qwen3_async_chunk_model_config(1)
+        receiver.init_omni_connectors(
+            vllm_config=None,
+            model_config=receiver.model_config,
+        )
+        receiver._recv_connector = connector
+        receiver._stage_id = 1
+        receiver._request_ids_mapping["req-1"] = "req-1"
+        receiver._pending_load_reqs["req-1"] = _make_request("req-1")
+
+        assert receiver._poll_single_request("req-1")
+        cached = receiver.get_local_stage_payload("req-1")
+        assert cached is not None
+        assert cached["ids"] == payload["ids"]
+        assert cached["next_stage_prompt_len"] == payload["next_stage_prompt_len"]
+        assert torch.equal(cached["embed"]["prefill"], payload["embed"]["prefill"])
+        assert torch.equal(cached["hidden_states"]["output"], payload["hidden_states"]["output"])
+
+        sender.shutdown_omni_connectors()
+        receiver.shutdown_omni_connectors()
+
+
+class TestQwen3PacketFullPayload:
+    """Thinker→talker non-async full-payload packet path over raw-data connector."""
+
+    def test_packet_send_recv_roundtrip(self):
+        payload = {
+            "embed": {"prefill": torch.ones(2, 3), "tts_bos": torch.zeros(1, 3)},
+            "hidden_states": {"output": torch.full((2, 3), 2.0)},
+            "ids": {"all": [1, 2, 3], "prompt": [1, 2]},
+            "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+            "next_stage_prompt_len": 5,
+        }
+        connector = RawDataMockConnector(stage_id=0)
+
+        sender = MixinHost()
+        sender.model_config = _make_qwen3_full_payload_model_config(0)
+        sender.init_omni_connectors(
+            vllm_config=None,
+            model_config=sender.model_config,
+        )
+        sender._send_connector = connector
+        sender._stage_id = 0
+        sender._next_stage_id = 1
+        sender._custom_process_func = lambda **kwargs: payload
+
+        req = _make_request("req-1")
+        req.is_finished = lambda: True
+        sent = sender.send_full_payload_outputs(
+            scheduler_output=None,
+            outputs={"req-1": ({}, req)},
+        )
+        assert sent == ["req-1"]
+        _drain_pending_connector_sends(sender)
+        assert len(connector._store) > 1
+        assert any("@packed" in key for key in connector._store)
+
+        receiver = MixinHost()
+        receiver.model_config = _make_qwen3_full_payload_model_config(1)
+        receiver.init_omni_connectors(
+            vllm_config=None,
+            model_config=receiver.model_config,
+        )
+        receiver._recv_connector = connector
+        receiver._stage_id = 1
+        receiver._request_ids_mapping["req-1"] = "req-1"
+        receiver._pending_load_reqs["req-1"] = _make_request("req-1")
+
+        assert receiver._poll_single_request("req-1")
+        results = receiver.recv_full_payload_inputs(scheduler_output=None)
+        assert results is not None
+        assert "req-1" in results
+        assert results["req-1"]["ids"] == payload["ids"]
+        assert results["req-1"]["next_stage_prompt_len"] == payload["next_stage_prompt_len"]
+        assert torch.equal(results["req-1"]["embed"]["prefill"], payload["embed"]["prefill"])
+
+        connector_output = receiver.get_omni_connector_output()
+        assert "req-1" in connector_output.stage_recv_req_ids
+
+        sender.shutdown_omni_connectors()
+        receiver.shutdown_omni_connectors()
+
+
+class TestQwen3TalkerPacketFullPayload:
+    """Talker→code2wav non-async full-payload packet path over raw-data connector."""
+
+    def test_packet_send_recv_roundtrip(self):
+        payload = {
+            "codes": {"audio": [1, 2, 3, 4]},
+            "meta": {"finished": torch.tensor(True, dtype=torch.bool), "left_context_size": 25},
+        }
+        connector = RawDataMockConnector(stage_id=1)
+
+        sender = MixinHost()
+        sender.model_config = _make_qwen3_full_payload_model_config(1)
+        sender.init_omni_connectors(
+            vllm_config=None,
+            model_config=sender.model_config,
+        )
+        sender._send_connector = connector
+        sender._stage_id = 1
+        sender._next_stage_id = 2
+        sender._custom_process_func = lambda **kwargs: payload
+
+        req = _make_request("req-1")
+        req.is_finished = lambda: True
+        sent = sender.send_full_payload_outputs(
+            scheduler_output=None,
+            outputs={"req-1": ({}, req)},
+        )
+        assert sent == ["req-1"]
+        _drain_pending_connector_sends(sender)
+        assert any("@packed" in key for key in connector._store)
+
+        receiver = MixinHost()
+        receiver.model_config = _make_qwen3_full_payload_model_config(2)
+        receiver.init_omni_connectors(
+            vllm_config=None,
+            model_config=receiver.model_config,
+        )
+        receiver._recv_connector = connector
+        receiver._stage_id = 2
+        receiver._request_ids_mapping["req-1"] = "req-1"
+        receiver._pending_load_reqs["req-1"] = _make_request("req-1")
+
+        assert receiver._poll_single_request("req-1")
+        results = receiver.recv_full_payload_inputs(scheduler_output=None)
+        assert results is not None
+        assert results["req-1"]["code_predictor_codes"] == [1, 2, 3, 4]
+        assert torch.is_tensor(results["req-1"]["codes"]["audio"])
+
+        sender.shutdown_omni_connectors()
+        receiver.shutdown_omni_connectors()
 
 
 class TestKVSentReqIdsAccumulation:
@@ -500,7 +699,7 @@ class TestChunkStreamCompletedGuard:
             vllm_config=None,
             model_config=_make_model_config(stage_id=stage_id, async_chunk=True),
         )
-        host._omni_connector = MockConnector(stage_id=stage_id)
+        host._recv_connector = MockConnector(stage_id=stage_id)
         host._stage_id = stage_id
         host._async_chunk = True
         return host
@@ -591,7 +790,7 @@ class TestCleanupFinishedRequest:
             vllm_config=None,
             model_config=_make_model_config(stage_id=stage_id, async_chunk=True),
         )
-        host._omni_connector = MockConnector(stage_id=stage_id)
+        host._recv_connector = MockConnector(stage_id=stage_id)
         host._stage_id = stage_id
         host._async_chunk = True
         return host
@@ -775,7 +974,7 @@ class TestSendChunkCachesMapping:
             vllm_config=None,
             model_config=_make_model_config(stage_id=0, async_chunk=True),
         )
-        host._omni_connector = MockConnector(stage_id=0)
+        host._send_connector = MockConnector(stage_id=0)
         host._stage_id = 0
         host._async_chunk = True
 
@@ -803,7 +1002,7 @@ class TestLocalPayloadCacheLifecycle:
             vllm_config=None,
             model_config=_make_model_config(stage_id=0),
         )
-        host._omni_connector = MockConnector(stage_id=0)
+        host._recv_connector = MockConnector(stage_id=0)
         host._stage_id = 0
         return host
 
@@ -820,7 +1019,7 @@ class TestLocalPayloadCacheLifecycle:
 
     def test_recv_full_payload_inputs_populates_local_cache(self):
         host = self._make_host()
-        host._omni_connector = MockConnector(stage_id=0)
+        host._recv_connector = MockConnector(stage_id=0)
         host._stage_id = 0
 
         # Simulate a full payload already staged by the bg recv path
@@ -834,21 +1033,21 @@ class TestLocalPayloadCacheLifecycle:
 
     def test_rank0_only_polls_connector_for_tp_full_payload(self):
         host = self._make_host()
-        host._omni_connector = MagicMock()
+        host._recv_connector = MagicMock()
         host._stage_id = 2
         host._local_rank = 0
         host._request_ids_mapping["r1"] = "ext-r1"
         host._get_req_chunk["r1"] = 0
         payload = {"tok": [10], "finished": torch.tensor(True)}
         connector_result = (payload, 123)
-        host._omni_connector.get.return_value = connector_result
+        host._recv_connector.get.return_value = connector_result
         tp_group = _FakeTPGroup(world_size=2, rank_in_group=0)
 
         with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
             made_progress = host._poll_single_request("r1")
 
         assert made_progress
-        host._omni_connector.get.assert_called_once_with("1", "2", "ext-r1_1_0")
+        host._recv_connector.get.assert_called_once_with("1", "2", "ext-r1_1_0")
         assert tp_group.broadcast_inputs == []
         assert host.get_local_stage_payload("r1") == payload
         assert "r1" in host._full_payload_pending_broadcast_req_ids
@@ -858,7 +1057,7 @@ class TestLocalPayloadCacheLifecycle:
 
     def test_tp_follower_skips_connector_poll_for_full_payload(self):
         host = self._make_host()
-        host._omni_connector = MagicMock()
+        host._recv_connector = MagicMock()
         host._stage_id = 2
         host._local_rank = 1
         host._request_ids_mapping["r1"] = "ext-r1"
@@ -869,14 +1068,14 @@ class TestLocalPayloadCacheLifecycle:
             made_progress = host._poll_single_request("r1")
 
         assert not made_progress
-        host._omni_connector.get.assert_not_called()
+        host._recv_connector.get.assert_not_called()
         assert tp_group.broadcast_inputs == []
         assert "r1" not in host._local_stage_payload_cache
         host.shutdown_omni_connectors()
 
     def test_recv_full_payload_inputs_broadcasts_tp_leader_results_to_followers(self):
         host = self._make_host()
-        host._omni_connector = MagicMock()
+        host._recv_connector = MagicMock()
         host._stage_id = 2
         host._local_rank = 1
         host._pending_load_reqs["r1"] = object()
@@ -902,7 +1101,7 @@ class TestTPAsyncChunkFanout:
             vllm_config=None,
             model_config=_make_model_config(stage_id=2, async_chunk=True, worker_type="gen"),
         )
-        host._omni_connector = MagicMock()
+        host._recv_connector = MagicMock()
         host._stage_id = 2
         host._async_chunk = True
         host._model_mode = "gen"
@@ -917,14 +1116,14 @@ class TestTPAsyncChunkFanout:
             "codes": {"audio": [10, 11]},
             "meta": {"left_context_size": 0, "finished": torch.tensor(False)},
         }
-        host._omni_connector.get.return_value = (payload, 123)
+        host._recv_connector.get.return_value = (payload, 123)
         tp_group = _FakeTPGroup(world_size=2, rank_in_group=0)
 
         with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
             made_progress = host._poll_single_request("r1")
 
         assert made_progress
-        host._omni_connector.get.assert_called_once_with("1", "2", "ext-r1_1_0")
+        host._recv_connector.get.assert_called_once_with("1", "2", "ext-r1_1_0")
         assert host.get_local_stage_payload("r1") == payload
         assert "r1" in host._finished_load_reqs
         assert "r1" in host._async_chunk_updated_req_ids
@@ -939,7 +1138,7 @@ class TestTPAsyncChunkFanout:
             made_progress = host._poll_single_request("r1")
 
         assert not made_progress
-        host._omni_connector.get.assert_not_called()
+        host._recv_connector.get.assert_not_called()
         assert host.get_local_stage_payload("r1") is None
         assert tp_group.broadcast_inputs == []
         host.shutdown_omni_connectors()
@@ -1096,14 +1295,14 @@ class TestAsyncPayloadLifecycle:
             vllm_config=None,
             model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
         )
-        host._omni_connector = MagicMock()
+        host._recv_connector = MagicMock()
         host._stage_id = 1
         host._async_chunk = True
         host._model_mode = "ar"
         host._request_ids_mapping["r1"] = "ext-r1"
         host._get_req_chunk["r1"] = 0
 
-        host._omni_connector.get.side_effect = [
+        host._recv_connector.get.side_effect = [
             (
                 {
                     "embed": {"decode": torch.ones(1, 2)},
@@ -1136,7 +1335,7 @@ class TestAsyncPayloadLifecycle:
             vllm_config=None,
             model_config=_make_model_config(stage_id=2, async_chunk=True, worker_type="gen"),
         )
-        host._omni_connector = MagicMock()
+        host._recv_connector = MagicMock()
         host._stage_id = 2
         host._async_chunk = True
         host._model_mode = "gen"
@@ -1151,7 +1350,7 @@ class TestAsyncPayloadLifecycle:
         made_progress = host._poll_single_request("r1")
 
         assert not made_progress
-        host._omni_connector.get.assert_not_called()
+        host._recv_connector.get.assert_not_called()
         assert host._get_req_chunk["r1"] == 1
 
         host.shutdown_omni_connectors()
@@ -1162,7 +1361,7 @@ class TestAsyncPayloadLifecycle:
             vllm_config=None,
             model_config=_make_model_config(stage_id=2, async_chunk=True, worker_type="gen"),
         )
-        host._omni_connector = MagicMock()
+        host._recv_connector = MagicMock()
         host._stage_id = 2
         host._async_chunk = True
         host._model_mode = "gen"
@@ -1177,14 +1376,14 @@ class TestAsyncPayloadLifecycle:
         made_progress = host._poll_single_request("r1")
 
         assert not made_progress
-        host._omni_connector.get.assert_not_called()
+        host._recv_connector.get.assert_not_called()
         assert host._get_req_chunk["r1"] == 1
 
         output = host.get_omni_connector_output()
         assert output.request_metadata["r1"]["code_predictor_codes"] == [10, 11, 12]
         assert output.chunk_ready_req_ids == {"r1"}
 
-        host._omni_connector.get.return_value = (
+        host._recv_connector.get.return_value = (
             {
                 "codes": {"audio": [20, 21, 22]},
                 "meta": {"left_context_size": 0, "finished": torch.tensor(False)},
@@ -1194,7 +1393,7 @@ class TestAsyncPayloadLifecycle:
         made_progress = host._poll_single_request("r1")
 
         assert made_progress
-        host._omni_connector.get.assert_called_once()
+        host._recv_connector.get.assert_called_once()
         assert host._get_req_chunk["r1"] == 2
 
         host.shutdown_omni_connectors()
@@ -1471,7 +1670,7 @@ class TestSendRetry:
             vllm_config=None,
             model_config=_make_model_config(stage_id=0, async_chunk=True),
         )
-        sender._omni_connector = connector
+        sender._send_connector = connector
         sender._stage_id = 0
         sender._async_chunk = True
         return sender

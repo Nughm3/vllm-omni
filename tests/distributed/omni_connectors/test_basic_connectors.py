@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
+
 import pytest
 from pytest_mock import MockerFixture
 
@@ -195,3 +197,51 @@ def test_mooncake_connector_defaults_missing_host_to_detected_ip(monkeypatch: py
         assert connector.get_connection_info()["host"] == "10.20.30.40"
     finally:
         connector.close()
+
+
+def test_mooncake_cuda_copy_uses_transfer_stream_events(mocker: MockerFixture):
+    import vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector as mooncake_module
+
+    connector = object.__new__(mooncake_module.MooncakeTransferEngineConnector)
+    connector._cuda_copy_streams = {}
+    connector._cuda_copy_streams_lock = threading.Lock()
+
+    producer_stream = mocker.MagicMock()
+    transfer_stream = mocker.MagicMock()
+    ready_event = mocker.MagicMock()
+    complete_event = mocker.MagicMock()
+    src = mocker.MagicMock(is_cuda=True, device="cuda:0")
+    dst = mocker.MagicMock(is_cuda=False, device="cpu")
+
+    mocker.patch.object(mooncake_module.torch.cuda, "Stream", return_value=transfer_stream)
+    mocker.patch.object(mooncake_module.torch.cuda, "current_stream", return_value=producer_stream)
+    mocker.patch.object(mooncake_module.torch.cuda, "Event", side_effect=[ready_event, complete_event])
+    mocker.patch.object(mooncake_module.torch.cuda, "device", return_value=mocker.MagicMock())
+    mocker.patch.object(mooncake_module.torch.cuda, "stream", return_value=mocker.MagicMock())
+
+    connector._copy_tensor_via_cuda_stream(dst, src)
+
+    ready_event.record.assert_called_once_with(producer_stream)
+    transfer_stream.wait_event.assert_called_once_with(ready_event)
+    dst.copy_.assert_called_once_with(src, non_blocking=True)
+    src.record_stream.assert_called_once_with(transfer_stream)
+    complete_event.record.assert_called_once_with(transfer_stream)
+    complete_event.synchronize.assert_called_once_with()
+    producer_stream.synchronize.assert_not_called()
+    transfer_stream.synchronize.assert_not_called()
+
+
+def test_mooncake_cpu_copy_does_not_create_cuda_events(mocker: MockerFixture):
+    import vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector as mooncake_module
+
+    connector = object.__new__(mooncake_module.MooncakeTransferEngineConnector)
+    connector._cuda_copy_streams = {}
+    connector._cuda_copy_streams_lock = threading.Lock()
+    src = mocker.MagicMock(is_cuda=False, device="cpu")
+    dst = mocker.MagicMock(is_cuda=False, device="cpu")
+    event = mocker.patch.object(mooncake_module.torch.cuda, "Event")
+
+    connector._copy_tensor_via_cuda_stream(dst, src)
+
+    dst.copy_.assert_called_once_with(src)
+    event.assert_not_called()

@@ -1,8 +1,10 @@
-# Qwen3-Omni-MoE single-node Mooncake Transfer Engine deploy.
+# Qwen3-Omni-MoE hybrid single-node deploy: Mooncake for thinker→talker (0→1),
+# SharedMemory for colocated talker→code2wav (1→2).
 #
 # Same packing as the SHM baseline: stage 0 on cuda:0, stages 1+2 on cuda:1.
-# Uses the duplex can_put/can_get connector path (async_chunk: false).
-# For cross-node, see qwen3_omni_moe_mooncake.yaml.
+# Connector layout matches ``qwen3_omni_moe_mooncake.yaml`` (hybrid) so
+# singlenode A/Bs isolate MTE on the 0→1 edge without a second TE on 1→2.
+# Uses the duplex / composite connector path (async_chunk: false).
 #
 # Usage (one node, 2 GPUs):
 #   vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --log-stats \
@@ -26,16 +28,12 @@ connectors:
       memory_pool_size: 4294967296
       memory_pool_device: "cpu"
 
-  talker2code2wav_mooncake:
-    name: MooncakeTransferEngineConnector
+  talker2code2wav_shm:
+    name: SharedMemoryConnector
     extra:
-      host: "auto"
-      sender_host: "auto"
-      zmq_port: 50051
-      protocol: "rdma"
-      device_name: "mlx5_0"
-      memory_pool_size: 4294967296
-      memory_pool_device: "cpu"
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
 
 stages:
   - stage_id: 0
@@ -61,7 +59,7 @@ stages:
     input_connectors:
       from_stage_0: thinker2talker_mooncake
     output_connectors:
-      to_stage_2: talker2code2wav_mooncake
+      to_stage_2: talker2code2wav_shm
     default_sampling_params:
       temperature: 0.9
       top_k: 50
@@ -80,7 +78,7 @@ stages:
     async_scheduling: false
     devices: "1"
     input_connectors:
-      from_stage_1: talker2code2wav_mooncake
+      from_stage_1: talker2code2wav_shm
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

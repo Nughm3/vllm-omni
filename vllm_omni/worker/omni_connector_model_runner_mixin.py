@@ -729,6 +729,137 @@ class OmniConnectorModelRunnerMixin:
             return model_config
         return getattr(getattr(self, "vllm_config", None), "model_config", None)
 
+    @staticmethod
+    def _coerce_connector_payload_dict(payload_data: Any) -> dict[str, Any] | None:
+        if isinstance(payload_data, dict):
+            return payload_data
+        to_dict_fn = getattr(payload_data, "to_dict", None)
+        if callable(to_dict_fn):
+            coerced = to_dict_fn()
+            return coerced if isinstance(coerced, dict) else None
+        try:
+            from vllm_omni.data_entry_keys import to_dict
+
+            coerced = to_dict(payload_data)
+            return coerced if isinstance(coerced, dict) else None
+        except Exception:
+            return None
+
+    def _connector_supports_raw_for_edge(self, *, for_recv: bool) -> bool:
+        """Whether this stage's connector can move raw tensors on this edge."""
+        connector = self._omni_connector
+        if connector is None:
+            return False
+        if for_recv:
+            return bool(connector.supports_raw_get())
+        return bool(connector.supports_raw_put())
+
+    def _should_use_qwen3_packet_path(
+        self,
+        *,
+        for_recv: bool = False,
+        transfer_mode: str | None = None,
+    ) -> bool:
+        from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
+            MODE_ASYNC_CHUNK,
+            MODE_NON_ASYNC_FULL_PAYLOAD,
+            should_use_qwen3_packet_path,
+        )
+
+        if self._omni_connector is None:
+            return False
+        model_config = self._get_model_config()
+        if for_recv:
+            from_stage_id = self._stage_id - 1
+            to_stage_id = self._stage_id
+        else:
+            from_stage_id = self._stage_id
+            to_stage_id = self._next_stage_id
+        if transfer_mode is None:
+            transfer_mode = MODE_ASYNC_CHUNK if self._async_chunk else MODE_NON_ASYNC_FULL_PAYLOAD
+        return should_use_qwen3_packet_path(
+            async_chunk=self._async_chunk,
+            supports_raw_data=self._connector_supports_raw_for_edge(for_recv=for_recv),
+            model_arch=getattr(model_config, "model_arch", None) if model_config is not None else None,
+            from_stage_id=from_stage_id,
+            to_stage_id=to_stage_id,
+            transfer_mode=transfer_mode,
+        )
+
+    def _enqueue_full_payload_packet_send(
+        self,
+        *,
+        req_id: str,
+        external_req_id: str,
+        connector_put_key: str,
+        payload: dict[str, Any],
+        next_stage_id: int,
+        chunk_id: int,
+        packet_mode: str | None = None,
+    ) -> None:
+        from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
+            MODE_ASYNC_CHUNK,
+            pack_qwen3_full_payload,
+        )
+
+        mode = packet_mode or MODE_ASYNC_CHUNK
+        packed, sidecar = pack_qwen3_full_payload(
+            payload,
+            request_id=req_id,
+            external_req_id=external_req_id,
+            from_stage_id=self._stage_id,
+            to_stage_id=next_stage_id,
+            chunk_id=chunk_id,
+            mode=mode,
+        )
+        # Packed buffer first, then sidecar. Once the receiver sees the sidecar,
+        # the packed buffer must already be available to pull.
+        tasks: list[dict[str, Any]] = []
+        if packed is not None:
+            tasks.append(
+                {
+                    "stage_id": self._stage_id,
+                    "next_stage_id": next_stage_id,
+                    "put_key": sidecar["packed_key"],
+                    "data": packed,
+                    "request_id": req_id,
+                }
+            )
+        tasks.append(
+            {
+                "stage_id": self._stage_id,
+                "next_stage_id": next_stage_id,
+                "put_key": connector_put_key,
+                "data": sidecar,
+                "request_id": req_id,
+            }
+        )
+        with self._lock:
+            dq = self._pending_save_reqs.setdefault(req_id, deque())
+            for task in tasks:
+                dq.append(task)
+                self._pending_save_counts[req_id] += 1
+
+    def _reconstruct_qwen3_packet_payload(
+        self,
+        connector: OmniConnectorBase,
+        sidecar: dict[str, Any],
+        from_stage: str,
+        to_stage: str,
+    ) -> dict[str, Any]:
+        from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
+            reconstruct_qwen3_full_payload,
+        )
+
+        def get_packed(packed_key: str) -> Any:
+            result = connector.get(from_stage, to_stage, packed_key)
+            if result is None:
+                return None
+            data, _size = result
+            return data
+
+        return reconstruct_qwen3_full_payload(sidecar, get_packed)
+
     def _should_accumulate_full_payload_output(self) -> bool:
         """Gate send-side full-payload output accumulation only.
 
@@ -1009,16 +1140,45 @@ class OmniConnectorModelRunnerMixin:
                 connector_put_key,
                 next_stage_id,
             )
-            task = {
-                "stage_id": self._stage_id,
-                "next_stage_id": next_stage_id,
-                "put_key": connector_put_key,
-                "data": payload,
-                "request_id": req_id,
-            }
-            with self._lock:
-                self._pending_save_reqs.setdefault(req_id, deque()).append(task)
-                self._pending_save_counts[req_id] += 1
+            payload_dict = self._coerce_connector_payload_dict(payload)
+            from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
+                payload_has_packet_tensors,
+            )
+
+            use_packet = (
+                payload_dict is not None
+                and payload_has_packet_tensors(payload_dict)
+                and self._should_use_qwen3_packet_path(
+                    transfer_mode="non_async_full_payload",
+                )
+            )
+            if use_packet:
+                self._enqueue_full_payload_packet_send(
+                    req_id=req_id,
+                    external_req_id=external_req_id,
+                    connector_put_key=connector_put_key,
+                    payload=payload_dict,
+                    next_stage_id=next_stage_id,
+                    chunk_id=chunk_id,
+                    packet_mode="non_async_full_payload",
+                )
+                logger.debug(
+                    "[Stage-%s] send_full_payload_outputs: packet_put req=%s key=%s mode=non_async_full_payload",
+                    self._stage_id,
+                    req_id,
+                    connector_put_key,
+                )
+            else:
+                task = {
+                    "stage_id": self._stage_id,
+                    "next_stage_id": next_stage_id,
+                    "put_key": connector_put_key,
+                    "data": payload,
+                    "request_id": req_id,
+                }
+                with self._lock:
+                    self._pending_save_reqs.setdefault(req_id, deque()).append(task)
+                    self._pending_save_counts[req_id] += 1
             sent_ids.append(req_id)
         if sent_ids:
             self._work_available.set()
@@ -1153,24 +1313,47 @@ class OmniConnectorModelRunnerMixin:
         next_stage_id = self._next_stage_id
         connector_put_key = f"{request_id}_{self._stage_id}_{chunk_id}"
 
-        if chunk_id == 0:
+        from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
+            payload_has_packet_tensors,
+        )
+
+        payload_dict = self._coerce_connector_payload_dict(payload_data)
+        use_packet = (
+            payload_dict is not None
+            and self._should_use_qwen3_packet_path()
+            and payload_has_packet_tensors(payload_dict)
+        )
+        if chunk_id == 0 or use_packet:
             logger.debug(
-                "[Stage-%s] send_chunk: first chunk enqueued, req=%s key=%s",
+                "[Stage-%s] send_chunk: enqueue req=%s key=%s chunk=%s packet=%s",
                 self._stage_id,
                 request_id,
                 connector_put_key,
+                chunk_id,
+                use_packet,
             )
 
-        task = {
-            "stage_id": self._stage_id,
-            "next_stage_id": next_stage_id,
-            "put_key": connector_put_key,
-            "data": payload_data,
-            "request_id": request_id,
-        }
-        with self._lock:
-            self._pending_save_reqs.setdefault(request_id, deque()).append(task)
-            self._pending_save_counts[request_id] += 1
+        if use_packet:
+            assert payload_dict is not None
+            self._enqueue_full_payload_packet_send(
+                req_id=request_id,
+                external_req_id=request_id,
+                connector_put_key=connector_put_key,
+                payload=payload_dict,
+                next_stage_id=next_stage_id,
+                chunk_id=chunk_id,
+            )
+        else:
+            task = {
+                "stage_id": self._stage_id,
+                "next_stage_id": next_stage_id,
+                "put_key": connector_put_key,
+                "data": payload_data,
+                "request_id": request_id,
+            }
+            with self._lock:
+                self._pending_save_reqs.setdefault(request_id, deque()).append(task)
+                self._pending_save_counts[request_id] += 1
         self._work_available.set()
         return True
 
@@ -1785,6 +1968,28 @@ class OmniConnectorModelRunnerMixin:
         payload_data, _size = result
         if not payload_data:
             return False
+
+        if isinstance(payload_data, dict) and self._should_use_qwen3_packet_path(for_recv=True):
+            from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import is_packet_sidecar
+
+            if is_packet_sidecar(payload_data):
+                try:
+                    payload_data = self._reconstruct_qwen3_packet_payload(
+                        connector,
+                        payload_data,
+                        str(target_stage_id),
+                        str(self._stage_id),
+                    )
+                except Exception:
+                    logger.warning(
+                        "[Stage-%s] failed to reconstruct Qwen3 packet payload for req=%s key=%s",
+                        self._stage_id,
+                        req_id,
+                        connector_get_key,
+                        exc_info=True,
+                    )
+                    return False
+
         if isinstance(payload_data, dict):
             logger.debug(
                 "[Stage-%s] recv_chunk_result: req=%s ext=%s key=%s keys=%s finished=%s",

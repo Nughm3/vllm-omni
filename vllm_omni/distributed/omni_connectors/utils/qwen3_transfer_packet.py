@@ -276,7 +276,7 @@ def _parse_dtype(dtype_str: str) -> torch.dtype:
     return getattr(torch, dtype_str)
 
 
-def _packed_u8_from_connector_result(data: Any, *, to_cpu: bool = True) -> torch.Tensor:
+def _packed_u8_from_connector_result(data: Any, *, to_cpu: bool = False) -> torch.Tensor:
     """Return a standalone 1D uint8 tensor from a connector ``get()`` result.
 
     The tensor is kept on the device the connector delivered it on (e.g. the
@@ -341,7 +341,7 @@ def reconstruct_qwen3_full_payload(
     sidecar: dict[str, Any],
     get_packed: Callable[[str], Any],
     *,
-    to_cpu: bool = True,
+    to_cpu: bool = False,
 ) -> dict[str, Any]:
     """Rebuild the semantic payload dict from a sidecar and one packed fetch.
 
@@ -404,6 +404,6 @@ def reconstruct_thinker_to_talker_full_payload(
     sidecar: dict[str, Any],
     get_packed: Callable[[str], Any],
     *,
-    to_cpu: bool = True,
+    to_cpu: bool = False,
 ) -> dict[str, Any]:
     return reconstruct_qwen3_full_payload(sidecar, get_packed, to_cpu=to_cpu)

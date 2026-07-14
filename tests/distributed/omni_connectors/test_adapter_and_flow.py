@@ -384,6 +384,15 @@ def test_composite_omni_connector_delegates_put_get(mocker: MockerFixture):
     put_conn.put.assert_called_once_with("1", "2", "req", {"data": 1})
     get_conn.put.assert_not_called()
 
+    # Directional raw-data: with both children non-raw, neither edge is raw-capable.
+    assert composite.supports_raw_get() is False
+    assert composite.supports_raw_put() is False
+
+    get_conn.supports_raw_data = True
+    put_conn.supports_raw_data = False
+    assert composite.supports_raw_get() is True
+    assert composite.supports_raw_put() is False
+
     composite.cleanup("req")
     get_conn.cleanup.assert_called_once_with("req")
     put_conn.cleanup.assert_called_once_with("req")

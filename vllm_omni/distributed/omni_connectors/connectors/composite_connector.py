@@ -18,11 +18,15 @@ logger = get_connector_logger(__name__)
 
 
 class CompositeOmniConnector(OmniConnectorBase):
-    """Delegates ``get`` / ``put`` to distinct underlying connectors."""
+    """Delegates ``get`` / ``put`` to distinct underlying connectors.
+
+    Raw-data capability is directional: use ``supports_raw_put`` /
+    ``supports_raw_get`` rather than a single ``supports_raw_data`` flag,
+    because the two legs may disagree (e.g. Mooncake inbound + SHM outbound).
+    """
 
     def __init__(self, config: dict[str, Any]):
         from ..factory import OmniConnectorFactory
-        from ..utils.config import ConnectorSpec
 
         self.config = config
         self._get_connector: OmniConnectorBase | None = None
@@ -47,16 +51,6 @@ class CompositeOmniConnector(OmniConnectorBase):
                 "get_connector / put_connector"
             )
 
-        # Prefer put-side for send-path raw-data decisions; fall back to get.
-        put_raw = bool(getattr(self._put_connector, "supports_raw_data", False))
-        get_raw = bool(getattr(self._get_connector, "supports_raw_data", False))
-        if self._put_connector is not None and self._get_connector is not None:
-            self.supports_raw_data = put_raw and get_raw
-        elif self._put_connector is not None:
-            self.supports_raw_data = put_raw
-        else:
-            self.supports_raw_data = get_raw
-
         logger.info(
             "CompositeOmniConnector: get=%s put=%s",
             type(self._get_connector).__name__ if self._get_connector else None,
@@ -74,6 +68,16 @@ class CompositeOmniConnector(OmniConnectorBase):
         if stage_id is not None:
             extra.setdefault("stage_id", stage_id)
         return ConnectorSpec(name=name.strip(), extra=extra)
+
+    def supports_raw_put(self) -> bool:
+        if self._put_connector is None:
+            return False
+        return bool(getattr(self._put_connector, "supports_raw_data", False))
+
+    def supports_raw_get(self) -> bool:
+        if self._get_connector is None:
+            return False
+        return bool(getattr(self._get_connector, "supports_raw_data", False))
 
     def put(
         self, from_stage: str, to_stage: str, put_key: str, data: Any

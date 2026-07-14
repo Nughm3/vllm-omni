@@ -37,9 +37,17 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 class MockConnector:
     """In-memory connector for testing (mimics OmniConnectorBase)."""
 
+    supports_raw_data: bool = False
+
     def __init__(self, stage_id: int = 0):
         self.stage_id = stage_id
         self._store: dict[str, Any] = {}
+
+    def supports_raw_put(self) -> bool:
+        return bool(self.supports_raw_data)
+
+    def supports_raw_get(self) -> bool:
+        return bool(self.supports_raw_data)
 
     def put(self, from_stage, to_stage, put_key, data):
         key = f"{from_stage}_{to_stage}_{put_key}"
@@ -55,6 +63,10 @@ class MockConnector:
 
     def close(self):
         pass
+
+
+class RawDataMockConnector(MockConnector):
+    supports_raw_data = True
 
 
 def _make_model_config(

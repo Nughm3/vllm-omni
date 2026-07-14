@@ -240,7 +240,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             f"MooncakeTransferEngineConnector config summary:\n"
             f"  Local: host={self.host}, zmq_port={self.zmq_port}, rpc_port={self.rpc_port}\n"
             f"  Remote: sender_host={self.sender_host}, sender_zmq_port={self.sender_zmq_port}\n"
-            f"  Role: can_put={self.can_put}, can_get={self.can_get}"
+            f"  Role: can_put={self.can_put}"
         )
 
         # Only sender needs ZMQ listener to handle pull requests

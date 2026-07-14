@@ -797,48 +797,73 @@ class OmniConnectorModelRunnerMixin:
         chunk_id: int,
         packet_mode: str | None = None,
     ) -> None:
+        """Enqueue an unpacked payload; packing runs on the save thread.
+
+        Keeps ``pack_qwen3_full_payload`` (tensor memcpy into one buffer) off the
+        model / scheduler thread. The save thread expands this into packed-buffer
+        put + sidecar put before the receiver can see the sidecar.
+        """
         from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
             MODE_ASYNC_CHUNK,
+        )
+
+        task = {
+            "packet": True,
+            "stage_id": self._stage_id,
+            "next_stage_id": next_stage_id,
+            "put_key": connector_put_key,
+            "data": payload,
+            "request_id": req_id,
+            "external_req_id": external_req_id,
+            "chunk_id": chunk_id,
+            "packet_mode": packet_mode or MODE_ASYNC_CHUNK,
+        }
+        with self._lock:
+            self._pending_save_reqs.setdefault(req_id, deque()).append(task)
+            self._pending_save_counts[req_id] += 1
+
+    def _expand_packet_send_task(self, task: dict[str, Any]) -> list[dict[str, Any]]:
+        """Pack a deferred packet task into put tasks (bg-thread only)."""
+        from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
             pack_qwen3_full_payload,
         )
 
-        mode = packet_mode or MODE_ASYNC_CHUNK
+        payload = task.get("data")
+        if not isinstance(payload, dict):
+            raise TypeError(f"packet send task missing payload dict: {type(payload)!r}")
+
         packed, sidecar = pack_qwen3_full_payload(
             payload,
-            request_id=req_id,
-            external_req_id=external_req_id,
-            from_stage_id=self._stage_id,
-            to_stage_id=next_stage_id,
-            chunk_id=chunk_id,
-            mode=mode,
+            request_id=str(task["request_id"]),
+            external_req_id=str(task["external_req_id"]),
+            from_stage_id=int(task["stage_id"]),
+            to_stage_id=int(task["next_stage_id"]),
+            chunk_id=int(task["chunk_id"]),
+            mode=str(task.get("packet_mode") or "async_chunk"),
         )
         # Packed buffer first, then sidecar. Once the receiver sees the sidecar,
         # the packed buffer must already be available to pull.
-        tasks: list[dict[str, Any]] = []
+        puts: list[dict[str, Any]] = []
         if packed is not None:
-            tasks.append(
+            puts.append(
                 {
-                    "stage_id": self._stage_id,
-                    "next_stage_id": next_stage_id,
+                    "stage_id": task["stage_id"],
+                    "next_stage_id": task["next_stage_id"],
                     "put_key": sidecar["packed_key"],
                     "data": packed,
-                    "request_id": req_id,
+                    "request_id": task["request_id"],
                 }
             )
-        tasks.append(
+        puts.append(
             {
-                "stage_id": self._stage_id,
-                "next_stage_id": next_stage_id,
-                "put_key": connector_put_key,
+                "stage_id": task["stage_id"],
+                "next_stage_id": task["next_stage_id"],
+                "put_key": task["put_key"],
                 "data": sidecar,
-                "request_id": req_id,
+                "request_id": task["request_id"],
             }
         )
-        with self._lock:
-            dq = self._pending_save_reqs.setdefault(req_id, deque())
-            for task in tasks:
-                dq.append(task)
-                self._pending_save_counts[req_id] += 1
+        return puts
 
     def _reconstruct_qwen3_packet_payload(
         self,
@@ -2155,6 +2180,9 @@ class OmniConnectorModelRunnerMixin:
     def _send_single_request(self, task: dict) -> bool:
         """Send one queued task via connector.put().
 
+        Packet tasks are packed here (save thread), then issued as
+        packed-buffer put followed by sidecar put.
+
         Returns True on success.  On failure (put() raises or returns
         ``success=False``), returns False **without** decrementing
         ``_pending_save_counts`` so the caller can retry or clean up.
@@ -2163,32 +2191,38 @@ class OmniConnectorModelRunnerMixin:
         if connector is None:
             return True
 
+        if task.get("packet"):
+            put_tasks = self._expand_packet_send_task(task)
+        else:
+            put_tasks = [task]
+
         request_id = task.get("request_id")
-        payload_data = task.get("data")
-        if payload_data is None and task.get("request") is not None:
-            payload_data = self._build_custom_process_payload(
-                request_id=request_id,
-                request=task.get("request"),
-                pooling_output=task.get("pooling_output"),
+        for put_task in put_tasks:
+            payload_data = put_task.get("data")
+            if payload_data is None and put_task.get("request") is not None:
+                payload_data = self._build_custom_process_payload(
+                    request_id=request_id,
+                    request=put_task.get("request"),
+                    pooling_output=put_task.get("pooling_output"),
+                )
+            put_key = put_task.get("put_key")
+
+            success, _size, _metadata = connector.put(
+                from_stage=str(put_task["stage_id"]),
+                to_stage=str(put_task["next_stage_id"]),
+                put_key=put_key,
+                data=payload_data,
             )
-        put_key = task.get("put_key")
-
-        success, _size, _metadata = connector.put(
-            from_stage=str(task["stage_id"]),
-            to_stage=str(task["next_stage_id"]),
-            put_key=put_key,
-            data=payload_data,
-        )
-        logger.debug(
-            "[Stage-%s] _send_single_request: put_key=%s success=%s size=%s",
-            task["stage_id"],
-            put_key,
-            success,
-            _size,
-        )
-
-        if not success:
-            return False
+            logger.debug(
+                "[Stage-%s] _send_single_request: put_key=%s success=%s size=%s packet=%s",
+                put_task["stage_id"],
+                put_key,
+                success,
+                _size,
+                bool(task.get("packet")),
+            )
+            if not success:
+                return False
 
         self._decrement_pending_save_count(request_id)
         return True

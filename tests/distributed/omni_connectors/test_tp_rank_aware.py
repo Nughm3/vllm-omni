@@ -395,7 +395,15 @@ class TestMooncakeQueryMetadataAt:
         connector._get_req_socket = MagicMock()
 
         mock_socket = MagicMock()
-        resp = QueryResponse(request_id="test_key@s0_s1", data_size=4096, is_fast_path=True)
+        resp = QueryResponse(
+            request_id="test_key@s0_s1",
+            data_size=4096,
+            is_fast_path=True,
+            segment_lengths=[4096],
+            sidecar=b"metadata",
+            generation="generation-1",
+            protocol_version=2,
+        )
         mock_socket.recv.return_value = msgspec.msgpack.encode(resp)
         connector._get_req_socket.return_value = mock_socket
 
@@ -411,6 +419,10 @@ class TestMooncakeQueryMetadataAt:
         assert result["source_port"] == 50151
         assert result["data_size"] == 4096
         assert result["is_fast_path"] is True
+        assert result["segment_lengths"] == [4096]
+        assert result["sidecar"] == b"metadata"
+        assert result["generation"] == "generation-1"
+        assert result["protocol_version"] == 2
 
     def test_query_metadata_at_returns_none_on_not_found(self):
         try:

@@ -41,6 +41,7 @@ TRANS_ERROR = b"trans_error"
 QUERY_INFO = b"query_info"
 INFO_NOT_FOUND = b"info_not_found"
 _SEGMENT_MARKER = "__mte_segment__"
+_SEGMENTED_PROTOCOL_VERSION = 2
 
 
 @dataclass
@@ -58,6 +59,9 @@ class QueryResponse:
     data_size: int
     is_fast_path: bool
     segment_lengths: list[int] | None = None
+    sidecar: bytes | None = None
+    generation: str | None = None
+    protocol_version: int = 1
 
 
 @dataclass
@@ -71,6 +75,8 @@ class MooncakeAgentMetadata:
     request_id: str
     dst_addrs: list[int]
     lengths: list[int]
+    generation: str | None = None
+    protocol_version: int = 1
 
 
 class MooncakeTransferEngineConnector(OmniConnectorBase):
@@ -119,6 +125,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self._listener_thread: threading.Thread | None = None
         self._listener_ready = threading.Event()
         self._local_buffers: dict[str, Any] = {}
+        self._local_sidecars: dict[str, bytes] = {}
+        self._local_generations: dict[str, str] = {}
+        self._claimed_generations: dict[str, str | None] = {}
+        self._cancelled_claims: set[tuple[str, str | None]] = set()
         self._local_buffers_lock = threading.Lock()
         self._put_lock = threading.Lock()
         self._req_local = threading.local()
@@ -545,6 +555,29 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             if isinstance(item, ManagedBuffer):
                 item.release()
 
+    def _finish_claimed_transfer(
+        self,
+        request_id: str,
+        item: Any,
+        sidecar: bytes | None,
+        generation: str | None,
+        *,
+        restore: bool,
+    ) -> bool:
+        with self._local_buffers_lock:
+            self._claimed_generations.pop(request_id, None)
+            cancelled_key = (request_id, generation)
+            cancelled = cancelled_key in self._cancelled_claims
+            self._cancelled_claims.discard(cancelled_key)
+            if restore and not cancelled and request_id not in self._local_buffers:
+                self._local_buffers[request_id] = item
+                if sidecar is not None:
+                    self._local_sidecars[request_id] = sidecar
+                if generation is not None:
+                    self._local_generations[request_id] = generation
+                return True
+        return False
+
     def _put_segmented_impl(
         self,
         put_key: str,
@@ -553,27 +586,28 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         data_buffers: list[ManagedBuffer] = []
         sidecar_value = self._build_segmented_sidecar(data, data_buffers)
         sidecar_bytes = OmniSerializer.serialize(sidecar_value)
-        if not sidecar_bytes:
+        if not sidecar_bytes or not data_buffers:
             return False, 0, None
 
-        sidecar_buffer = self._allocate_pool_buffer(len(sidecar_bytes))
-        try:
-            sidecar_tensor = torch.frombuffer(bytearray(sidecar_bytes), dtype=torch.uint8)
-            self._copy_tensor_to_pool(sidecar_buffer.tensor, sidecar_tensor)
-        except Exception:
-            sidecar_buffer.release()
-            raise
-
-        holders = [sidecar_buffer, *data_buffers]
+        holders = data_buffers
         for buffer in data_buffers:
             if buffer.ready_event is not None:
                 buffer.ready_event.synchronize()
         src_addrs = [self.base_ptr + holder.offset for holder in holders]
         lengths = [holder.size for holder in holders]
         total_size = sum(lengths)
+        generation = uuid.uuid4().hex
 
         with self._local_buffers_lock:
+            if put_key in self._claimed_generations:
+                logger.warning(
+                    "Rejecting duplicate put for %s while its previous generation is in flight",
+                    put_key,
+                )
+                return False, 0, None
             old_item = self._local_buffers.pop(put_key, None)
+            self._local_sidecars.pop(put_key, None)
+            self._local_generations.pop(put_key, None)
             if old_item:
                 _, _, old_holder, old_should_release, _, _ = old_item
                 self._release_holders(old_holder, old_should_release)
@@ -586,6 +620,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 True,
                 _time_mod.monotonic(),
             )
+            self._local_sidecars[put_key] = sidecar_bytes
+            self._local_generations[put_key] = generation
 
         self._metrics["puts"] += 1
         self._metrics["bytes_transferred"] += total_size
@@ -597,6 +633,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 "source_port": self.zmq_port,
                 "data_size": total_size,
                 "segment_lengths": lengths,
+                "sidecar": sidecar_bytes,
+                "generation": generation,
+                "protocol_version": _SEGMENTED_PROTOCOL_VERSION,
                 "is_segmented": True,
                 "is_fast_path": True,
             },
@@ -746,8 +785,18 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 return False, 0, None
 
             with self._local_buffers_lock:
+                if put_key in self._claimed_generations:
+                    if should_release_holder:
+                        self._release_holders(holder, True)
+                    logger.warning(
+                        "Rejecting duplicate put for %s while its previous generation is in flight",
+                        put_key,
+                    )
+                    return False, 0, None
                 # Release old buffer if put_key already exists (prevents pool leak)
                 old_item = self._local_buffers.pop(put_key, None)
+                self._local_sidecars.pop(put_key, None)
+                self._local_generations.pop(put_key, None)
                 if old_item:
                     _, _, old_holder, old_should_release, _, _ = old_item
                     self._release_holders(old_holder, old_should_release)
@@ -817,6 +866,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 "data_size": query_resp.data_size,
                 "is_fast_path": query_resp.is_fast_path,
                 "segment_lengths": query_resp.segment_lengths,
+                "sidecar": query_resp.sidecar,
+                "generation": query_resp.generation,
+                "protocol_version": query_resp.protocol_version,
                 "is_segmented": bool(query_resp.segment_lengths),
             }
         except Exception as e:
@@ -924,6 +976,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         data_size = metadata.get("data_size", 0)
         is_fast_path = metadata.get("is_fast_path", False)
         segment_lengths = metadata.get("segment_lengths")
+        sidecar = metadata.get("sidecar")
+        generation = metadata.get("generation")
+        protocol_version = int(metadata.get("protocol_version", 1))
         is_segmented = bool(metadata.get("is_segmented") or segment_lengths)
 
         if not src_host or not src_port or str(src_host).lower() == "auto":
@@ -941,8 +996,12 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         recv_buffers: list[ManagedBuffer] = []
         try:
             if is_segmented:
-                if not isinstance(segment_lengths, list) or len(segment_lengths) < 2:
+                if not isinstance(segment_lengths, list) or not segment_lengths:
                     raise ValueError(f"Invalid segmented transfer lengths: {segment_lengths!r}")
+                if not isinstance(sidecar, bytes) or not sidecar:
+                    raise ValueError("Segmented transfer metadata is missing its sidecar")
+                if protocol_version != _SEGMENTED_PROTOCOL_VERSION or not generation:
+                    raise ValueError("Segmented transfer requires a coordinated protocol-v2 sender and receiver")
                 if sum(int(length) for length in segment_lengths) != data_size:
                     raise ValueError(f"Segment lengths sum to {sum(segment_lengths)}, expected data_size={data_size}")
                 for length in segment_lengths:
@@ -972,6 +1031,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             request_id=get_key,
             dst_addrs=[self.base_ptr + buffer.offset for buffer in recv_buffers],
             lengths=transfer_lengths,
+            generation=str(generation) if is_segmented else None,
+            protocol_version=protocol_version if is_segmented else 1,
         )
 
         # 3. ZMQ Transaction (uses cached socket to avoid TCP reconnection)
@@ -1002,16 +1063,13 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 _sync_ms = (_t4 - _t3) * 1000
 
                 if is_segmented:
-                    sidecar_buffer = recv_buffers[0]
-                    data_buffers = recv_buffers[1:]
                     try:
                         value = self._restore_segmented_payload(
-                            sidecar_buffer.to_bytes(),
-                            data_buffers,
+                            sidecar,
+                            recv_buffers,
                         )
                     except Exception:
                         raise
-                    sidecar_buffer.release()
                     _t5 = _time_mod.perf_counter()
                     _total_ms = (_t5 - _t0) * 1000
                     _mbps = (data_size / 1024 / 1024) / (_total_ms / 1000) if _total_ms > 0 else 0
@@ -1119,6 +1177,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             request_id = self._make_key(request_id, from_stage, to_stage)
         with self._local_buffers_lock:
             item = self._local_buffers.pop(request_id, None)
+            self._local_sidecars.pop(request_id, None)
+            self._local_generations.pop(request_id, None)
+            if request_id in self._claimed_generations:
+                self._cancelled_claims.add((request_id, self._claimed_generations[request_id]))
             if item:
                 # item is (src_addrs, lengths, holder, should_release, is_fast_path, created_at)
                 _, _, holder, should_release, _, _ = item
@@ -1174,6 +1236,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 _, _, holder, should_release, _, _ = item
                 self._release_holders(holder, should_release)
             self._local_buffers.clear()
+            self._local_sidecars.clear()
+            self._local_generations.clear()
+            self._claimed_generations.clear()
+            self._cancelled_claims.clear()
 
         # 5. Close thread-local cached REQ sockets (for the calling thread).
         #    Sockets cached in *other* threads are not directly accessible here
@@ -1226,6 +1292,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             stale_keys = [k for k, v in self._local_buffers.items() if now - v[5] > _BUFFER_TTL_SECONDS]
             for k in stale_keys:
                 item = self._local_buffers.pop(k)
+                self._local_sidecars.pop(k, None)
+                self._local_generations.pop(k, None)
                 _, _, holder, should_release, _, _ = item
                 self._release_holders(holder, should_release)
                 logger.warning(f"TTL expired ({_BUFFER_TTL_SECONDS}s): cleaned up stale buffer for {k}")
@@ -1315,6 +1383,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         Handle pull request or query request in worker thread.
         Results are put into response_queue and listener is notified via inproc.
         """
+        claimed_item = None
+        claimed_sidecar = None
+        claimed_generation = None
         try:
             # Check if this is a query request
             if payload.startswith(QUERY_INFO):
@@ -1326,43 +1397,88 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
             with self._local_buffers_lock:
                 item = self._local_buffers.get(meta.request_id)
+                sidecar = self._local_sidecars.get(meta.request_id)
+                generation = self._local_generations.get(meta.request_id)
+                validation_error = None
+                if not item:
+                    validation_error = "buffer not found"
+                else:
+                    current_segmented = sidecar is not None
+                    requested_segmented = (
+                        meta.protocol_version == _SEGMENTED_PROTOCOL_VERSION or meta.generation is not None
+                    )
+                    if current_segmented != requested_segmented:
+                        validation_error = "segmented/nonsegmented protocol mismatch"
+                    elif current_segmented and (
+                        meta.protocol_version != _SEGMENTED_PROTOCOL_VERSION or meta.generation != generation
+                    ):
+                        validation_error = f"stale generation requested={meta.generation}, current={generation}"
+                    elif len(meta.dst_addrs) != len(item[0]) or meta.lengths != item[1]:
+                        validation_error = (
+                            f"segment mismatch source={item[1]}, destination={meta.lengths}, "
+                            f"addresses={len(meta.dst_addrs)}"
+                        )
+                if validation_error is None:
+                    claimed_item = self._local_buffers.pop(meta.request_id)
+                    claimed_sidecar = self._local_sidecars.pop(meta.request_id, None)
+                    claimed_generation = self._local_generations.pop(meta.request_id, None)
+                    self._claimed_generations[meta.request_id] = claimed_generation
 
-            if not item:
-                response_queue.put((identity, TRANS_ERROR))
-                self._notify_listener(notify_addr)
-                return
-
-            src_addrs, src_lengths, _, _, _, _ = item
-            remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
-            if len(meta.dst_addrs) != len(src_addrs) or meta.lengths != src_lengths:
+            if validation_error is not None:
                 logger.error(
-                    "Segment mismatch for %s: source lengths=%s, destination lengths=%s, destination addresses=%s",
+                    "Rejected pull for %s: %s",
                     meta.request_id,
-                    src_lengths,
-                    meta.lengths,
-                    len(meta.dst_addrs),
+                    validation_error,
                 )
                 response_queue.put((identity, TRANS_ERROR))
                 self._notify_listener(notify_addr)
                 return
 
             # RDMA Write
+            src_addrs, src_lengths, holder, should_release, _, _ = claimed_item
+            remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
             ret = self.engine.batch_transfer_sync_write(remote_session, src_addrs, meta.dst_addrs, src_lengths)
 
             if ret == 0:
-                self.cleanup(meta.request_id)
+                self._finish_claimed_transfer(
+                    meta.request_id,
+                    claimed_item,
+                    claimed_sidecar,
+                    claimed_generation,
+                    restore=False,
+                )
+                self._release_holders(holder, should_release)
+                claimed_item = None
                 response_queue.put((identity, TRANS_DONE))
             else:
-                # Keep buffer in _local_buffers so receiver can retry on transient failures.
-                # Buffer will be cleaned up when: (a) a retry succeeds, (b) close() is called,
-                # or (c) a future TTL mechanism reclaims stale entries.
+                restored = self._finish_claimed_transfer(
+                    meta.request_id,
+                    claimed_item,
+                    claimed_sidecar,
+                    claimed_generation,
+                    restore=True,
+                )
+                if not restored:
+                    self._release_holders(holder, should_release)
+                claimed_item = None
                 logger.warning(
                     f"RDMA write failed for {meta.request_id} to {remote_session} "
-                    f"(ret={ret}). Buffer retained for retry."
+                    f"(ret={ret}). Buffer {'retained for retry' if restored else 'superseded by a newer put'}."
                 )
                 response_queue.put((identity, TRANS_ERROR))
 
         except Exception as e:
+            if claimed_item is not None:
+                _, _, holder, should_release, _, _ = claimed_item
+                restored = self._finish_claimed_transfer(
+                    meta.request_id,
+                    claimed_item,
+                    claimed_sidecar,
+                    claimed_generation,
+                    restore=True,
+                )
+                if not restored:
+                    self._release_holders(holder, should_release)
             logger.error(f"Push failed: {e}")
             response_queue.put((identity, TRANS_ERROR))
 
@@ -1376,6 +1492,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
             with self._local_buffers_lock:
                 item = self._local_buffers.get(query.request_id)
+                sidecar = self._local_sidecars.get(query.request_id)
+                generation = self._local_generations.get(query.request_id)
 
             if not item:
                 response_queue.put((identity, INFO_NOT_FOUND))
@@ -1386,7 +1504,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     request_id=query.request_id,
                     data_size=sum(src_lengths),
                     is_fast_path=is_fast_path,
-                    segment_lengths=src_lengths if len(src_lengths) > 1 else None,
+                    segment_lengths=src_lengths if sidecar is not None else None,
+                    sidecar=sidecar,
+                    generation=generation,
+                    protocol_version=(_SEGMENTED_PROTOCOL_VERSION if sidecar is not None else 1),
                 )
                 response_queue.put((identity, msgspec.msgpack.encode(resp)))
 

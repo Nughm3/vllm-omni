@@ -214,6 +214,10 @@ def _make_uninitialized_mooncake_connector(pool_size: int = 64 * 1024):
     connector.base_ptr = connector.pool.data_ptr()
     connector.allocator = BufferAllocator(pool_size, alignment=8)
     connector._local_buffers = {}
+    connector._local_sidecars = {}
+    connector._local_generations = {}
+    connector._claimed_generations = {}
+    connector._cancelled_claims = set()
     connector._local_buffers_lock = threading.Lock()
     connector._metrics = {
         "puts": 0,
@@ -248,10 +252,13 @@ def test_mooncake_flat_packet_uses_one_multisegment_put():
 
     assert success
     assert metadata["is_segmented"] is True
-    assert metadata["segment_lengths"][1:] == [16, 8]
+    assert metadata["segment_lengths"] == [16, 8]
+    assert isinstance(metadata["sidecar"], bytes)
+    assert metadata["protocol_version"] == 2
+    assert metadata["generation"]
     assert total_size == sum(metadata["segment_lengths"])
     src_addrs, lengths, holders, should_release, is_fast_path, _ = connector._local_buffers["request@0_1"]
-    assert len(src_addrs) == len(lengths) == len(holders) == 3
+    assert len(src_addrs) == len(lengths) == len(holders) == 2
     assert should_release is True
     assert is_fast_path is True
 
@@ -272,12 +279,11 @@ def test_mooncake_segmented_payload_restores_typed_tensor_views():
             "ids.all": [1, 2],
         },
     }
-    success, _, _ = connector._put_impl("request@0_1", packet)
+    success, _, metadata = connector._put_impl("request@0_1", packet)
     assert success
     _, _, holders, _, _, _ = connector._local_buffers["request@0_1"]
-    sidecar = holders[0].to_bytes()
 
-    restored = connector._restore_segmented_payload(sidecar, holders[1:])
+    restored = connector._restore_segmented_payload(metadata["sidecar"], holders)
 
     assert restored["payload"]["ids.all"] == [1, 2]
     assert torch.equal(
@@ -286,7 +292,7 @@ def test_mooncake_segmented_payload_restores_typed_tensor_views():
     )
     assert restored["payload"]["hidden_states.output"].dtype == torch.int64
     assert restored["payload"]["hidden_states.output"].tolist() == [7]
-    assert restored[MANAGED_BUFFER_LEASES_KEY] == holders[1:]
+    assert restored[MANAGED_BUFFER_LEASES_KEY] == holders
 
 
 def test_managed_buffer_slices_keep_shared_allocation_alive():
@@ -310,3 +316,74 @@ def test_managed_buffer_slices_keep_shared_allocation_alive():
 
     second.release()
     assert allocator.alloc(32) == 0
+
+
+def test_mooncake_cleanup_prevents_failed_claim_from_restoring_buffer():
+    connector = _make_uninitialized_mooncake_connector()
+    buffer = connector.allocate_buf(16, dtype=torch.float32, shape=(2, 2))
+    packet = {
+        "__qwen3_flat__": True,
+        "packet_version": 1,
+        "payload_kind": "thinker_to_talker_full_payload",
+        "payload": {"embed.prefill": buffer},
+    }
+    success, _, metadata = connector._put_impl("request@0_1", packet)
+    assert success
+
+    with connector._local_buffers_lock:
+        item = connector._local_buffers.pop("request@0_1")
+        sidecar = connector._local_sidecars.pop("request@0_1")
+        generation = connector._local_generations.pop("request@0_1")
+        connector._claimed_generations["request@0_1"] = generation
+
+    connector.cleanup("request@0_1")
+    restored = connector._finish_claimed_transfer(
+        "request@0_1",
+        item,
+        sidecar,
+        generation,
+        restore=True,
+    )
+
+    assert restored is False
+    assert "request@0_1" not in connector._local_buffers
+    _, _, holders, should_release, _, _ = item
+    connector._release_holders(holders, should_release)
+    assert metadata["generation"] == generation
+
+
+def test_mooncake_rejects_duplicate_put_while_generation_is_claimed():
+    connector = _make_uninitialized_mooncake_connector()
+    first = connector.allocate_buf(16, dtype=torch.float32, shape=(2, 2))
+    packet = {
+        "__qwen3_flat__": True,
+        "packet_version": 1,
+        "payload_kind": "thinker_to_talker_full_payload",
+        "payload": {"embed.prefill": first},
+    }
+    success, _, metadata = connector._put_impl("request@0_1", packet)
+    assert success
+
+    with connector._local_buffers_lock:
+        item = connector._local_buffers.pop("request@0_1")
+        sidecar = connector._local_sidecars.pop("request@0_1")
+        generation = connector._local_generations.pop("request@0_1")
+        connector._claimed_generations["request@0_1"] = generation
+
+    second = connector.allocate_buf(16, dtype=torch.float32, shape=(2, 2))
+    duplicate = {**packet, "payload": {"embed.prefill": second}}
+    duplicate_success, _, _ = connector._put_impl("request@0_1", duplicate)
+
+    assert duplicate_success is False
+    assert "request@0_1" not in connector._local_buffers
+    assert metadata["generation"] == generation
+    connector._finish_claimed_transfer(
+        "request@0_1",
+        item,
+        sidecar,
+        generation,
+        restore=False,
+    )
+    _, _, holders, should_release, _, _ = item
+    connector._release_holders(holders, should_release)
+    second.release()

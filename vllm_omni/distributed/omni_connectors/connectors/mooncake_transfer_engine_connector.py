@@ -174,21 +174,15 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self.sender_zmq_port = config.get("sender_zmq_port", None)
 
         # --- Role ---
-        # Prefer explicit can_put / can_get (duplex-capable). Fall back to legacy
-        # role=sender|receiver for callers that have not been migrated yet.
-        self.can_put = bool(config.get("can_put", False))
-        self.can_get = bool(config.get("can_get", False))
-        if not self.can_put and not self.can_get:
-            role = config.get("role")
-            if role == "sender":
-                self.can_put = True
-            elif role == "receiver":
-                self.can_get = True
-            else:
-                raise ValueError(
-                    "MooncakeTransferEngineConnector must have can_put and/or can_get "
-                    f"set to True (or legacy role=sender|receiver); got role={role!r}."
-                )
+        # A connector instance is always exactly one direction. Callers that
+        # need both directions for a stage use CompositeOmniConnector with
+        # two separate instances (one sender, one receiver) instead of a
+        # single duplex instance — see merge_stage_connector_specs.
+        role = str(config.get("role", "")).lower()
+        if role not in {"sender", "receiver"}:
+            raise ValueError(f"MooncakeTransferEngineConnector requires role='sender'|'receiver'; got role={role!r}.")
+        self.can_put = role == "sender"
+        self.can_get = role == "receiver"
 
         self.engine_id = str(uuid.uuid4())
 

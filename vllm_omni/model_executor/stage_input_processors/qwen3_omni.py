@@ -604,6 +604,12 @@ def thinker2talker_full_payload(
         "ids": {"all": list(all_token_ids), "prompt": list(prompt_token_ids)},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }
+    # Scheduler hint for the talker's placeholder prompt allocation, same
+    # computation the async path uses for its own local placeholder sizing
+    # (thinker2talker_token_only) — the full-payload path must ship it too so
+    # the downstream scheduler can size the talker's KV allocation.
+    info_for_len = {"ids": {"all": list(all_token_ids), "prompt": list(prompt_token_ids)}}
+    payload["next_stage_prompt_len"] = _compute_talker_prompt_ids_length(info_for_len, device="cpu")
     speaker = extract_speaker_from_request(request)
     if speaker is not None:
         payload["speaker"] = speaker

@@ -209,6 +209,7 @@ def test_mooncake_connector_defaults_missing_host_to_detected_ip(monkeypatch: py
         {
             "zmq_port": 50051,
             "memory_pool_size": 4096,
+            "role": "sender",
         }
     )
     try:

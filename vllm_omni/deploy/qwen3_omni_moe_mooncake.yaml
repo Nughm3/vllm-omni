@@ -15,32 +15,32 @@
 # Usage:
 # Start node 0 first.
 #
-# Node 0 (thinker + orchestrator) run command (on hk01dgx006)
+# Node 0 (thinker + orchestrator) run command
 # vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --log-stats \
 #   --deploy-config vllm_omni/deploy/qwen3_omni_moe_mooncake.yaml \
 #   --port 8091 \
 #   --stage-id 0 \
-#   --omni-master-address 10.248.12.80 \
+#   --omni-master-address NODE0_ADDR \
 #   --omni-master-port 26000
 #
-# Node 1 (talker) run command (on hk01dgx012)
+# Node 1 (talker) run command
 # vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --log-stats \
 #   --deploy-config vllm_omni/deploy/qwen3_omni_moe_mooncake.yaml \
 #   --stage-id 1 \
 #   --headless \
-#   --omni-master-address 10.248.12.80 \
+#   --omni-master-address NODE0_ADDR \
 #   --omni-master-port 26000 \
-#   --omni-replica-address 10.248.12.86
-# 
-# Node 1 (code2wav) run command (on hk01dgx012)
+#   --omni-replica-address NODE1_ADDR
+#
+# Node 1 (code2wav) run command
 # vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --log-stats \
 #   --deploy-config vllm_omni/deploy/qwen3_omni_moe_mooncake.yaml \
 #   --stage-id 2 \
 #   --headless \
-#   --omni-master-address 10.248.12.80 \
+#   --omni-master-address NODE0_ADDR \
 #   --omni-master-port 26000 \
-#   --omni-replica-address 10.248.12.86
-#
+#   --omni-replica-address NODE1_ADDR
+
 # Async chunk mode is not currently supported for this cross-node Mooncake path.
 async_chunk: false
 
@@ -54,12 +54,31 @@ connectors:
       host: "auto"
       zmq_port: 50051
       # Stage 1 (receiver) queries thinker on node 0.
-      sender_host: "10.248.12.80" # hk01dgx006
+      # "auto" works in single-node mode.
+      # For cross-node setups, set this to point to your stage 0 node.
+      sender_host: "auto"
       protocol: "rdma"
       device_name: "mlx5_0"
       memory_pool_size: 4294967296
       memory_pool_device: "cpu"
 
+  talker2code2wav_mooncake:
+    name: MooncakeTransferEngineConnector
+    extra:
+      host: "auto"
+      zmq_port: 50051
+      # Stage 2 (receiver) queries talker on node 1 (colocated with stage 2).
+      # "auto" works in single-node mode.
+      # For cross-node setups, set this to point to your stage 1 node.
+      sender_host: "auto"
+      protocol: "rdma"
+      device_name: "mlx5_0"
+      memory_pool_size: 4294967296
+      memory_pool_device: "cpu"
+
+  # Hybrid Mooncake + SHM setup is often more suitable for production, if stages
+  # 1 and 2 are on the same node. Select talker2code2wav_shm in the stage config
+  # to enable.
   talker2code2wav_shm:
     name: SharedMemoryConnector
     extra:

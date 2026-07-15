@@ -176,6 +176,7 @@ def _connector_config(
     zmq_port: int,
     pool_size: int = 16 * 1024 * 1024,
     pool_device: str = "cpu",
+    role: str = "sender",
 ) -> dict:
     cfg = {
         "host": RDMA_HOST,
@@ -183,6 +184,7 @@ def _connector_config(
         "protocol": "rdma",
         "memory_pool_size": pool_size,
         "memory_pool_device": pool_device,
+        "role": role,
     }
     if RDMA_DEVICE:
         cfg["device_name"] = RDMA_DEVICE
@@ -264,8 +266,8 @@ class TestEndToEnd:
     """E2E RDMA transfer: tensor, bytes, object, zero-copy, large payload, mixed types."""
 
     def _pair(self, pool_size=16 * 1024 * 1024):
-        p = MooncakeTransferEngineConnector(_connector_config(_free_port(), pool_size))
-        c = MooncakeTransferEngineConnector(_connector_config(_free_port(), pool_size))
+        p = MooncakeTransferEngineConnector(_connector_config(_free_port(), pool_size, role="sender"))
+        c = MooncakeTransferEngineConnector(_connector_config(_free_port(), pool_size, role="receiver"))
         return p, c
 
     def test_tensor_e2e(self):
@@ -485,8 +487,8 @@ class TestGPUPool:
     """GPU memory pool: initialization, put (CPU/GPU tensor), E2E transfer."""
 
     @staticmethod
-    def _gpu_cfg(port, pool_size=32 * 1024 * 1024):
-        return _connector_config(port, pool_size, pool_device="cuda:0")
+    def _gpu_cfg(port, pool_size=32 * 1024 * 1024, role="sender"):
+        return _connector_config(port, pool_size, pool_device="cuda:0", role=role)
 
     def test_gpu_pool_init(self):
         with MooncakeTransferEngineConnector(self._gpu_cfg(_free_port())) as c:
@@ -504,8 +506,8 @@ class TestGPUPool:
             assert meta["is_fast_path"]
 
     def test_gpu_e2e_transfer(self):
-        p = MooncakeTransferEngineConnector(self._gpu_cfg(_free_port()))
-        c = MooncakeTransferEngineConnector(self._gpu_cfg(_free_port()))
+        p = MooncakeTransferEngineConnector(self._gpu_cfg(_free_port(), role="sender"))
+        c = MooncakeTransferEngineConnector(self._gpu_cfg(_free_port(), role="receiver"))
         try:
             orig = torch.randn(512, 512, dtype=torch.float32, device="cuda:0")
             ok, _, meta = p.put("s0", "s1", "ge", orig)
@@ -536,8 +538,8 @@ class TestStressCorrectness:
     """
 
     def _pair(self, pool_size=64 * 1024 * 1024):
-        p = MooncakeTransferEngineConnector(_connector_config(_free_port(), pool_size))
-        c = MooncakeTransferEngineConnector(_connector_config(_free_port(), pool_size))
+        p = MooncakeTransferEngineConnector(_connector_config(_free_port(), pool_size, role="sender"))
+        c = MooncakeTransferEngineConnector(_connector_config(_free_port(), pool_size, role="receiver"))
         return p, c
 
     # -- Concurrent put + get with data integrity --

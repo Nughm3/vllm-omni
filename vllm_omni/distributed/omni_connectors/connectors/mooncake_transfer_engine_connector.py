@@ -109,6 +109,27 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
     # to_gpu_tensor() / to_bytes() fast-paths.
     supports_raw_data: bool = True
 
+    @staticmethod
+    def _resolve_pool_config(
+        config: dict[str, Any],
+        *,
+        can_put: bool,
+        can_get: bool,
+    ) -> tuple[int, str]:
+        default_size = int(config.get("memory_pool_size", 1024**3))
+        default_device = str(config.get("memory_pool_device", "cpu"))
+        if can_put and not can_get:
+            return (
+                int(config.get("sender_memory_pool_size", default_size)),
+                str(config.get("sender_memory_pool_device", default_device)),
+            )
+        if can_get and not can_put:
+            return (
+                int(config.get("receiver_memory_pool_size", default_size)),
+                str(config.get("receiver_memory_pool_device", default_device)),
+            )
+        return default_size, default_device
+
     def __init__(self, config: dict[str, Any]):
         if TransferEngine is None:
             raise ImportError("Mooncake not available")
@@ -168,9 +189,6 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 self.device_name = env_device
                 logger.info(f"Using RDMA_DEVICE_NAME from env: {self.device_name}")
 
-        # --- Memory Pool Configuration ---
-        self.pool_size = config.get("memory_pool_size", 1024**3)  # Default 1GB
-        self.pool_device = config.get("memory_pool_device", "cpu")
         self.gpu_segment_min_bytes = int(config.get("gpu_segment_min_bytes", 4096))
 
         # --- Sender Configuration (for receiver to query without metadata) ---
@@ -207,6 +225,11 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     f"set to True (or legacy role=sender|receiver); got role={role!r}."
                 )
 
+        self.pool_size, self.pool_device = self._resolve_pool_config(
+            config,
+            can_put=self.can_put,
+            can_get=self.can_get,
+        )
         self.engine_id = str(uuid.uuid4())
 
         # --- Mooncake Engine Init ---
@@ -309,7 +332,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         dtype: torch.dtype | None = None,
         shape: tuple[int, ...] | None = None,
     ) -> ManagedBuffer | None:
-        if not self.pool.is_cuda or size < self.gpu_segment_min_bytes:
+        if size < self.gpu_segment_min_bytes:
             return None
         return self._allocate_pool_buffer(size, dtype=dtype, shape=shape)
 

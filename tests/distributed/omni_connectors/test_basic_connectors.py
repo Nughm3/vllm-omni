@@ -387,3 +387,50 @@ def test_mooncake_rejects_duplicate_put_while_generation_is_claimed():
     _, _, holders, should_release, _, _ = item
     connector._release_holders(holders, should_release)
     second.release()
+
+
+@pytest.mark.parametrize(
+    ("can_put", "can_get", "expected_size", "expected_device"),
+    [
+        (True, False, 4 * 1024, "cpu"),
+        (False, True, 2 * 1024, "cuda:0"),
+    ],
+)
+def test_mooncake_resolves_role_specific_pool_configuration(
+    can_put,
+    can_get,
+    expected_size,
+    expected_device,
+):
+    size, device = MooncakeTransferEngineConnector._resolve_pool_config(
+        {
+            "memory_pool_size": 1024,
+            "memory_pool_device": "cpu",
+            "sender_memory_pool_size": 4 * 1024,
+            "sender_memory_pool_device": "cpu",
+            "receiver_memory_pool_size": 2 * 1024,
+            "receiver_memory_pool_device": "cuda:0",
+        },
+        can_put=can_put,
+        can_get=can_get,
+    )
+
+    assert size == expected_size
+    assert device == expected_device
+
+
+def test_mooncake_cpu_pool_allocates_semantic_transport_buffer():
+    connector = _make_uninitialized_mooncake_connector()
+    connector.gpu_segment_min_bytes = 8
+
+    buffer = connector.allocate_buffer(
+        16,
+        dtype=torch.float32,
+        shape=(2, 2),
+    )
+
+    assert isinstance(buffer, ManagedBuffer)
+    assert buffer.pool_tensor.device.type == "cpu"
+    assert buffer.dtype == torch.float32
+    assert buffer.shape == (2, 2)
+    buffer.release()

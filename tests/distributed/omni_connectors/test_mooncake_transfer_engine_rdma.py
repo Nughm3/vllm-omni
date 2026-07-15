@@ -23,6 +23,9 @@ from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_c
     MooncakeTransferEngineConnector,
     TransferEngine,
 )
+from vllm_omni.distributed.omni_connectors.utils.memory_pool import (
+    MANAGED_BUFFER_LEASES_KEY,
+)
 
 # All tests in this file require Mooncake TransferEngine and an RDMA environment.
 pytestmark = [
@@ -521,6 +524,74 @@ class TestGPUPool:
         finally:
             p.close()
             c.close()
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+class TestAsymmetricPool:
+    def test_cpu_sender_to_gpu_receiver_segmented_transfer(self):
+        pool_size = 16 * 1024 * 1024
+        producer_config = _connector_config(
+            _free_port(),
+            pool_size,
+            pool_device="cpu",
+        )
+        producer_config["can_put"] = True
+        producer = MooncakeTransferEngineConnector(producer_config)
+        consumer_config = _connector_config(
+            _free_port(),
+            pool_size,
+            pool_device="cuda:0",
+        )
+        consumer_config["can_get"] = True
+        consumer = MooncakeTransferEngineConnector(consumer_config)
+        try:
+            first = producer.allocate_buffer(
+                4 * 1024 * 4,
+                dtype=torch.float32,
+                shape=(1024, 4),
+            )
+            second = producer.allocate_buffer(
+                8 * 1024,
+                dtype=torch.int64,
+                shape=(1024,),
+            )
+            assert first is not None and second is not None
+            first_value = torch.arange(4096, dtype=torch.float32).reshape(1024, 4)
+            second_value = torch.arange(1024, dtype=torch.int64)
+            first.as_tensor(torch.float32, (1024, 4)).copy_(first_value)
+            second.as_tensor(torch.int64, (1024,)).copy_(second_value)
+            packet = {
+                "__qwen3_flat__": True,
+                "packet_version": 1,
+                "payload_kind": "thinker_to_talker_full_payload",
+                "payload": {
+                    "embed.prefill": first,
+                    "hidden_states.output": second,
+                    "ids.all": [1, 2],
+                },
+            }
+
+            success, _, metadata = producer.put("0", "1", "asymmetric", packet)
+            assert success and metadata is not None
+            result = consumer.get("0", "1", "asymmetric", metadata)
+            assert result is not None
+            restored, _ = result
+
+            assert restored["payload"]["embed.prefill"].is_cuda
+            assert restored["payload"]["hidden_states.output"].is_cuda
+            assert torch.equal(
+                restored["payload"]["embed.prefill"].cpu(),
+                first_value,
+            )
+            assert torch.equal(
+                restored["payload"]["hidden_states.output"].cpu(),
+                second_value,
+            )
+            for lease in restored.pop(MANAGED_BUFFER_LEASES_KEY):
+                lease.release()
+        finally:
+            producer.close()
+            consumer.close()
 
 
 # ---------------------------------------------------------------------------

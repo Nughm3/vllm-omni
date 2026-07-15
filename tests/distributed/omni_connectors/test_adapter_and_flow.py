@@ -228,7 +228,10 @@ def test_get_connectors_for_stage():
 
 
 def test_merge_stage_connector_specs_duplex_mooncake():
-    """Middle stage merges inbound+outbound Mooncake edges into one duplex spec."""
+    """Middle stage always builds a dual (Composite) spec for its two Mooncake
+    edges — even though both edges use the same connector type — so each
+    edge's config (ports, rank_mapping, ...) stays fully independent instead
+    of collapsing into one duplex instance."""
     from vllm_omni.distributed.omni_connectors.utils.initialization import (
         merge_stage_connector_specs,
     )
@@ -259,28 +262,100 @@ def test_merge_stage_connector_specs_duplex_mooncake():
     stage_1 = get_connectors_config_for_stage(config, stage_id=1)
     merged = merge_stage_connector_specs(stage_1)
 
-    assert merged["name"] == "MooncakeTransferEngineConnector"
+    assert merged["name"] == "CompositeOmniConnector"
     extra = merged["extra"]
     assert extra["can_put"] is True
     assert extra["can_get"] is True
-    assert "role" not in extra
-    # Listen on base+stage1; query stage0's listen port.
-    assert extra["zmq_port"] == 50052
-    assert extra["sender_host"] == "10.248.12.80"
-    assert extra["sender_zmq_port"] == 50051
+
+    get_connector = extra["get_connector"]
+    assert get_connector["name"] == "MooncakeTransferEngineConnector"
+    get_extra = get_connector["extra"]
+    assert get_extra["can_put"] is False
+    assert get_extra["can_get"] is True
+    assert get_extra["role"] == "receiver"
+    assert get_extra["sender_host"] == "10.248.12.80"
+    assert get_extra["sender_zmq_port"] == 50051
+
+    put_connector = extra["put_connector"]
+    assert put_connector["name"] == "MooncakeTransferEngineConnector"
+    put_extra = put_connector["extra"]
+    assert put_extra["can_put"] is True
+    assert put_extra["can_get"] is False
+    assert put_extra["role"] == "sender"
+    # Listen on base+stage1 (outbound edge from stage 1).
+    assert put_extra["zmq_port"] == 50052
 
     stage_0 = merge_stage_connector_specs(get_connectors_config_for_stage(config, stage_id=0))
+    assert stage_0["name"] == "MooncakeTransferEngineConnector"
     assert stage_0["extra"]["can_put"] is True
     assert stage_0["extra"]["can_get"] is False
     assert stage_0["extra"]["zmq_port"] == 50051
     assert stage_0["extra"]["role"] == "sender"
 
     stage_2 = merge_stage_connector_specs(get_connectors_config_for_stage(config, stage_id=2))
+    assert stage_2["name"] == "MooncakeTransferEngineConnector"
     assert stage_2["extra"]["can_put"] is False
     assert stage_2["extra"]["can_get"] is True
     assert stage_2["extra"]["sender_host"] == "10.248.12.86"
     assert stage_2["extra"]["sender_zmq_port"] == 50052
     assert stage_2["extra"]["role"] == "receiver"
+
+
+def test_merge_stage_connector_specs_same_type_composite_delegates_put_get(mocker: MockerFixture):
+    """Even when both edges share a connector type, CompositeOmniConnector
+    still routes get() to the inbound instance and put() to the outbound
+    instance — two independent instances, not one duplex object."""
+    from vllm_omni.distributed.omni_connectors.connectors.composite_connector import (
+        CompositeOmniConnector,
+    )
+    from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec as _ConnectorSpec
+
+    get_conn = mocker.Mock()
+    get_conn.get.return_value = ({"ok": True}, 4)
+    get_conn.supports_raw_data = False
+    put_conn = mocker.Mock()
+    put_conn.put.return_value = (True, 8, None)
+    put_conn.supports_raw_data = False
+
+    created: list[_ConnectorSpec] = []
+
+    def _create(spec: _ConnectorSpec):
+        created.append(spec)
+        return get_conn if len(created) == 1 else put_conn
+
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
+        side_effect=_create,
+    )
+
+    composite = CompositeOmniConnector(
+        {
+            "stage_id": 1,
+            "get_connector": {
+                "name": "MooncakeTransferEngineConnector",
+                "extra": {"can_get": True, "can_put": False, "rank_mapping": {"from_tp": 4, "to_tp": 2}},
+            },
+            "put_connector": {
+                "name": "MooncakeTransferEngineConnector",
+                "extra": {"can_put": True, "can_get": False, "rank_mapping": {"from_tp": 2, "to_tp": 1}},
+            },
+        }
+    )
+
+    # Two distinct child connector instances were constructed, even though
+    # both children share the same connector type name.
+    assert len(created) == 2
+    assert created[0].extra["rank_mapping"] == {"from_tp": 4, "to_tp": 2}
+    assert created[1].extra["rank_mapping"] == {"from_tp": 2, "to_tp": 1}
+
+    result = composite.get("0", "1", "key")
+    assert result == ({"ok": True}, 4)
+    get_conn.get.assert_called_once_with("0", "1", "key", None)
+    put_conn.put.assert_not_called()
+
+    success, size, _ = composite.put("1", "2", "key", {"data": 1})
+    assert (success, size) == (True, 8)
+    put_conn.put.assert_called_once_with("1", "2", "key", {"data": 1})
 
 
 def test_merge_stage_connector_specs_heterogeneous_mooncake_shm():
@@ -334,6 +409,50 @@ def test_merge_stage_connector_specs_heterogeneous_mooncake_shm():
     assert stage_2["name"] == "SharedMemoryConnector"
     assert stage_2["extra"]["can_get"] is True
     assert stage_2["extra"]["can_put"] is False
+
+
+def test_merge_stage_connector_specs_preserves_per_edge_rank_mapping():
+    """A middle stage's inbound and outbound edges may have different TP
+    ratios (e.g. thinker TP=4 -> talker TP=2 -> code2wav TP=1). Each edge's
+    rank_mapping must survive the merge independently, not get clobbered by
+    the other edge's value."""
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        merge_stage_connector_specs,
+    )
+
+    config = OmniTransferConfig(
+        connectors={
+            ("0", "1"): ConnectorSpec(
+                name="MooncakeTransferEngineConnector",
+                extra={
+                    "host": "auto",
+                    "zmq_port": 50051,
+                    "sender_host": "10.248.12.80",
+                    "protocol": "rdma",
+                    "rank_mapping": {"from_tp": 4, "to_tp": 2},
+                },
+            ),
+            ("1", "2"): ConnectorSpec(
+                name="MooncakeTransferEngineConnector",
+                extra={
+                    "host": "auto",
+                    "zmq_port": 50051,
+                    "sender_host": "10.248.12.86",
+                    "protocol": "rdma",
+                    "rank_mapping": {"from_tp": 2, "to_tp": 1},
+                },
+            ),
+        }
+    )
+
+    stage_1 = merge_stage_connector_specs(get_connectors_config_for_stage(config, stage_id=1))
+    assert stage_1["name"] == "CompositeOmniConnector"
+    extra = stage_1["extra"]
+
+    # Inbound (recv) edge keeps its own rank_mapping...
+    assert extra["get_connector"]["extra"]["rank_mapping"] == {"from_tp": 4, "to_tp": 2}
+    # ...and the outbound (send) edge keeps its own, independently.
+    assert extra["put_connector"]["extra"]["rank_mapping"] == {"from_tp": 2, "to_tp": 1}
 
 
 def test_composite_omni_connector_delegates_put_get(mocker: MockerFixture):

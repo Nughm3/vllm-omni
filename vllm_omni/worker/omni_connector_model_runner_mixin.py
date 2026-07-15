@@ -122,10 +122,12 @@ class OmniConnectorModelRunnerMixin:
         # -- next stage ID (from connector config or default stage_id + 1) --
         self._next_stage_id: int = self._resolve_next_stage_id(model_config)
 
-        # -- heterogeneous TP rank support --
+        # -- heterogeneous TP rank support (independent per direction) --
         rank_cfg = self._parse_rank_mapping(model_config)
-        self._from_tp: int = rank_cfg["from_tp"]
-        self._to_tp: int = rank_cfg["to_tp"]
+        self._recv_from_tp: int = rank_cfg["recv"]["from_tp"]
+        self._recv_to_tp: int = rank_cfg["recv"]["to_tp"]
+        self._send_from_tp: int = rank_cfg["send"]["from_tp"]
+        self._send_to_tp: int = rank_cfg["send"]["to_tp"]
         self._local_rank: int = rank_cfg["local_rank"]
         if self._kv_transfer_manager is not None:
             self._kv_transfer_manager.kv_send_key_builder = self.get_rank_aware_kv_send_keys
@@ -1515,14 +1517,18 @@ class OmniConnectorModelRunnerMixin:
         ]
 
     def get_kv_target_ranks_for_send(self) -> list[int]:
-        """Determine which target ranks this local rank should send KV shards to."""
-        self._validate_kv_tp_topology()
-        if self._from_tp == self._to_tp:
+        """Determine which target ranks this local rank should send KV shards to.
+
+        Uses the send-side (outbound edge) TP mapping.
+        """
+        from_tp, to_tp = self._send_from_tp, self._send_to_tp
+        self._validate_kv_tp_topology(from_tp, to_tp)
+        if from_tp == to_tp:
             return [self._local_rank]
-        if self._from_tp > self._to_tp:
-            tp_ratio = self._from_tp // self._to_tp
+        if from_tp > to_tp:
+            tp_ratio = from_tp // to_tp
             return [self._local_rank // tp_ratio]
-        tp_ratio = self._to_tp // self._from_tp
+        tp_ratio = to_tp // from_tp
         base_rank = self._local_rank * tp_ratio
         return [base_rank + i for i in range(tp_ratio)]
 
@@ -1585,11 +1591,14 @@ class OmniConnectorModelRunnerMixin:
         return merged
 
     def _slice_rank_sharded_kv_payload(self, payload: dict[str, Any] | None) -> dict[str, Any] | None:
-        """Slice a duplicated source-rank KV shard for ``from_tp < to_tp`` cases."""
-        if payload is None or self._from_tp >= self._to_tp:
+        """Slice a duplicated source-rank KV shard for ``from_tp < to_tp`` cases.
+
+        Uses the send-side (outbound edge) TP mapping.
+        """
+        if payload is None or self._send_from_tp >= self._send_to_tp:
             return payload
 
-        tp_ratio = self._to_tp // self._from_tp
+        tp_ratio = self._send_to_tp // self._send_from_tp
         shard_index = self._local_rank % tp_ratio
         layer_blocks = payload.get("layer_blocks") if isinstance(payload, dict) else None
         if not isinstance(layer_blocks, dict):
@@ -1633,11 +1642,13 @@ class OmniConnectorModelRunnerMixin:
         """Return the current rank mapping configuration.
 
         Useful for debugging and for downstream code that needs to know
-        the TP topology without re-parsing model config.
+        the TP topology without re-parsing model config. ``recv``/``send``
+        are independent since a stage's inbound and outbound edges may have
+        different TP ratios.
         """
         return {
-            "from_tp": self._from_tp,
-            "to_tp": self._to_tp,
+            "recv": {"from_tp": self._recv_from_tp, "to_tp": self._recv_to_tp},
+            "send": {"from_tp": self._send_from_tp, "to_tp": self._send_to_tp},
             "local_rank": self._local_rank,
             "remote_ranks": self.get_kv_remote_ranks(),
             "is_data_transfer_rank": self.is_data_transfer_rank(),
@@ -2497,15 +2508,20 @@ class OmniConnectorModelRunnerMixin:
     def _resolve_next_stage_id(self, model_config: Any) -> int:
         """Determine the downstream stage ID from connector config.
 
-        Falls back to ``stage_id + 1`` when the config does not specify
-        a ``to_stage`` explicitly.
+        For a composite (dual) connector spec, ``to_stage`` is read from the
+        ``put_connector`` child's ``extra`` since that describes the outbound
+        edge. Falls back to ``stage_id + 1`` when nothing specifies it.
         """
         connector_config = getattr(model_config, "stage_connector_config", None)
         if connector_config is not None:
-            if isinstance(connector_config, dict):
-                to_stage = connector_config.get("to_stage")
+            if not isinstance(connector_config, dict):
+                connector_config = getattr(connector_config, "__dict__", {})
+            extra = connector_config.get("extra") or {}
+            put_connector = extra.get("put_connector")
+            if isinstance(put_connector, dict):
+                to_stage = (put_connector.get("extra") or {}).get("to_stage")
             else:
-                to_stage = getattr(connector_config, "to_stage", None)
+                to_stage = connector_config.get("to_stage")
             if isinstance(to_stage, int):
                 return to_stage
             if isinstance(to_stage, str) and to_stage.strip():
@@ -2513,22 +2529,43 @@ class OmniConnectorModelRunnerMixin:
         return self._stage_id + 1
 
     @staticmethod
-    def _parse_rank_mapping(model_config: Any) -> dict[str, int]:
-        """Parse rank_mapping from connector config (optional).
+    def _parse_rank_mapping(model_config: Any) -> dict[str, Any]:
+        """Parse per-direction rank_mapping from connector config (optional).
 
-        Returns ``{"from_tp": int, "to_tp": int, "local_rank": int}``.
-        When ``rank_mapping`` is absent, assumes 1:1 homogeneous mapping.
+        Returns ``{"recv": {"from_tp", "to_tp"}, "send": {"from_tp", "to_tp"},
+        "local_rank"}``. For a composite (dual) connector spec, ``recv`` comes
+        from the ``get_connector`` child's ``rank_mapping`` and ``send`` from
+        the ``put_connector`` child's — independent TP topologies for a
+        stage's two edges. For a flat (single-edge) spec, the same
+        ``rank_mapping`` is used for both, since there's only one edge and no
+        ambiguity. Absent ``rank_mapping`` assumes 1:1 homogeneous mapping.
         """
         connector_config = getattr(model_config, "stage_connector_config", None)
         if connector_config is not None and not isinstance(connector_config, dict):
             connector_config = getattr(connector_config, "__dict__", {})
 
-        rank_mapping: dict = {}
+        extra: dict = {}
         if isinstance(connector_config, dict):
-            rank_mapping = connector_config.get("rank_mapping", {})
+            extra = connector_config.get("extra") or {}
 
-        from_tp = int(rank_mapping.get("from_tp", 1))
-        to_tp = int(rank_mapping.get("to_tp", 1))
+        def _tp_pair(rank_mapping: Any) -> dict[str, int]:
+            rank_mapping = rank_mapping if isinstance(rank_mapping, dict) else {}
+            return {
+                "from_tp": int(rank_mapping.get("from_tp", 1)),
+                "to_tp": int(rank_mapping.get("to_tp", 1)),
+            }
+
+        get_connector = extra.get("get_connector")
+        put_connector = extra.get("put_connector")
+        if isinstance(get_connector, dict) or isinstance(put_connector, dict):
+            recv_extra = (get_connector or {}).get("extra") or {}
+            send_extra = (put_connector or {}).get("extra") or {}
+            recv = _tp_pair(recv_extra.get("rank_mapping"))
+            send = _tp_pair(send_extra.get("rank_mapping"))
+        else:
+            shared = _tp_pair(extra.get("rank_mapping"))
+            recv = dict(shared)
+            send = dict(shared)
 
         local_rank = 0
         try:
@@ -2536,40 +2573,43 @@ class OmniConnectorModelRunnerMixin:
         except (ValueError, TypeError):
             pass
 
-        return {"from_tp": from_tp, "to_tp": to_tp, "local_rank": local_rank}
+        return {"recv": recv, "send": send, "local_rank": local_rank}
 
     # ------------------------------------------------------------------ #
     #  Heterogeneous TP rank support
     # ------------------------------------------------------------------ #
 
-    def _validate_kv_tp_topology(self) -> None:
+    @staticmethod
+    def _validate_kv_tp_topology(from_tp: int, to_tp: int) -> None:
         """Reject heterogeneous TP mappings that cannot be routed losslessly."""
-        if self._from_tp <= 0 or self._to_tp <= 0:
-            raise ValueError(f"Invalid KV TP mapping: from_tp={self._from_tp}, to_tp={self._to_tp}")
-        larger = max(self._from_tp, self._to_tp)
-        smaller = min(self._from_tp, self._to_tp)
+        if from_tp <= 0 or to_tp <= 0:
+            raise ValueError(f"Invalid KV TP mapping: from_tp={from_tp}, to_tp={to_tp}")
+        larger = max(from_tp, to_tp)
+        smaller = min(from_tp, to_tp)
         if larger % smaller != 0:
             raise ValueError(
-                f"KV TP mapping must be divisible for rank-aware routing: from_tp={self._from_tp}, to_tp={self._to_tp}"
+                f"KV TP mapping must be divisible for rank-aware routing: from_tp={from_tp}, to_tp={to_tp}"
             )
 
     def get_kv_remote_ranks(self) -> list[int]:
         """Determine which remote ranks this local rank exchanges KV with.
 
-        Follows vLLM's ``TpKVTopology.get_target_remote_ranks()`` pattern:
+        Uses the recv-side (inbound edge) TP mapping. Follows vLLM's
+        ``TpKVTopology.get_target_remote_ranks()`` pattern:
         - ``from_tp > to_tp``: each to-rank reads from multiple from-ranks
         - ``from_tp < to_tp``: multiple to-ranks read from the same from-rank
         - ``from_tp == to_tp``: 1:1 mapping
         """
-        self._validate_kv_tp_topology()
-        if self._from_tp == self._to_tp:
+        from_tp, to_tp = self._recv_from_tp, self._recv_to_tp
+        self._validate_kv_tp_topology(from_tp, to_tp)
+        if from_tp == to_tp:
             return [self._local_rank]
 
-        if self._from_tp > self._to_tp:
-            tp_ratio = self._from_tp // self._to_tp
+        if from_tp > to_tp:
+            tp_ratio = from_tp // to_tp
             return [self._local_rank * tp_ratio + i for i in range(tp_ratio)]
         else:
-            tp_ratio = self._to_tp // self._from_tp
+            tp_ratio = to_tp // from_tp
             return [self._local_rank // tp_ratio]
 
     def is_data_transfer_rank(self) -> bool:

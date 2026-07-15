@@ -96,6 +96,10 @@ def create_connectors_from_config(
         from_stage, to_stage = edge_key
         try:
             if connector_spec.name in TRANSFER_ENGINE_CONNECTOR_NAMES:
+                # Local import to avoid a circular import: kv_utils imports
+                # the port constants from this module.
+                from .kv_utils import get_omni_replica_id
+
                 extra = dict(connector_spec.extra) if connector_spec.extra else {}
                 base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
                 try:
@@ -103,12 +107,16 @@ def create_connectors_from_config(
                 except (TypeError, ValueError):
                     stage_offset = 0
 
-                local_rank = 0 if str(caller_stage_id) == "orchestrator" else get_connector_local_rank()
-                if str(caller_stage_id) == "orchestrator":
+                is_orchestrator = str(caller_stage_id) == "orchestrator"
+                local_rank = 0 if is_orchestrator else get_connector_local_rank()
+                # The orchestrator is a single global coordinator, not a
+                # per-stage replica, so it gets no replica offset of its own.
+                replica_id = 0 if is_orchestrator else get_omni_replica_id()
+                if is_orchestrator:
                     rank0_port = base_port + orchestrator_port_offset + stage_offset
                 else:
                     rank0_port = base_port + port_offset + stage_offset
-                adjusted_port = rank0_port + local_rank * KV_RANK_PORT_STRIDE
+                adjusted_port = rank0_port + replica_id * KV_REPLICA_PORT_STRIDE + local_rank * KV_RANK_PORT_STRIDE
                 extra["zmq_port"] = adjusted_port
 
                 if is_sender is not None:
@@ -177,17 +185,31 @@ def _apply_transfer_engine_ports(
     (used when ``can_put``) is ``base + from_stage`` for the outbound edge, i.e.
     ``base + this_stage``.  The upstream query port (used when ``can_get``) is
     ``base + upstream_stage`` unless ``sender_zmq_port`` is already set.
+
+    Both are offset by this worker's own Omni replica id (``KV_REPLICA_PORT_STRIDE``,
+    matching the formula ``kv_zmq_port`` already uses for KV-transfer connectors)
+    so co-located replicas of the same stage bind distinct ports instead of
+    colliding. The ``can_get`` fallback assumes replica N of this stage talks to
+    replica N of the upstream stage — the same simplifying assumption implicit
+    in this formula elsewhere in the codebase. If replicas are not matched 1:1
+    across stages, callers must set ``sender_zmq_port`` explicitly rather than
+    relying on this fallback.
     """
+    # Local import to avoid a circular import: kv_utils imports the port
+    # constants from this module.
+    from .kv_utils import get_omni_replica_id
+
     base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
     local_rank = get_connector_local_rank()
-    rank_offset = local_rank * KV_RANK_PORT_STRIDE
+    replica_id = get_omni_replica_id()
+    offset = replica_id * KV_REPLICA_PORT_STRIDE + local_rank * KV_RANK_PORT_STRIDE
 
     if can_put:
-        # Outbound edge: from_stage is this stage — bind base + this_stage (+ rank).
-        extra["zmq_port"] = base_port + _stage_port_offset(from_stage) + rank_offset
+        # Outbound edge: from_stage is this stage — bind base + this_stage (+ replica/rank).
+        extra["zmq_port"] = base_port + _stage_port_offset(from_stage) + offset
     if can_get:
         # Inbound edge: query the upstream sender's listen port.
-        computed_sender_port = base_port + _stage_port_offset(from_stage) + rank_offset
+        computed_sender_port = base_port + _stage_port_offset(from_stage) + offset
         if extra.get("sender_zmq_port") is None:
             extra["sender_zmq_port"] = computed_sender_port
         else:
@@ -244,29 +266,27 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
             )
 
         if is_get:
-            stage_connectors_config[f"from_stage_{from_stage}"] = {
-                "spec": {"name": spec.name, "extra": extra}
-            }
+            stage_connectors_config[f"from_stage_{from_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
         if is_put:
             # Outbound edges for every stage (not only stage 0) so middle-stage
             # duplex merge and stage-0 sender spec extraction both work.
-            stage_connectors_config[f"to_stage_{to_stage}"] = {
-                "spec": {"name": spec.name, "extra": dict(extra)}
-            }
+            stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": dict(extra)}}
 
     return stage_connectors_config
 
 
 def merge_stage_connector_specs(stage_connectors_cfg: dict[str, Any]) -> dict[str, Any]:
-    """Merge per-edge stage connector entries into one duplex-capable spec.
+    """Resolve per-edge stage connector entries into a single connector spec.
 
-    Incoming edges contribute ``can_get`` + ``sender_host`` / ``sender_zmq_port``.
-    Outgoing edges contribute ``can_put`` + local listen ``zmq_port``.
-    Capabilities are OR-merged so a middle stage becomes duplex.
-
-    When inbound and outbound edges use different connector types (e.g.
-    Mooncake receive + SharedMemory send on a colocated middle stage), return
-    a ``CompositeOmniConnector`` wrapping both instead of raising.
+    A stage with only one edge (stage 0, or the last stage) returns that
+    edge's spec unchanged. A stage with two edges (inbound + outbound)
+    always returns a ``CompositeOmniConnector`` spec wrapping a distinct
+    ``get_connector`` (inbound) and ``put_connector`` (outbound) — even when
+    both edges use the same connector type. Each edge keeps its own
+    ``extra`` untouched (ports, ``rank_mapping``, etc.), so a middle stage
+    with different TP ratios on its two edges is expressed correctly instead
+    of collapsing into one duplex instance that can only hold one
+    direction's config.
     """
     if not stage_connectors_cfg:
         return {}
@@ -290,61 +310,31 @@ def merge_stage_connector_specs(stage_connectors_cfg: dict[str, Any]) -> dict[st
     if not edge_specs:
         return {}
 
-    names = {name for name, _, _, _ in edge_specs}
-    if len(names) > 1:
-        return _merge_heterogeneous_stage_connector_specs(edge_specs)
+    if len(edge_specs) > 1:
+        return _build_dual_stage_connector_spec(edge_specs)
 
-    merged_name = edge_specs[0][0]
-    merged_extra: dict[str, Any] = {}
-    can_put = False
-    can_get = False
-
-    for name, extra, edge_can_put, edge_can_get in edge_specs:
-        if not merged_extra:
-            merged_extra = extra
-        else:
-            # Keep shared backend knobs from the first edge; direction-specific
-            # fields are overwritten below from the matching edge.
-            for key, value in extra.items():
-                if key in {
-                    "can_put",
-                    "can_get",
-                    "role",
-                    "zmq_port",
-                    "sender_host",
-                    "sender_zmq_port",
-                }:
-                    continue
-                merged_extra.setdefault(key, value)
-
-        can_put = can_put or edge_can_put
-        can_get = can_get or edge_can_get
-
-        if edge_can_put and "zmq_port" in extra:
-            merged_extra["zmq_port"] = extra["zmq_port"]
-        if edge_can_get:
-            if extra.get("sender_host") is not None:
-                merged_extra["sender_host"] = extra["sender_host"]
-            if extra.get("sender_zmq_port") is not None:
-                merged_extra["sender_zmq_port"] = extra["sender_zmq_port"]
-
+    name, extra, can_put, can_get = edge_specs[0]
+    merged_extra = dict(extra)
     merged_extra["can_put"] = can_put
     merged_extra["can_get"] = can_get
     if can_put and not can_get:
-        merged_extra["role"] = "sender"
+        merged_extra.setdefault("role", "sender")
     elif can_get and not can_put:
-        merged_extra["role"] = "receiver"
-    else:
-        # Duplex: Mooncake uses can_put/can_get; drop a single-direction role.
-        merged_extra.pop("role", None)
+        merged_extra.setdefault("role", "receiver")
 
-    return {"name": merged_name, "extra": merged_extra}
+    return {"name": name, "extra": merged_extra}
 
 
-def _merge_heterogeneous_stage_connector_specs(
+def _build_dual_stage_connector_spec(
     edge_specs: list[tuple[str, dict[str, Any], bool, bool]],
 ) -> dict[str, Any]:
-    """Build a CompositeOmniConnector spec for mixed inbound/outbound types."""
+    """Build a CompositeOmniConnector spec wrapping a stage's two edges.
+
+    Always builds distinct ``get_connector`` / ``put_connector`` children —
+    one per edge — regardless of whether both edges use the same connector
+    type. This keeps each edge's config (ports, ``rank_mapping``, pool
+    sizing) fully independent instead of merging them into one instance.
+    """
     get_connector: dict[str, Any] | None = None
     put_connector: dict[str, Any] | None = None
 

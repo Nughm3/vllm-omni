@@ -1428,8 +1428,12 @@ class TestRankAwareKVRouting(unittest.TestCase):
     def _make_host(self, *, from_tp: int, to_tp: int, local_rank: int) -> MixinHost:
         host = MixinHost()
         host.init_omni_connectors(vllm_config=None, model_config=_make_model_config(stage_id=1))
-        host._from_tp = from_tp
-        host._to_tp = to_tp
+        # Both directions share the same topology here; these tests exercise
+        # recv-side and send-side routing independently, not asymmetric TP.
+        host._recv_from_tp = from_tp
+        host._recv_to_tp = to_tp
+        host._send_from_tp = from_tp
+        host._send_to_tp = to_tp
         host._local_rank = local_rank
         return host
 
@@ -1483,6 +1487,80 @@ class TestRankAwareKVRouting(unittest.TestCase):
         self.assertEqual(tuple(sliced["layer_blocks"]["key_cache"][0].shape), (2, 2, 3))
         expected = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)[:, 2:4, :]
         self.assertTrue(torch.equal(sliced["layer_blocks"]["key_cache"][0], expected))
+        host.shutdown_omni_connectors()
+
+
+class TestRankMappingResolutionFromConnectorConfig(unittest.TestCase):
+    """A stage's recv (inbound) and send (outbound) edges may have different
+    TP ratios. init_omni_connectors must resolve each independently from a
+    composite stage_connector_config, and must still support the flat
+    single-edge case (stage 0 / last stage) applying one mapping to both."""
+
+    def test_composite_spec_resolves_distinct_recv_and_send_tp(self):
+        model_config = _make_model_config(stage_id=1)
+        model_config.stage_connector_config = {
+            "name": "CompositeOmniConnector",
+            "extra": {
+                "can_put": True,
+                "can_get": True,
+                "get_connector": {
+                    "name": "MooncakeTransferEngineConnector",
+                    "extra": {"rank_mapping": {"from_tp": 4, "to_tp": 2}},
+                },
+                "put_connector": {
+                    "name": "MooncakeTransferEngineConnector",
+                    "extra": {"rank_mapping": {"from_tp": 2, "to_tp": 1}},
+                },
+            },
+        }
+
+        host = MixinHost()
+        with patch(
+            "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
+            return_value=MockConnector(),
+        ):
+            host.init_omni_connectors(vllm_config=None, model_config=model_config)
+
+        self.assertEqual(host._recv_from_tp, 4)
+        self.assertEqual(host._recv_to_tp, 2)
+        self.assertEqual(host._send_from_tp, 2)
+        self.assertEqual(host._send_to_tp, 1)
+
+        host.shutdown_omni_connectors()
+
+    def test_flat_single_edge_spec_applies_same_mapping_to_both(self):
+        """Regression guard: stage 0 / the last stage only has one edge, so
+        the flat spec's rank_mapping must still resolve for both recv and
+        send (there's no ambiguity with a single edge)."""
+        model_config = _make_model_config(stage_id=0)
+        model_config.stage_connector_config = {
+            "name": "MooncakeTransferEngineConnector",
+            "extra": {"can_put": True, "can_get": False, "rank_mapping": {"from_tp": 2, "to_tp": 1}},
+        }
+
+        host = MixinHost()
+        with patch(
+            "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
+            return_value=MockConnector(),
+        ):
+            host.init_omni_connectors(vllm_config=None, model_config=model_config)
+
+        self.assertEqual(host._recv_from_tp, 2)
+        self.assertEqual(host._recv_to_tp, 1)
+        self.assertEqual(host._send_from_tp, 2)
+        self.assertEqual(host._send_to_tp, 1)
+
+        host.shutdown_omni_connectors()
+
+    def test_missing_stage_connector_config_defaults_to_homogeneous(self):
+        host = MixinHost()
+        host.init_omni_connectors(vllm_config=None, model_config=_make_model_config(stage_id=0))
+
+        self.assertEqual(host._recv_from_tp, 1)
+        self.assertEqual(host._recv_to_tp, 1)
+        self.assertEqual(host._send_from_tp, 1)
+        self.assertEqual(host._send_to_tp, 1)
+
         host.shutdown_omni_connectors()
 
 

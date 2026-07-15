@@ -25,6 +25,37 @@ class OmniConnectorBase(ABC):
         """Whether ``get`` can return raw tensor/bytes without serialization."""
         return bool(self.supports_raw_data)
 
+    def allocate_buffer(
+        self,
+        size: int,
+        *,
+        dtype: Any | None = None,
+        shape: tuple[int, ...] | None = None,
+    ) -> Any | None:
+        """Allocate connector-owned transport storage when supported."""
+        return None
+
+    def stage_tensor(
+        self,
+        buffer: Any,
+        tensor: Any,
+        *,
+        ready_event: Any | None = None,
+    ) -> None:
+        """Copy a tensor into connector-owned storage."""
+        del ready_event
+        buffer.as_tensor(tensor.dtype, tuple(tensor.shape)).copy_(tensor)
+
+    def stage_tensors(
+        self,
+        pairs: list[tuple[Any, Any]],
+        *,
+        ready_event: Any | None = None,
+    ) -> None:
+        """Copy multiple tensors into connector-owned storage."""
+        for buffer, tensor in pairs:
+            self.stage_tensor(buffer, tensor, ready_event=ready_event)
+
     @abstractmethod
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """Store Python object, internal serialization handled by connector.

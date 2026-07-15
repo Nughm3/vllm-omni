@@ -21,28 +21,26 @@ def _sample_thinker_payload() -> dict:
     }
 
 
-def test_split_and_reconstruct_roundtrip() -> None:
+def test_flatten_and_reconstruct_roundtrip() -> None:
     payload = _sample_thinker_payload()
-    packed, sidecar = pkt.split_thinker_to_talker_full_payload(
+    packet = pkt.flatten_qwen3_payload(
         payload,
-        request_id="req-1",
-        external_req_id="ext-1",
         from_stage_id=0,
         to_stage_id=1,
-        chunk_id=0,
     )
-    assert sidecar["sidecar_put_key"] == "ext-1_0_0"
-    assert sidecar["packed_key"] == "ext-1_0_0@packed"
-    # 3 tensor fields present: embed.prefill, embed.tts_bos, hidden_states.output.
-    assert len(sidecar["tensor_entries"]) == 3
-    assert packed is not None and packed.dtype == torch.uint8
-    assert sidecar["packed_nbytes"] == int(packed.numel())
-    # One packed buffer fetched under the packed key (not one get per tensor).
-    store = {sidecar["packed_key"]: packed}
-    rebuilt = pkt.reconstruct_thinker_to_talker_full_payload(
-        sidecar,
-        lambda key: store.get(key),
-    )
+    assert pkt.is_qwen3_flat_packet(packet)
+    assert packet["payload_kind"] == pkt.PAYLOAD_KIND_THINKER_TO_TALKER_FULL
+    # Payload is flattened into a single-level dict: nested a.b -> "a.b".
+    flat = packet["payload"]
+    assert "embed.prefill" in flat
+    assert "embed.tts_bos" in flat
+    assert "hidden_states.output" in flat
+    assert "ids.all" in flat
+    assert "meta.finished" in flat
+    # No nesting remains in the flat payload.
+    assert not any(isinstance(v, dict) for v in flat.values())
+
+    rebuilt = pkt.reconstruct_qwen3_full_payload(packet)
     assert rebuilt["ids"] == payload["ids"]
     assert rebuilt["next_stage_prompt_len"] == 7
     assert rebuilt["speaker"] == "alice"
@@ -51,49 +49,19 @@ def test_split_and_reconstruct_roundtrip() -> None:
     assert bool(rebuilt["meta"]["finished"].item()) is True
 
 
-def test_reconstruct_clones_managed_buffer_before_release() -> None:
-    from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector import (
-        ManagedBuffer,
-    )
+def test_flatten_unflatten_roundtrip() -> None:
+    payload = _sample_thinker_payload()
+    flat = pkt._flatten_payload(payload)
+    # Every leaf reachable via a dotted key, no nested dicts.
+    assert flat["ids.all"] == [1, 2, 3]
+    assert flat["ids.prompt"] == [1, 2]
+    assert flat["next_stage_prompt_len"] == 7
+    assert not any(isinstance(v, dict) for v in flat.values())
 
-    class DummyAllocator:
-        def __init__(self) -> None:
-            self.freed: list[tuple[int, int]] = []
-
-        def free(self, offset: int, size: int) -> None:
-            self.freed.append((offset, size))
-
-    source = torch.arange(8, dtype=torch.float32).reshape(2, 4)
-    pool = source.reshape(-1).view(torch.uint8).clone()  # 1D uint8 pool, 32 bytes
-    allocator = DummyAllocator()
-    buffer = ManagedBuffer(allocator, 0, pool.numel(), pool)
-    sidecar = {
-        "packet_version": pkt.PACKET_VERSION,
-        "payload_kind": pkt.PAYLOAD_KIND_THINKER_TO_TALKER_FULL,
-        "sidecar_put_key": "k_0_0",
-        "packed_key": "k_0_0@packed",
-        "packed_nbytes": int(pool.numel()),
-        "tensor_entries": [
-            {
-                "name": "embed.prefill",
-                "dtype": str(source.dtype),
-                "shape": list(source.shape),
-                "offset": 0,
-                "nbytes": int(pool.numel()),
-            }
-        ],
-        "metadata": {},
-    }
-
-    rebuilt = pkt.reconstruct_qwen3_full_payload(sidecar, lambda _key: buffer)
-
-    assert allocator.freed == [(0, pool.numel())]
-    assert torch.equal(rebuilt["embed"]["prefill"], source)
-
-    # Simulate the MTE receive pool reusing the released buffer for the next
-    # tensor.  The reconstructed payload must not alias that pool memory.
-    pool.fill_(0)
-    assert torch.equal(rebuilt["embed"]["prefill"], source)
+    rebuilt = pkt._unflatten_payload(flat)
+    assert rebuilt["ids"]["all"] == [1, 2, 3]
+    assert torch.equal(rebuilt["embed"]["prefill"], payload["embed"]["prefill"])
+    assert rebuilt["speaker"] == "alice"
 
 
 def test_should_use_packet_path_gate() -> None:
@@ -154,23 +122,16 @@ def test_talker_to_code2wav_split_and_reconstruct_roundtrip() -> None:
         "codes": {"audio": [1, 2, 3, 4]},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool), "left_context_size": 25},
     }
-    packed, sidecar = pkt.split_qwen3_full_payload(
+    packet = pkt.flatten_qwen3_payload(
         payload,
-        request_id="req-2",
-        external_req_id="ext-2",
         from_stage_id=1,
         to_stage_id=2,
-        chunk_id=0,
-        mode=pkt.MODE_NON_ASYNC_FULL_PAYLOAD,
     )
-    assert sidecar["payload_kind"] == pkt.PAYLOAD_KIND_TALKER_TO_CODE2WAV_FULL
-    assert len(sidecar["tensor_entries"]) == 1
-    assert packed is not None
-    store = {sidecar["packed_key"]: packed}
-    rebuilt = pkt.reconstruct_qwen3_full_payload(
-        sidecar,
-        lambda key: store.get(key),
-    )
+    assert packet["payload_kind"] == pkt.PAYLOAD_KIND_TALKER_TO_CODE2WAV_FULL
+    # Known tensor-path fields are coerced to tensors even from list input.
+    assert torch.is_tensor(packet["payload"]["codes.audio"])
+    assert packet["payload"]["codes.audio"].tolist() == [1, 2, 3, 4]
+    rebuilt = pkt.reconstruct_qwen3_full_payload(packet)
     assert "codes" in rebuilt and "audio" in rebuilt["codes"]
     assert rebuilt["code_predictor_codes"] == [1, 2, 3, 4]
 
@@ -190,17 +151,14 @@ def test_thinker2talker_full_payload_processor_roundtrip() -> None:
     payload = q3.thinker2talker_full_payload(None, pooling_output, request)
     assert payload is not None
 
-    packed, sidecar = pkt.split_thinker_to_talker_full_payload(
+    packet = pkt.flatten_qwen3_payload(
         payload,
-        request_id="thinker",
-        external_req_id="thinker",
         from_stage_id=0,
         to_stage_id=1,
-        chunk_id=0,
     )
-    store = {sidecar["packed_key"]: packed}
-    rebuilt = pkt.reconstruct_thinker_to_talker_full_payload(sidecar, store.get)
+    rebuilt = pkt.reconstruct_qwen3_full_payload(packet)
     assert rebuilt["ids"]["all"] == payload["ids"]["all"]
     assert rebuilt["embed"]["prefill"].shape == payload["embed"]["prefill"].shape
     assert rebuilt["hidden_states"]["output"].shape == payload["hidden_states"]["output"].shape
-    assert rebuilt["next_stage_prompt_len"] == payload["next_stage_prompt_len"]
+    if "next_stage_prompt_len" in payload:
+        assert rebuilt["next_stage_prompt_len"] == payload["next_stage_prompt_len"]

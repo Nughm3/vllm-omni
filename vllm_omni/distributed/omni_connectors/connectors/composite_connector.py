@@ -37,19 +37,12 @@ class CompositeOmniConnector(OmniConnectorBase):
         put_spec = config.get("put_connector")
 
         if get_spec:
-            self._get_connector = OmniConnectorFactory.create_connector(
-                self._child_spec(get_spec, stage_id)
-            )
+            self._get_connector = OmniConnectorFactory.create_connector(self._child_spec(get_spec, stage_id))
         if put_spec:
-            self._put_connector = OmniConnectorFactory.create_connector(
-                self._child_spec(put_spec, stage_id)
-            )
+            self._put_connector = OmniConnectorFactory.create_connector(self._child_spec(put_spec, stage_id))
 
         if self._get_connector is None and self._put_connector is None:
-            raise ValueError(
-                "CompositeOmniConnector requires at least one of "
-                "get_connector / put_connector"
-            )
+            raise ValueError("CompositeOmniConnector requires at least one of get_connector / put_connector")
 
         logger.info(
             "CompositeOmniConnector: get=%s put=%s",
@@ -79,9 +72,39 @@ class CompositeOmniConnector(OmniConnectorBase):
             return False
         return bool(getattr(self._get_connector, "supports_raw_data", False))
 
-    def put(
-        self, from_stage: str, to_stage: str, put_key: str, data: Any
-    ) -> tuple[bool, int, dict[str, Any] | None]:
+    def allocate_buffer(
+        self,
+        size: int,
+        *,
+        dtype: Any | None = None,
+        shape: tuple[int, ...] | None = None,
+    ) -> Any | None:
+        if self._put_connector is None:
+            return None
+        return self._put_connector.allocate_buffer(size, dtype=dtype, shape=shape)
+
+    def stage_tensor(
+        self,
+        buffer: Any,
+        tensor: Any,
+        *,
+        ready_event: Any | None = None,
+    ) -> None:
+        if self._put_connector is None:
+            raise RuntimeError("CompositeOmniConnector has no put_connector")
+        self._put_connector.stage_tensor(buffer, tensor, ready_event=ready_event)
+
+    def stage_tensors(
+        self,
+        pairs: list[tuple[Any, Any]],
+        *,
+        ready_event: Any | None = None,
+    ) -> None:
+        if self._put_connector is None:
+            raise RuntimeError("CompositeOmniConnector has no put_connector")
+        self._put_connector.stage_tensors(pairs, ready_event=ready_event)
+
+    def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         if self._put_connector is None:
             raise RuntimeError("CompositeOmniConnector has no put_connector")
         return self._put_connector.put(from_stage, to_stage, put_key, data)

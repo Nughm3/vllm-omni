@@ -4,11 +4,20 @@
 import threading
 
 import pytest
+import torch
 from pytest_mock import MockerFixture
 
+from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector import (
+    MooncakeTransferEngineConnector,
+)
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+from vllm_omni.distributed.omni_connectors.utils.memory_pool import (
+    MANAGED_BUFFER_LEASES_KEY,
+    BufferAllocator,
+    ManagedBuffer,
+)
 from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -245,3 +254,107 @@ def test_mooncake_cpu_copy_does_not_create_cuda_events(mocker: MockerFixture):
 
     dst.copy_.assert_called_once_with(src)
     event.assert_not_called()
+
+
+def _make_uninitialized_mooncake_connector(pool_size: int = 64 * 1024):
+    connector = object.__new__(MooncakeTransferEngineConnector)
+    connector.pool = torch.empty(pool_size, dtype=torch.uint8)
+    connector.base_ptr = connector.pool.data_ptr()
+    connector.allocator = BufferAllocator(pool_size, alignment=8)
+    connector._local_buffers = {}
+    connector._local_buffers_lock = threading.Lock()
+    connector._metrics = {
+        "puts": 0,
+        "gets": 0,
+        "bytes_transferred": 0,
+        "errors": 0,
+        "timeouts": 0,
+    }
+    connector.host = "127.0.0.1"
+    connector.zmq_port = 50051
+    return connector
+
+
+def test_mooncake_flat_packet_uses_one_multisegment_put():
+    connector = _make_uninitialized_mooncake_connector()
+    first = connector.allocate_buf(16, dtype=torch.float32, shape=(2, 2))
+    second = connector.allocate_buf(8, dtype=torch.int64, shape=(1,))
+    first.as_tensor(torch.float32, (2, 2)).copy_(torch.arange(4, dtype=torch.float32).reshape(2, 2))
+    second.as_tensor(torch.int64, (1,)).fill_(7)
+    packet = {
+        "__qwen3_flat__": True,
+        "packet_version": 1,
+        "payload_kind": "thinker_to_talker_full_payload",
+        "payload": {
+            "embed.prefill": first,
+            "hidden_states.output": second,
+            "ids.all": [1, 2],
+        },
+    }
+
+    success, total_size, metadata = connector._put_impl("request@0_1", packet)
+
+    assert success
+    assert metadata["is_segmented"] is True
+    assert metadata["segment_lengths"][1:] == [16, 8]
+    assert total_size == sum(metadata["segment_lengths"])
+    src_addrs, lengths, holders, should_release, is_fast_path, _ = connector._local_buffers["request@0_1"]
+    assert len(src_addrs) == len(lengths) == len(holders) == 3
+    assert should_release is True
+    assert is_fast_path is True
+
+
+def test_mooncake_segmented_payload_restores_typed_tensor_views():
+    connector = _make_uninitialized_mooncake_connector()
+    first = connector.allocate_buf(16, dtype=torch.float32, shape=(2, 2))
+    second = connector.allocate_buf(8, dtype=torch.int64, shape=(1,))
+    first.as_tensor(torch.float32, (2, 2)).copy_(torch.arange(4, dtype=torch.float32).reshape(2, 2))
+    second.as_tensor(torch.int64, (1,)).fill_(7)
+    packet = {
+        "__qwen3_flat__": True,
+        "packet_version": 1,
+        "payload_kind": "thinker_to_talker_full_payload",
+        "payload": {
+            "embed.prefill": first,
+            "hidden_states.output": second,
+            "ids.all": [1, 2],
+        },
+    }
+    success, _, _ = connector._put_impl("request@0_1", packet)
+    assert success
+    _, _, holders, _, _, _ = connector._local_buffers["request@0_1"]
+    sidecar = holders[0].to_bytes()
+
+    restored = connector._restore_segmented_payload(sidecar, holders[1:])
+
+    assert restored["payload"]["ids.all"] == [1, 2]
+    assert torch.equal(
+        restored["payload"]["embed.prefill"],
+        torch.arange(4, dtype=torch.float32).reshape(2, 2),
+    )
+    assert restored["payload"]["hidden_states.output"].dtype == torch.int64
+    assert restored["payload"]["hidden_states.output"].tolist() == [7]
+    assert restored[MANAGED_BUFFER_LEASES_KEY] == holders[1:]
+
+
+def test_managed_buffer_slices_keep_shared_allocation_alive():
+    allocator = BufferAllocator(32, alignment=8)
+    pool = torch.empty(32, dtype=torch.uint8)
+    parent = ManagedBuffer(
+        allocator,
+        allocator.alloc(32),
+        32,
+        pool,
+        dtype=torch.float32,
+        shape=(8,),
+    )
+    first = parent.slice(0, 16, dtype=torch.float32, shape=(4,))
+    second = parent.slice(16, 16, dtype=torch.float32, shape=(4,))
+
+    parent.release()
+    first.release()
+    with pytest.raises(MemoryError):
+        allocator.alloc(32)
+
+    second.release()
+    assert allocator.alloc(32) == 0

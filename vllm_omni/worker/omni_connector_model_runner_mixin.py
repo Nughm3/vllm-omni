@@ -27,6 +27,10 @@ from vllm.logger import init_logger
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+from vllm_omni.distributed.omni_connectors.utils.memory_pool import (
+    MANAGED_BUFFER_LEASES_KEY,
+    ManagedBuffer,
+)
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.payload_span import (
     get_tensor_span,
@@ -165,6 +169,8 @@ class OmniConnectorModelRunnerMixin:
         # visibility and avoids mixing connector I/O with model runtime
         # ownership.
         self._local_stage_payload_cache: dict[str, dict[str, Any]] = {}
+        self._received_connector_buffer_leases: dict[str, list[ManagedBuffer]] = {}
+        self._inactive_recv_req_ids: set[str] = set()
         # Lightweight scheduling metadata pending delivery to the Scheduler.
         self._local_request_metadata: dict[str, dict[str, Any]] = {}
 
@@ -175,6 +181,7 @@ class OmniConnectorModelRunnerMixin:
         # -- full_payload_mode: accumulate latest pooler_output per request,
         #    send only when the request finishes (next-cycle flush) --
         self._pending_full_payload_send: dict[str, tuple[Any, ...]] = {}
+        self._materialized_connector_buffers: dict[str, list[ManagedBuffer]] = {}
 
         # -- KV sent accumulator --
         self._kv_sent_req_ids: list[str] = []
@@ -229,6 +236,10 @@ class OmniConnectorModelRunnerMixin:
                 self._omni_connector.close()
             except Exception:
                 pass
+        for leases in self._received_connector_buffer_leases.values():
+            for buffer in leases:
+                buffer.release()
+        self._received_connector_buffer_leases.clear()
 
     def cleanup_finished_request(self, req_id: str) -> None:
         """Clean up per-request state after a request is fully finished.
@@ -269,6 +280,8 @@ class OmniConnectorModelRunnerMixin:
                     exc_info=True,
                 )
 
+        self._release_materialized_connector_buffers(req_id)
+        self._cleanup_recv_delivery_state(req_id)
         ext_id = self._request_ids_mapping.pop(req_id, None)
         keys_to_clean: list[str] = [req_id]
         if ext_id is not None and ext_id != req_id:
@@ -289,7 +302,6 @@ class OmniConnectorModelRunnerMixin:
             self._kv_active_transfers.discard(req_id)
             self._kv_completed_transfers.discard(req_id)
             self._kv_triggered_requests.discard(req_id)
-        self._cleanup_recv_delivery_state(req_id)
 
     def drop_inactive_request_delivery_state(self, req_id: str) -> None:
         """Clear recv-side state for inactive requests."""
@@ -310,11 +322,18 @@ class OmniConnectorModelRunnerMixin:
 
     def _cleanup_recv_delivery_state(self, req_id: str) -> None:
         """Clear recv-side delivery-cycle state."""
+        leases: list[ManagedBuffer] = []
         if hasattr(self, "_lock"):
             with self._lock:
+                self._inactive_recv_req_ids.add(req_id)
+                leases = self._received_connector_buffer_leases.pop(req_id, [])
                 self._clear_recv_delivery_state(req_id)
         else:
+            self._inactive_recv_req_ids.add(req_id)
+            leases = self._received_connector_buffer_leases.pop(req_id, [])
             self._clear_recv_delivery_state(req_id)
+        for buffer in leases:
+            buffer.release()
 
     def _clear_recv_delivery_state(self, req_id: str) -> None:
         self._get_req_chunk.pop(req_id, None)
@@ -786,104 +805,98 @@ class OmniConnectorModelRunnerMixin:
             transfer_mode=transfer_mode,
         )
 
-    def _enqueue_full_payload_packet_send(
+    def _build_qwen3_packet_send_task(
         self,
         *,
         req_id: str,
-        external_req_id: str,
         connector_put_key: str,
         payload: dict[str, Any],
         next_stage_id: int,
-        chunk_id: int,
-        packet_mode: str | None = None,
-    ) -> None:
-        """Enqueue an unpacked payload; packing runs on the save thread.
+    ) -> dict[str, Any]:
+        """Build a send task whose ``data`` is a flattened Qwen3 packet.
 
-        Keeps ``pack_qwen3_full_payload`` (tensor memcpy into one buffer) off the
-        model / scheduler thread. The save thread expands this into packed-buffer
-        put + sidecar put before the receiver can see the sidecar.
+        Flattening a Qwen3 payload collapses nested paths (``a.b`` -> ``"a.b"``)
+        into one self-contained dict. Raw-data connectors may stage its tensor
+        leaves into multiple transport buffers, but the mixin submits one
+        atomic connector put under ``connector_put_key``.
         """
         from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
-            MODE_ASYNC_CHUNK,
+            flatten_qwen3_payload,
         )
 
-        task = {
-            "packet": True,
+        packet = flatten_qwen3_payload(
+            payload,
+            from_stage_id=self._stage_id,
+            to_stage_id=next_stage_id,
+        )
+        packet = self._reuse_materialized_connector_buffers(req_id, packet)
+        cuda_tensor = self._find_cuda_tensor(packet)
+        ready_event = None
+        if cuda_tensor is not None:
+            with torch.cuda.device(cuda_tensor.device):
+                ready_event = torch.cuda.Event()
+                ready_event.record(torch.cuda.current_stream(cuda_tensor.device))
+        return {
             "stage_id": self._stage_id,
             "next_stage_id": next_stage_id,
             "put_key": connector_put_key,
-            "data": payload,
+            "data": packet,
             "request_id": req_id,
-            "external_req_id": external_req_id,
-            "chunk_id": chunk_id,
-            "packet_mode": packet_mode or MODE_ASYNC_CHUNK,
+            "stage_connector_buffers": True,
+            "ready_event": ready_event,
         }
-        with self._lock:
-            self._pending_save_reqs.setdefault(req_id, deque()).append(task)
-            self._pending_save_counts[req_id] += 1
 
-    def _expand_packet_send_task(self, task: dict[str, Any]) -> list[dict[str, Any]]:
-        """Pack a deferred packet task into put tasks (bg-thread only)."""
-        from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
-            pack_qwen3_full_payload,
-        )
+    @staticmethod
+    def _find_cuda_tensor(value: Any) -> torch.Tensor | None:
+        if isinstance(value, torch.Tensor):
+            return value if value.is_cuda else None
+        if isinstance(value, dict):
+            values = value.values()
+        elif isinstance(value, (list, tuple)):
+            values = value
+        else:
+            return None
+        for item in values:
+            tensor = OmniConnectorModelRunnerMixin._find_cuda_tensor(item)
+            if tensor is not None:
+                return tensor
+        return None
 
-        payload = task.get("data")
-        if not isinstance(payload, dict):
-            raise TypeError(f"packet send task missing payload dict: {type(payload)!r}")
-
-        packed, sidecar = pack_qwen3_full_payload(
-            payload,
-            request_id=str(task["request_id"]),
-            external_req_id=str(task["external_req_id"]),
-            from_stage_id=int(task["stage_id"]),
-            to_stage_id=int(task["next_stage_id"]),
-            chunk_id=int(task["chunk_id"]),
-            mode=str(task.get("packet_mode") or "async_chunk"),
-        )
-        # Packed buffer first, then sidecar. Once the receiver sees the sidecar,
-        # the packed buffer must already be available to pull.
-        puts: list[dict[str, Any]] = []
-        if packed is not None:
-            puts.append(
-                {
-                    "stage_id": task["stage_id"],
-                    "next_stage_id": task["next_stage_id"],
-                    "put_key": sidecar["packed_key"],
-                    "data": packed,
-                    "request_id": task["request_id"],
-                }
-            )
-        puts.append(
-            {
-                "stage_id": task["stage_id"],
-                "next_stage_id": task["next_stage_id"],
-                "put_key": task["put_key"],
-                "data": sidecar,
-                "request_id": task["request_id"],
-            }
-        )
-        return puts
-
-    def _reconstruct_qwen3_packet_payload(
+    def _stage_connector_packet_buffers(
         self,
-        connector: OmniConnectorBase,
-        sidecar: dict[str, Any],
-        from_stage: str,
-        to_stage: str,
-    ) -> dict[str, Any]:
-        from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
-            reconstruct_qwen3_full_payload,
-        )
+        value: Any,
+        *,
+        ready_event: torch.cuda.Event | None,
+    ) -> Any:
+        pairs: list[tuple[ManagedBuffer, torch.Tensor]] = []
 
-        def get_packed(packed_key: str) -> Any:
-            result = connector.get(from_stage, to_stage, packed_key)
-            if result is None:
-                return None
-            data, _size = result
-            return data
+        def stage(item: Any) -> Any:
+            if isinstance(item, torch.Tensor):
+                if item.numel() == 0:
+                    return item
+                shape = tuple(int(dim) for dim in item.shape)
+                buffer = self._allocate_connector_buffer(
+                    item.nbytes,
+                    dtype=item.dtype,
+                    shape=shape,
+                )
+                if buffer is None:
+                    return item
+                pairs.append((buffer, item))
+                return buffer
+            if isinstance(item, dict):
+                return {key: stage(nested) for key, nested in item.items()}
+            if isinstance(item, list):
+                return [stage(nested) for nested in item]
+            if isinstance(item, tuple):
+                return tuple(stage(nested) for nested in item)
+            return item
 
-        return reconstruct_qwen3_full_payload(sidecar, get_packed)
+        staged = stage(value)
+        connector = self._omni_connector
+        if connector is not None and pairs:
+            connector.stage_tensors(pairs, ready_event=ready_event)
+        return staged
 
     def _should_accumulate_full_payload_output(self) -> bool:
         """Gate send-side full-payload output accumulation only.
@@ -1069,6 +1082,131 @@ class OmniConnectorModelRunnerMixin:
 
         self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
 
+    def _allocate_connector_buffer(
+        self,
+        size: int,
+        *,
+        dtype: torch.dtype,
+        shape: tuple[int, ...],
+    ) -> ManagedBuffer | None:
+        connector = self._omni_connector
+        if connector is None:
+            return None
+        try:
+            buffer = connector.allocate_buffer(size, dtype=dtype, shape=shape)
+        except MemoryError:
+            logger.warning(
+                "[Stage-%s] connector buffer pool exhausted for %s bytes; using tensor fallback",
+                self._stage_id,
+                size,
+            )
+            return None
+        return buffer if isinstance(buffer, ManagedBuffer) else None
+
+    def _release_materialized_connector_buffers(self, req_id: str) -> None:
+        for buffer in self._materialized_connector_buffers.pop(req_id, []):
+            buffer.release()
+
+    def _materialize_full_payload_entry_for_request(
+        self,
+        req_id: str,
+        entry: tuple[Any, ...],
+    ) -> tuple[Any, Any]:
+        if len(entry) == 2 or not self._should_use_qwen3_packet_path(transfer_mode="non_async_full_payload"):
+            return self._materialize_full_payload_entry(entry)
+
+        chunks, latest, _rows, request = entry
+        output = dict(latest)
+        buffers: list[ManagedBuffer] = []
+        for key, tensors in chunks.items():
+            if not tensors:
+                continue
+            first = tensors[0]
+            shape = (
+                tuple(first.shape)
+                if len(tensors) == 1
+                else (
+                    sum(int(tensor.shape[0]) for tensor in tensors),
+                    *first.shape[1:],
+                )
+            )
+            size = first.element_size()
+            for dim in shape:
+                size *= int(dim)
+            buffer = self._allocate_connector_buffer(
+                size,
+                dtype=first.dtype,
+                shape=shape,
+            )
+            if buffer is None:
+                output[key] = first if len(tensors) == 1 else torch.cat(tensors, dim=0)
+                continue
+            if any(tensor.device != buffer.pool_tensor.device for tensor in tensors):
+                buffer.release()
+                output[key] = first if len(tensors) == 1 else torch.cat(tensors, dim=0)
+                continue
+
+            destination = buffer.as_tensor(first.dtype, shape)
+            if len(tensors) == 1:
+                destination.copy_(first)
+            else:
+                torch.cat(tensors, dim=0, out=destination)
+            output[key] = destination
+            buffers.append(buffer)
+
+        if buffers:
+            cuda_buffer = next((buffer for buffer in buffers if buffer.pool_tensor.is_cuda), None)
+            if cuda_buffer is not None:
+                with torch.cuda.device(cuda_buffer.pool_tensor.device):
+                    ready_event = torch.cuda.Event()
+                    ready_event.record(torch.cuda.current_stream(cuda_buffer.pool_tensor.device))
+                for buffer in buffers:
+                    if buffer.pool_tensor.is_cuda:
+                        buffer.ready_event = ready_event
+            self._materialized_connector_buffers[req_id] = buffers
+        return output, request
+
+    def _reuse_materialized_connector_buffers(
+        self,
+        req_id: str,
+        value: Any,
+    ) -> Any:
+        buffers = self._materialized_connector_buffers.pop(req_id, [])
+        if not buffers:
+            return value
+        used_owner_ids: set[int] = set()
+
+        def reuse(item: Any) -> Any:
+            if isinstance(item, torch.Tensor) and item.is_contiguous() and item.numel() > 0:
+                start = item.data_ptr()
+                size = item.nbytes
+                for buffer in buffers:
+                    buffer_start = buffer.pool_tensor.data_ptr() + buffer.offset
+                    if buffer_start <= start and start + size <= buffer_start + buffer.size:
+                        view = buffer.slice(
+                            start - buffer_start,
+                            size,
+                            dtype=item.dtype,
+                            shape=tuple(int(dim) for dim in item.shape),
+                        )
+                        view.ready_event = buffer.ready_event
+                        used_owner_ids.add(id(buffer))
+                        return view
+                return item
+            if isinstance(item, dict):
+                return {key: reuse(nested) for key, nested in item.items()}
+            if isinstance(item, list):
+                return [reuse(nested) for nested in item]
+            if isinstance(item, tuple):
+                return tuple(reuse(nested) for nested in item)
+            return item
+
+        reused = reuse(value)
+        for buffer in buffers:
+            if id(buffer) not in used_owner_ids:
+                buffer.release()
+        return reused
+
     def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
         """Send accumulated full_payload outputs for requests that just finished."""
         pending_req_ids = set(self._pending_full_payload_send.keys())
@@ -1085,7 +1223,8 @@ class OmniConnectorModelRunnerMixin:
         for req_id in finished_req_ids:
             entry = self._pending_full_payload_send.pop(req_id, None)
             if entry is not None:
-                to_send[req_id] = self._materialize_full_payload_entry(entry)
+                to_send[req_id] = self._materialize_full_payload_entry_for_request(req_id, entry)
+
         logger.debug("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
         if to_send:
             self.send_full_payload_outputs(scheduler_output=None, outputs=to_send)
@@ -1131,9 +1270,11 @@ class OmniConnectorModelRunnerMixin:
                     pooling_output=raw_output,
                 )
                 if payload is None:
+                    self._release_materialized_connector_buffers(req_id)
                     continue
             if payload is None:
                 logger.debug("[Stage-%s] send_full_payload_outputs: payload is None for %s", self._stage_id, req_id)
+                self._release_materialized_connector_buffers(req_id)
                 continue
             if isinstance(payload, dict):
                 audio_codes = self._payload_audio_codes(payload)
@@ -1178,22 +1319,15 @@ class OmniConnectorModelRunnerMixin:
                 )
             )
             if use_packet:
-                self._enqueue_full_payload_packet_send(
+                assert payload_dict is not None
+                task = self._build_qwen3_packet_send_task(
                     req_id=req_id,
-                    external_req_id=external_req_id,
                     connector_put_key=connector_put_key,
                     payload=payload_dict,
                     next_stage_id=next_stage_id,
-                    chunk_id=chunk_id,
-                    packet_mode="non_async_full_payload",
-                )
-                logger.debug(
-                    "[Stage-%s] send_full_payload_outputs: packet_put req=%s key=%s mode=non_async_full_payload",
-                    self._stage_id,
-                    req_id,
-                    connector_put_key,
                 )
             else:
+                self._release_materialized_connector_buffers(req_id)
                 task = {
                     "stage_id": self._stage_id,
                     "next_stage_id": next_stage_id,
@@ -1201,9 +1335,9 @@ class OmniConnectorModelRunnerMixin:
                     "data": payload,
                     "request_id": req_id,
                 }
-                with self._lock:
-                    self._pending_save_reqs.setdefault(req_id, deque()).append(task)
-                    self._pending_save_counts[req_id] += 1
+            with self._lock:
+                self._pending_save_reqs.setdefault(req_id, deque()).append(task)
+                self._pending_save_counts[req_id] += 1
             sent_ids.append(req_id)
         if sent_ids:
             self._work_available.set()
@@ -1254,6 +1388,7 @@ class OmniConnectorModelRunnerMixin:
         ext = getattr(request, "external_req_id", None)
         self._request_ids_mapping[request_id] = ext if ext is not None else request_id
         with self._lock:
+            self._inactive_recv_req_ids.discard(request_id)
             if request_id in self._stage_recv_req_ids:
                 return
             # Don't re-register if the finish sentinel was already received
@@ -1360,13 +1495,11 @@ class OmniConnectorModelRunnerMixin:
 
         if use_packet:
             assert payload_dict is not None
-            self._enqueue_full_payload_packet_send(
+            task = self._build_qwen3_packet_send_task(
                 req_id=request_id,
-                external_req_id=request_id,
                 connector_put_key=connector_put_key,
                 payload=payload_dict,
                 next_stage_id=next_stage_id,
-                chunk_id=chunk_id,
             )
         else:
             task = {
@@ -1376,9 +1509,9 @@ class OmniConnectorModelRunnerMixin:
                 "data": payload_data,
                 "request_id": request_id,
             }
-            with self._lock:
-                self._pending_save_reqs.setdefault(request_id, deque()).append(task)
-                self._pending_save_counts[request_id] += 1
+        with self._lock:
+            self._pending_save_reqs.setdefault(request_id, deque()).append(task)
+            self._pending_save_counts[request_id] += 1
         self._work_available.set()
         return True
 
@@ -1994,18 +2127,24 @@ class OmniConnectorModelRunnerMixin:
         if not payload_data:
             return False
 
-        if isinstance(payload_data, dict) and self._should_use_qwen3_packet_path(for_recv=True):
-            from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import is_packet_sidecar
+        received_leases: list[ManagedBuffer] = []
+        if isinstance(payload_data, dict):
+            raw_leases = payload_data.pop(MANAGED_BUFFER_LEASES_KEY, [])
+            if isinstance(raw_leases, list):
+                received_leases = [buffer for buffer in raw_leases if isinstance(buffer, ManagedBuffer)]
 
-            if is_packet_sidecar(payload_data):
+        if isinstance(payload_data, dict) and self._should_use_qwen3_packet_path(for_recv=True):
+            from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
+                is_qwen3_flat_packet,
+                reconstruct_qwen3_full_payload,
+            )
+
+            if is_qwen3_flat_packet(payload_data):
                 try:
-                    payload_data = self._reconstruct_qwen3_packet_payload(
-                        connector,
-                        payload_data,
-                        str(target_stage_id),
-                        str(self._stage_id),
-                    )
+                    payload_data = reconstruct_qwen3_full_payload(payload_data)
                 except Exception:
+                    for buffer in received_leases:
+                        buffer.release()
                     logger.warning(
                         "[Stage-%s] failed to reconstruct Qwen3 packet payload for req=%s key=%s",
                         self._stage_id,
@@ -2014,6 +2153,18 @@ class OmniConnectorModelRunnerMixin:
                         exc_info=True,
                     )
                     return False
+
+        with self._lock:
+            if req_id in self._inactive_recv_req_ids:
+                inactive = True
+            else:
+                inactive = False
+                if received_leases:
+                    self._received_connector_buffer_leases.setdefault(req_id, []).extend(received_leases)
+        if inactive:
+            for buffer in received_leases:
+                buffer.release()
+            return False
 
         if isinstance(payload_data, dict):
             logger.debug(
@@ -2042,6 +2193,8 @@ class OmniConnectorModelRunnerMixin:
                 payload_consumable = self._payload_is_consumable(payload_data)
 
             with self._lock:
+                if req_id in self._inactive_recv_req_ids:
+                    return False
                 if is_finished:
                     self._chunk_finished_req_ids.add(req_id)
                     self._chunk_stream_completed.add(req_id)
@@ -2084,6 +2237,8 @@ class OmniConnectorModelRunnerMixin:
             else:
                 engine_inputs = payload_data
             with self._lock:
+                if req_id in self._inactive_recv_req_ids:
+                    return False
                 self._local_stage_payload_cache[req_id] = self._snapshot_payload(engine_inputs)
                 # Publish full-payload readiness only after the aligned TP broadcast
                 # path in recv_full_payload_inputs() has materialized the payload on all
@@ -2180,9 +2335,6 @@ class OmniConnectorModelRunnerMixin:
     def _send_single_request(self, task: dict) -> bool:
         """Send one queued task via connector.put().
 
-        Packet tasks are packed here (save thread), then issued as
-        packed-buffer put followed by sidecar put.
-
         Returns True on success.  On failure (put() raises or returns
         ``success=False``), returns False **without** decrementing
         ``_pending_save_counts`` so the caller can retry or clean up.
@@ -2191,38 +2343,36 @@ class OmniConnectorModelRunnerMixin:
         if connector is None:
             return True
 
-        if task.get("packet"):
-            put_tasks = self._expand_packet_send_task(task)
-        else:
-            put_tasks = [task]
-
         request_id = task.get("request_id")
-        for put_task in put_tasks:
-            payload_data = put_task.get("data")
-            if payload_data is None and put_task.get("request") is not None:
-                payload_data = self._build_custom_process_payload(
-                    request_id=request_id,
-                    request=put_task.get("request"),
-                    pooling_output=put_task.get("pooling_output"),
-                )
-            put_key = put_task.get("put_key")
+        payload_data = task.get("data")
+        if task.get("stage_connector_buffers"):
+            payload_data = self._stage_connector_packet_buffers(
+                payload_data,
+                ready_event=task.get("ready_event"),
+            )
+        if payload_data is None and task.get("request") is not None:
+            payload_data = self._build_custom_process_payload(
+                request_id=request_id,
+                request=task.get("request"),
+                pooling_output=task.get("pooling_output"),
+            )
+        put_key = task.get("put_key")
 
-            success, _size, _metadata = connector.put(
-                from_stage=str(put_task["stage_id"]),
-                to_stage=str(put_task["next_stage_id"]),
-                put_key=put_key,
-                data=payload_data,
-            )
-            logger.debug(
-                "[Stage-%s] _send_single_request: put_key=%s success=%s size=%s packet=%s",
-                put_task["stage_id"],
-                put_key,
-                success,
-                _size,
-                bool(task.get("packet")),
-            )
-            if not success:
-                return False
+        success, _size, _metadata = connector.put(
+            from_stage=str(task["stage_id"]),
+            to_stage=str(task["next_stage_id"]),
+            put_key=put_key,
+            data=payload_data,
+        )
+        logger.debug(
+            "[Stage-%s] _send_single_request: put_key=%s success=%s size=%s",
+            task["stage_id"],
+            put_key,
+            success,
+            _size,
+        )
+        if not success:
+            return False
 
         self._decrement_pending_save_count(request_id)
         return True

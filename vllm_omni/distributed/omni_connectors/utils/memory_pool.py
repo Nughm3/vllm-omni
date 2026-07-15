@@ -8,6 +8,7 @@ import torch
 from .logging import get_connector_logger
 
 logger = get_connector_logger(__name__)
+MANAGED_BUFFER_LEASES_KEY = "__mte_managed_buffer_leases__"
 
 
 class BufferAllocator:
@@ -83,23 +84,67 @@ class BufferAllocator:
                     i += 1
 
 
+class _BufferLease:
+    def __init__(self, allocator: BufferAllocator, offset: int, size: int):
+        self.allocator = allocator
+        self.offset = offset
+        self.size = size
+        self._references = 1
+        self._released = False
+        self._lock = threading.Lock()
+
+    def retain(self) -> None:
+        with self._lock:
+            if self._released:
+                raise RuntimeError("Cannot retain a released buffer allocation")
+            self._references += 1
+
+    def release(self) -> None:
+        should_free = False
+        with self._lock:
+            if self._released:
+                return
+            self._references -= 1
+            if self._references == 0:
+                self._released = True
+                should_free = True
+        if should_free:
+            self.allocator.free(self.offset, self.size)
+
+
 class ManagedBuffer:
     """
     A temporary view into a global memory pool.
     Must be kept alive while the data view is being used.
     """
 
-    def __init__(self, allocator: BufferAllocator, offset: int, size: int, pool_tensor: torch.Tensor):
+    def __init__(
+        self,
+        allocator: BufferAllocator,
+        offset: int,
+        size: int,
+        pool_tensor: torch.Tensor,
+        *,
+        dtype: torch.dtype | None = None,
+        shape: tuple[int, ...] | None = None,
+        lease: _BufferLease | None = None,
+    ):
         self.allocator = allocator
         self.offset = offset
         self.size = size
         self.pool_tensor = pool_tensor
+        self.dtype = dtype
+        self.shape = shape
+        self._lease = lease or _BufferLease(allocator, offset, size)
+        if lease is not None:
+            self._lease.retain()
+        self.ready_event: torch.cuda.Event | None = None
         self._released = False
 
     def release(self) -> None:
         """Explicitly release the buffer back to the pool."""
         if not self._released:
-            self.allocator.free(self.offset, self.size)
+            self._lease.release()
             self._released = True
 
     def __del__(self):
@@ -141,6 +186,26 @@ class ManagedBuffer:
 
         typed_view = self.tensor.view(dtype)
         return typed_view.reshape(shape)
+
+    def slice(
+        self,
+        byte_offset: int,
+        size: int,
+        *,
+        dtype: torch.dtype,
+        shape: tuple[int, ...],
+    ) -> "ManagedBuffer":
+        if byte_offset < 0 or size <= 0 or byte_offset + size > self.size:
+            raise ValueError(f"Invalid ManagedBuffer slice offset={byte_offset}, size={size}, buffer_size={self.size}")
+        return ManagedBuffer(
+            self.allocator,
+            self.offset + byte_offset,
+            size,
+            self.pool_tensor,
+            dtype=dtype,
+            shape=shape,
+            lease=self._lease,
+        )
 
     def to_bytes(self) -> bytes:
         """

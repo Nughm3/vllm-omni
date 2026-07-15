@@ -25,8 +25,8 @@ connectors:
       zmq_port: 50051
       protocol: "rdma"
       device_name: "mlx5_0"
-      memory_pool_size: 4294967296
-      memory_pool_device: "cpu"
+      memory_pool_size: 1073741824 # 1GB
+      memory_pool_device: "cuda:0"
 
   talker2code2wav_shm:
     name: SharedMemoryConnector

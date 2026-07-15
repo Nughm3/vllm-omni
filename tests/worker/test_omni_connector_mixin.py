@@ -521,8 +521,9 @@ class TestQwen3PacketAsyncChunk(unittest.TestCase):
         req = _make_request("req-1")
         self.assertTrue(sender.send_chunk(req, pooling_output={}))
         _drain_pending_connector_sends(sender)
-        self.assertGreater(len(connector._store), 1)
-        self.assertTrue(any("@packed" in key for key in connector._store))
+        # A flattened packet is a single self-contained put (no sidecar/buffer).
+        self.assertEqual(len(connector._store), 1)
+        self.assertFalse(any("@packed" in key for key in connector._store))
 
         receiver = MixinHost()
         receiver.model_config = _make_qwen3_async_chunk_model_config(1)
@@ -580,8 +581,9 @@ class TestQwen3PacketFullPayload(unittest.TestCase):
         )
         self.assertEqual(sent, ["req-1"])
         _drain_pending_connector_sends(sender)
-        self.assertGreater(len(connector._store), 1)
-        self.assertTrue(any("@packed" in key for key in connector._store))
+        # A flattened packet is a single self-contained put (no sidecar/buffer).
+        self.assertEqual(len(connector._store), 1)
+        self.assertFalse(any("@packed" in key for key in connector._store))
 
         receiver = MixinHost()
         receiver.model_config = _make_qwen3_full_payload_model_config(1)
@@ -639,7 +641,8 @@ class TestQwen3TalkerPacketFullPayload(unittest.TestCase):
         )
         self.assertEqual(sent, ["req-1"])
         _drain_pending_connector_sends(sender)
-        self.assertTrue(any("@packed" in key for key in connector._store))
+        self.assertEqual(len(connector._store), 1)
+        self.assertFalse(any("@packed" in key for key in connector._store))
 
         receiver = MixinHost()
         receiver.model_config = _make_qwen3_full_payload_model_config(2)

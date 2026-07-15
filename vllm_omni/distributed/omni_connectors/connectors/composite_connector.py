@@ -72,6 +72,11 @@ class CompositeOmniConnector(OmniConnectorBase):
             return False
         return bool(getattr(self._get_connector, "supports_raw_data", False))
 
+    def supports_device_buffers(self) -> bool:
+        if self._put_connector is None:
+            return False
+        return self._put_connector.supports_device_buffers()
+
     def allocate_buffer(
         self,
         size: int,

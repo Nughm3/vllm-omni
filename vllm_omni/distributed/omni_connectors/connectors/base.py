@@ -25,6 +25,10 @@ class OmniConnectorBase(ABC):
         """Whether ``get`` can return raw tensor/bytes without serialization."""
         return bool(self.supports_raw_data)
 
+    def supports_device_buffers(self) -> bool:
+        """Whether outbound payload tensors can remain device-resident."""
+        return False
+
     def allocate_buffer(
         self,
         size: int,

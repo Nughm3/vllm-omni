@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner, _filter_mrope_kwargs_for_model
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -605,6 +606,114 @@ def test_full_payload_output_accumulation_hook_matrix():
     runner._custom_process_func = None
     runner._should_accumulate_full_payload_output_cached = None
     assert not runner._should_accumulate_full_payload_output()
+
+
+def test_gpu_pool_connector_preserves_device_pooler_payload(monkeypatch):
+    import vllm_omni.worker.gpu_ar_model_runner as gpu_ar_module
+
+    class DeviceBufferConnector:
+        @staticmethod
+        def supports_device_buffers():
+            return True
+
+    runner = object.__new__(GPUARModelRunner)
+    runner._omni_connector = DeviceBufferConnector()
+    payload = {"hidden_states": {"layer_0": torch.arange(4)}}
+
+    def fail_build_mm_cpu(_payload):
+        raise AssertionError("GPU inter-stage payload must not be copied to CPU")
+
+    monkeypatch.setattr(gpu_ar_module, "build_mm_cpu", fail_build_mm_cpu)
+
+    result = runner._prepare_mm_pooler_payload_source(payload)
+
+    assert torch.equal(result["hidden_states.layer_0"], payload["hidden_states"]["layer_0"])
+
+
+def test_non_device_connector_builds_cpu_pooler_payload(monkeypatch):
+    import vllm_omni.worker.gpu_ar_model_runner as gpu_ar_module
+
+    class CpuConnector:
+        @staticmethod
+        def supports_device_buffers():
+            return False
+
+    runner = object.__new__(GPUARModelRunner)
+    runner._omni_connector = CpuConnector()
+    expected = {"copied": torch.tensor([1])}
+    monkeypatch.setattr(
+        gpu_ar_module,
+        "build_mm_cpu",
+        lambda payload: expected,
+    )
+
+    result = runner._prepare_mm_pooler_payload_source({"hidden": torch.tensor([1])})
+
+    assert result is expected
+
+
+def test_gpu_pool_connector_skips_async_cpu_payload_snapshot(monkeypatch):
+    import vllm_omni.worker.gpu_ar_model_runner as gpu_ar_module
+
+    class DeviceBufferConnector:
+        @staticmethod
+        def supports_device_buffers():
+            return True
+
+    runner = object.__new__(GPUARModelRunner)
+    runner._omni_connector = DeviceBufferConnector()
+    runner._model_omni_pooler_payload_include_hidden = lambda: False
+    expected_snapshot = SimpleNamespace(
+        payload={"multimodal_outputs": {"hidden_states.layer_0": torch.arange(4)}},
+        wait=lambda: None,
+    )
+    monkeypatch.setattr(
+        gpu_ar_module,
+        "_snapshot_tensor_payload_on_device",
+        lambda payload: expected_snapshot,
+    )
+
+    def fail_cpu_snapshot(*_args, **_kwargs):
+        raise AssertionError("GPU inter-stage payload must not use the async CPU snapshot")
+
+    monkeypatch.setattr(
+        gpu_ar_module,
+        "_snapshot_tensor_payload_to_cpu_async",
+        fail_cpu_snapshot,
+    )
+
+    result = runner._snapshot_omni_output_tensors_for_async_output(
+        use_async_omni_output=True,
+        hidden_states=torch.arange(2),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={"hidden_states.layer_0": torch.arange(4)},
+    )
+
+    assert result.async_payload is expected_snapshot
+
+
+def test_gpu_pool_connector_clones_synchronous_device_payload():
+    class DeviceBufferConnector:
+        @staticmethod
+        def supports_device_buffers():
+            return True
+
+    runner = object.__new__(GPUARModelRunner)
+    runner._omni_connector = DeviceBufferConnector()
+    runner._model_omni_pooler_payload_include_hidden = lambda: False
+    original = torch.arange(4)
+
+    result = runner._snapshot_omni_output_tensors_for_async_output(
+        use_async_omni_output=False,
+        hidden_states=torch.arange(2),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={"hidden_states.layer_0": original},
+    )
+
+    snapshot = result.multimodal_outputs["hidden_states.layer_0"]
+    assert torch.equal(snapshot, original)
+    assert snapshot.data_ptr() != original.data_ptr()
+    assert result.async_payload is not None
 
 
 def test_sync_local_stage_payloads_retains_payload_until_request_is_active():

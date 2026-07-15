@@ -121,8 +121,6 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self._local_buffers: dict[str, Any] = {}
         self._local_buffers_lock = threading.Lock()
         self._put_lock = threading.Lock()
-        self._cuda_copy_streams: dict[str, torch.cuda.Stream] = {}
-        self._cuda_copy_streams_lock = threading.Lock()
         self._req_local = threading.local()
         self._worker_local = threading.local()
         self._last_ttl_check: float = _time_mod.monotonic()
@@ -305,6 +303,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             return None
         return self._allocate_pool_buffer(size, dtype=dtype, shape=shape)
 
+    def supports_device_buffers(self) -> bool:
+        return bool(self.pool.is_cuda)
+
     def allocate_buf(
         self,
         size: int,
@@ -452,46 +453,15 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         with self._put_lock:
             return self._put_impl(put_key, data)
 
-    def _get_cuda_copy_stream(self, device: torch.device | str) -> torch.cuda.Stream:
-        device_key = str(torch.device(device))
-        with self._cuda_copy_streams_lock:
-            stream = self._cuda_copy_streams.get(device_key)
-            if stream is None:
-                with torch.cuda.device(device):
-                    stream = torch.cuda.Stream(device=device)
-                self._cuda_copy_streams[device_key] = stream
-            return stream
-
-    def _copy_tensor_via_cuda_stream(
-        self,
-        dst_tensor: torch.Tensor,
-        src_tensor: torch.Tensor,
-        *,
-        ready_event: torch.cuda.Event | None = None,
-    ) -> None:
+    @staticmethod
+    def _copy_tensor_to_pool(dst_tensor: torch.Tensor, src_tensor: torch.Tensor) -> None:
         if not src_tensor.is_cuda and not dst_tensor.is_cuda:
             dst_tensor.copy_(src_tensor)
             return
-
+        dst_tensor.copy_(src_tensor, non_blocking=True)
         device = src_tensor.device if src_tensor.is_cuda else dst_tensor.device
         with torch.cuda.device(device):
-            if ready_event is None:
-                producer_stream = torch.cuda.current_stream(device)
-                ready_event = torch.cuda.Event()
-                ready_event.record(producer_stream)
-
-            transfer_stream = self._get_cuda_copy_stream(device)
-            transfer_stream.wait_event(ready_event)
-            with torch.cuda.stream(transfer_stream):
-                dst_tensor.copy_(src_tensor, non_blocking=True)
-                if src_tensor.is_cuda:
-                    src_tensor.record_stream(transfer_stream)
-                if dst_tensor.is_cuda:
-                    dst_tensor.record_stream(transfer_stream)
-                complete_event = torch.cuda.Event()
-                complete_event.record(transfer_stream)
-
-        complete_event.synchronize()
+            torch.cuda.current_stream(device).synchronize()
 
     def stage_tensor(
         self,
@@ -510,7 +480,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
     ) -> None:
         if not pairs:
             return
-        destinations: list[tuple[ManagedBuffer, torch.Tensor, torch.Tensor]] = []
+        if ready_event is not None:
+            ready_event.synchronize()
+        cuda_device: torch.device | None = None
         for buffer, tensor in pairs:
             if buffer.pool_tensor.data_ptr() != self.pool.data_ptr():
                 raise ValueError("Cannot stage into a ManagedBuffer from a different pool")
@@ -519,38 +491,16 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     f"Buffer metadata {buffer.dtype}/{buffer.shape} does not match "
                     f"tensor {tensor.dtype}/{tuple(tensor.shape)}"
                 )
-            destinations.append(
-                (
-                    buffer,
-                    buffer.as_tensor(tensor.dtype, tuple(tensor.shape)),
-                    tensor,
-                )
-            )
-
-        device = self.pool.device
-        with torch.cuda.device(device):
-            if ready_event is None:
-                ready_event = torch.cuda.Event()
-                ready_event.record(torch.cuda.current_stream(device))
-            transfer_stream = self._get_cuda_copy_stream(device)
-            transfer_stream.wait_event(ready_event)
-            with torch.cuda.stream(transfer_stream):
-                for buffer, destination, tensor in destinations:
-                    destination.copy_(tensor, non_blocking=True)
-                    if tensor.is_cuda:
-                        tensor.record_stream(transfer_stream)
-                    destination.record_stream(transfer_stream)
-                    buffer.ready_event = None
-                complete_event = torch.cuda.Event()
-                complete_event.record(transfer_stream)
-        complete_event.synchronize()
-
-    @staticmethod
-    def _wait_for_cuda_visibility(device: torch.device | str) -> None:
-        with torch.cuda.device(device):
-            visibility_event = torch.cuda.Event()
-            visibility_event.record(torch.cuda.current_stream(device))
-        visibility_event.synchronize()
+            destination = buffer.as_tensor(tensor.dtype, tuple(tensor.shape))
+            destination.copy_(tensor, non_blocking=True)
+            if tensor.is_cuda:
+                cuda_device = tensor.device
+            elif destination.is_cuda:
+                cuda_device = destination.device
+            buffer.ready_event = None
+        if cuda_device is not None:
+            with torch.cuda.device(cuda_device):
+                torch.cuda.current_stream(cuda_device).synchronize()
 
     @staticmethod
     def _contains_managed_buffer(value: Any) -> bool:
@@ -609,7 +559,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         sidecar_buffer = self._allocate_pool_buffer(len(sidecar_bytes))
         try:
             sidecar_tensor = torch.frombuffer(bytearray(sidecar_bytes), dtype=torch.uint8)
-            self._copy_tensor_via_cuda_stream(sidecar_buffer.tensor, sidecar_tensor)
+            self._copy_tensor_to_pool(sidecar_buffer.tensor, sidecar_tensor)
         except Exception:
             sidecar_buffer.release()
             raise
@@ -772,11 +722,11 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
                         # View as flat uint8
                         src_view = data.view(torch.uint8).flatten()
-                        self._copy_tensor_via_cuda_stream(dst_tensor, src_view)
+                        self._copy_tensor_to_pool(dst_tensor, src_view)
                     else:
                         # bytes -> tensor copy
                         # torch.frombuffer creates CPU tensor. If pool is GPU, copy_ handles H2D.
-                        self._copy_tensor_via_cuda_stream(dst_tensor, tensor_data)
+                        self._copy_tensor_to_pool(dst_tensor, tensor_data)
                 except Exception as e:
                     # Copy failed, release the allocated buffer to prevent leak
                     holder.release()
@@ -1043,10 +993,11 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             _rdma_ms = (_t3 - _t2) * 1000
 
             if resp == TRANS_DONE:
-                # Success
-                if self.pool.is_cuda:
-                    self._wait_for_cuda_visibility(self.pool.device)
-
+                # batch_transfer_sync_write has completed before TRANS_DONE is
+                # sent. Do not synchronize an arbitrary CUDA stream here: that
+                # measures unrelated model work and caused large latency tails.
+                # A transport-provided GPUDirect visibility fence should replace
+                # this completion contract if Mooncake exposes one.
                 _t4 = _time_mod.perf_counter()
                 _sync_ms = (_t4 - _t3) * 1000
 

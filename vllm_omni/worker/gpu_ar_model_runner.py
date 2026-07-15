@@ -138,6 +138,16 @@ def _snapshot_tensor_payload_to_cpu_async(
     return _AsyncCPUPayloadSnapshot(cpu_payload, ready_event, cuda_sources)
 
 
+def _snapshot_tensor_payload_on_device(value: Any) -> _AsyncCPUPayloadSnapshot:
+    cuda_sources: list[torch.Tensor] = []
+    cloned = _clone_cuda_tensor_payload(value, cuda_sources)
+    if not cuda_sources:
+        return _AsyncCPUPayloadSnapshot(cloned, None, cuda_sources)
+    ready_event = torch.cuda.Event()
+    ready_event.record(torch.cuda.current_stream())
+    return _AsyncCPUPayloadSnapshot(cloned, ready_event, cuda_sources)
+
+
 class _OmniOutputTensorSnapshot(NamedTuple):
     hidden_states: torch.Tensor
     staged_hidden_states_cpu: torch.Tensor | None
@@ -815,6 +825,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             scheduler_output.num_scheduled_tokens,
         )
         return hidden_states_cpu, combined_hidden_states, combined_multimodal_outputs
+
+    def _prepare_mm_pooler_payload_source(
+        self,
+        multimodal_outputs: dict | None,
+    ) -> dict[str, object]:
+        if not multimodal_outputs:
+            return {}
+        flattened = flatten_payload(multimodal_outputs)
+        if self._should_preserve_device_pooler_payload():
+            return flattened
+        return build_mm_cpu(flattened)
 
     @staticmethod
     def _build_combined_prefix_cache_mm_payload(
@@ -1540,6 +1561,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     def _model_omni_pooler_payload_include_hidden(self) -> bool:
         return self._runner_model_omni_flag("omni_pooler_payload_include_hidden", default=True)
 
+    def _should_preserve_device_pooler_payload(self) -> bool:
+        connector = getattr(self, "_omni_connector", None)
+        supports_device_buffers = getattr(connector, "supports_device_buffers", None)
+        return bool(callable(supports_device_buffers) and supports_device_buffers())
+
     def _should_use_async_omni_output(self) -> bool:
         if not self.use_async_scheduling:
             return False
@@ -1588,31 +1614,47 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         multimodal_outputs: Any,
     ) -> _OmniOutputTensorSnapshot:
         if not use_async_omni_output:
+            if self._should_preserve_device_pooler_payload():
+                snapshot = _snapshot_tensor_payload_on_device(
+                    self._build_omni_async_snapshot_payload(
+                        hidden_states=hidden_states,
+                        staged_hidden_states_cpu=staged_hidden_states_cpu,
+                        multimodal_outputs=multimodal_outputs,
+                    )
+                )
+                payload = snapshot.payload
+                hidden_states_snapshot = payload.get("hidden_states")
+                if hidden_states_snapshot is None:
+                    hidden_states_snapshot = hidden_states[:0]
+                return _OmniOutputTensorSnapshot(
+                    hidden_states=hidden_states_snapshot,
+                    staged_hidden_states_cpu=payload.get("staged_hidden_states_cpu"),
+                    multimodal_outputs=payload["multimodal_outputs"],
+                    async_payload=snapshot,
+                )
             return _OmniOutputTensorSnapshot(
                 hidden_states=hidden_states,
                 staged_hidden_states_cpu=staged_hidden_states_cpu,
                 multimodal_outputs=multimodal_outputs,
             )
 
-        with record_function_or_nullcontext("omni_async_output:snapshot_cpu_payload"):
-            async_payload_snapshot = _snapshot_tensor_payload_to_cpu_async(
-                self._build_omni_async_snapshot_payload(
-                    hidden_states=hidden_states,
-                    staged_hidden_states_cpu=staged_hidden_states_cpu,
-                    multimodal_outputs=multimodal_outputs,
-                ),
-                copy_stream=self._get_or_create_omni_payload_copy_stream(),
-                # NOTE: vLLM v0.24.0's GPUModelRunner no longer exposes a
-                # ``self.pin_memory`` attribute (it uses a module-level
-                # ``PIN_MEMORY`` constant instead), so the old
-                # ``getattr(self, "pin_memory", False)`` silently fell back to
-                # False. That allocated the async D2H snapshot destination in
-                # *pageable* host memory, which turns ``copy_(non_blocking=True)``
-                # into a fully synchronous, stream-stalling copy (~240 ms/step
-                # on the 17.5k-token Thinker prefill). Resolve pinning from the
-                # platform helper so the copy is a true async cudaMemcpyAsync.
-                pin_memory=is_pin_memory_available(),
-            )
+        snapshot_payload = self._build_omni_async_snapshot_payload(
+            hidden_states=hidden_states,
+            staged_hidden_states_cpu=staged_hidden_states_cpu,
+            multimodal_outputs=multimodal_outputs,
+        )
+        if self._should_preserve_device_pooler_payload():
+            with record_function_or_nullcontext("omni_async_output:snapshot_device_payload"):
+                async_payload_snapshot = _snapshot_tensor_payload_on_device(snapshot_payload)
+        else:
+            with record_function_or_nullcontext("omni_async_output:snapshot_cpu_payload"):
+                async_payload_snapshot = _snapshot_tensor_payload_to_cpu_async(
+                    snapshot_payload,
+                    copy_stream=self._get_or_create_omni_payload_copy_stream(),
+                    # vLLM v0.24.0 no longer exposes self.pin_memory. Pageable
+                    # destinations silently make non_blocking D2H synchronous.
+                    pin_memory=is_pin_memory_available(),
+                )
 
         payload = async_payload_snapshot.payload
         hidden_states_snapshot = payload.get("hidden_states")
@@ -1719,22 +1761,29 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         )
 
         if self.omni_prefix_cache is None and needs_scheduled_hidden_payload and not audio_sparse_output:
+            preserve_device = self._should_preserve_device_pooler_payload()
             num_valid_tokens = min(
                 int(scheduler_output.total_num_scheduled_tokens),
                 int(hidden_states.shape[0]),
             )
             if len(downstream_req_ids) == len(req_ids_output_copy):
-                with record_function_or_nullcontext("omni_output_builder:hidden_d2h/scheduled"):
-                    hidden_states_cpu = _to_cpu_contiguous(hidden_states[:num_valid_tokens])
+                with record_function_or_nullcontext("omni_output_builder:hidden_payload/scheduled"):
+                    scheduled_hidden = hidden_states[:num_valid_tokens]
+                    hidden_states_cpu = (
+                        scheduled_hidden.contiguous() if preserve_device else _to_cpu_contiguous(scheduled_hidden)
+                    )
             else:
                 req_hidden_states_cpu = {}
-                with record_function_or_nullcontext("omni_output_builder:hidden_d2h/per_request"):
+                with record_function_or_nullcontext("omni_output_builder:hidden_payload/per_request"):
                     for rid in downstream_req_ids:
                         idx = req_id_to_index_output_copy[rid]
                         start = int(query_start_loc_cpu[idx])
                         sched = int(num_scheduled_tokens_np[idx])
                         end = start + sched
-                        req_hidden_states_cpu[rid] = _to_cpu_contiguous(hidden_states[start:end])
+                        req_hidden = hidden_states[start:end]
+                        req_hidden_states_cpu[rid] = (
+                            req_hidden.contiguous() if preserve_device else _to_cpu_contiguous(req_hidden)
+                        )
 
         # NOTE: pooler_output here is used only for the full-payload accumulation
         # path (accumulate_full_payload_output) and is NOT passed on the wire via
@@ -1758,10 +1807,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     needs_scheduled_hidden_payload=needs_scheduled_hidden_payload,
                 )
             if combined_multimodal_outputs is None:
-                with record_function_or_nullcontext("omni_output_builder:build_mm_cpu"):
-                    mm_cpu = build_mm_cpu(
-                        flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
-                    )
+                with record_function_or_nullcontext("omni_output_builder:prepare_mm_payload"):
+                    mm_cpu = self._prepare_mm_pooler_payload_source(multimodal_outputs)
 
             with record_function_or_nullcontext("omni_output_builder:process_additional_information"):
                 if not postprocess_already_applied:

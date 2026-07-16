@@ -1059,14 +1059,22 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     if socket in events:
                         frames = socket.recv_multipart()
                         if len(frames) >= 2:
-                            # Submit to thread pool
-                            self._sender_executor.submit(
-                                self._handle_pull_request,
-                                response_queue,
-                                notify_addr,
-                                frames[0],
-                                frames[-1],
-                            )
+                            identity = frames[0]
+                            payload = frames[-1]
+                            if payload.startswith(QUERY_INFO):
+                                # Metadata lookup is a short local operation. Handle it
+                                # on the listener thread so polling misses cannot occupy
+                                # the executor used by synchronous RDMA writes.
+                                response = self._build_query_response(payload[len(QUERY_INFO) :])
+                                socket.send_multipart([identity, b"", response])
+                            else:
+                                self._sender_executor.submit(
+                                    self._handle_pull_request,
+                                    response_queue,
+                                    notify_addr,
+                                    identity,
+                                    payload,
+                                )
                 except zmq.ContextTerminated:
                     break
                 except Exception:
@@ -1079,17 +1087,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 pass  # Best-effort cleanup during listener shutdown
 
     def _handle_pull_request(self, response_queue: queue.Queue, notify_addr: str, identity, payload):
-        """
-        Handle pull request or query request in worker thread.
-        Results are put into response_queue and listener is notified via inproc.
-        """
+        """Handle an RDMA pull request in a worker thread."""
         try:
-            # Check if this is a query request
-            if payload.startswith(QUERY_INFO):
-                self._handle_query_request(response_queue, notify_addr, identity, payload[len(QUERY_INFO) :])
-                return
-
-            # Normal RDMA transfer request
             meta = msgspec.msgpack.decode(payload, type=MooncakeAgentMetadata)
 
             with self._local_buffers_lock:
@@ -1126,8 +1125,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # Notify listener thread that response is ready
         self._notify_listener(notify_addr)
 
-    def _handle_query_request(self, response_queue: queue.Queue, notify_addr: str, identity, payload):
-        """Handle metadata query request."""
+    def _build_query_response(self, payload: bytes) -> bytes:
+        """Build a metadata query response on the ZMQ listener thread."""
         try:
             query = msgspec.msgpack.decode(payload, type=QueryRequest)
 
@@ -1135,22 +1134,19 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 item = self._local_buffers.get(query.request_id)
 
             if not item:
-                response_queue.put((identity, INFO_NOT_FOUND))
-            else:
-                src_addrs, src_lengths, _, _, is_fast_path, _ = item
+                return INFO_NOT_FOUND
 
-                resp = QueryResponse(
-                    request_id=query.request_id,
-                    data_size=src_lengths[0] if src_lengths else 0,
-                    is_fast_path=is_fast_path,
-                )
-                response_queue.put((identity, msgspec.msgpack.encode(resp)))
+            _, src_lengths, _, _, is_fast_path, _ = item
+            response = QueryResponse(
+                request_id=query.request_id,
+                data_size=src_lengths[0] if src_lengths else 0,
+                is_fast_path=is_fast_path,
+            )
+            return msgspec.msgpack.encode(response)
 
         except Exception as e:
             logger.error(f"Query request failed: {e}")
-            response_queue.put((identity, INFO_NOT_FOUND))
-
-        self._notify_listener(notify_addr)
+            return INFO_NOT_FOUND
 
     def _notify_listener(self, notify_addr: str):
         """Send notification to wake up listener thread.

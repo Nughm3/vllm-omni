@@ -10,6 +10,7 @@ Set RDMA_DEVICE_NAME to force a specific device for single-node testing.
 
 import hashlib
 import os
+import queue
 import subprocess
 import threading
 import time
@@ -17,10 +18,12 @@ import time
 import msgspec
 import pytest
 import torch
+import zmq
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector import (
     INFO_NOT_FOUND,
+    WAIT_INFO,
     ManagedBuffer,
     MooncakeTransferEngineConnector,
     QueryRequest,
@@ -204,6 +207,7 @@ class TestMetadataQueryResponse:
         connector = MooncakeTransferEngineConnector.__new__(MooncakeTransferEngineConnector)
         connector._local_buffers_lock = threading.Lock()
         connector._local_buffers = {} if item is None else {"ready@0_1": item}
+        connector._metadata_waiters = {}
         return connector
 
     def test_found(self):
@@ -223,6 +227,180 @@ class TestMetadataQueryResponse:
     def test_malformed_payload(self):
         connector = self._connector_with_item()
         assert connector._build_query_response(b"not-msgpack") == INFO_NOT_FOUND
+
+    def test_waiter_is_deduplicated_and_released_when_ready(self):
+        connector = self._connector_with_item()
+        envelope = (b"consumer",)
+        payload = msgspec.msgpack.encode(QueryRequest(request_id="ready@0_1"))
+
+        assert connector._register_metadata_waiter(envelope, payload) is None
+        assert connector._register_metadata_waiter(envelope, payload) is None
+        assert list(connector._metadata_waiters["ready@0_1"]) == [envelope]
+
+        item = ([1234], [4096], None, False, True, time.monotonic())
+        with connector._local_buffers_lock:
+            connector._local_buffers["ready@0_1"] = item
+        waiters, encoded = connector._pop_ready_waiters("ready@0_1")
+
+        assert waiters == [envelope]
+        response = msgspec.msgpack.decode(encoded, type=QueryResponse)
+        assert response.request_id == "ready@0_1"
+        assert response.data_size == 4096
+        assert connector._metadata_waiters == {}
+
+    def test_ready_waiter_gets_immediate_response(self):
+        item = ([1234], [4096], None, False, True, time.monotonic())
+        connector = self._connector_with_item(item)
+        payload = msgspec.msgpack.encode(QueryRequest(request_id="ready@0_1"))
+
+        encoded = connector._register_metadata_waiter((b"consumer",), payload)
+
+        response = msgspec.msgpack.decode(encoded, type=QueryResponse)
+        assert response.request_id == "ready@0_1"
+        assert response.data_size == 4096
+        assert connector._metadata_waiters == {}
+
+    def test_listener_delivers_metadata_after_ready_notification(self):
+        connector = MooncakeTransferEngineConnector.__new__(MooncakeTransferEngineConnector)
+        connector.zmq_ctx = zmq.Context()
+        connector.host = RDMA_HOST
+        connector.zmq_port = _free_port()
+        connector.can_put = True
+        connector._bind_error = None
+        connector._listener_ready = threading.Event()
+        connector._stop_event = threading.Event()
+        connector._local_buffers_lock = threading.Lock()
+        connector._local_buffers = {}
+        connector._metadata_waiters = {}
+        connector._ready_keys = queue.Queue()
+        connector._listener_notify_addr = None
+        connector._last_ttl_check = time.monotonic()
+        connector._worker_local = threading.local()
+        connector._sender_executor = None
+
+        listener = threading.Thread(target=connector._zmq_listener_loop)
+        listener.start()
+        dealer = None
+        try:
+            assert connector._listener_ready.wait(timeout=2)
+            assert connector._bind_error is None
+            dealer = connector.zmq_ctx.socket(zmq.DEALER)
+            dealer.setsockopt(zmq.LINGER, 0)
+            dealer.connect(f"tcp://{connector.host}:{connector.zmq_port}")
+            dealer.send(WAIT_INFO + msgspec.msgpack.encode(QueryRequest(request_id="ready@0_1")))
+
+            registered = False
+            for _ in range(100):
+                with connector._local_buffers_lock:
+                    registered = "ready@0_1" in connector._metadata_waiters
+                if registered:
+                    break
+                time.sleep(0.01)
+            assert registered
+
+            item = ([1234], [4096], None, False, True, time.monotonic())
+            with connector._local_buffers_lock:
+                connector._local_buffers["ready@0_1"] = item
+            connector._ready_keys.put("ready@0_1")
+            connector._notify_listener(connector._listener_notify_addr)
+
+            assert dealer.poll(2000, zmq.POLLIN)
+            response = msgspec.msgpack.decode(
+                dealer.recv_multipart()[-1],
+                type=QueryResponse,
+            )
+            assert response.request_id == "ready@0_1"
+            assert response.data_size == 4096
+        finally:
+            connector._stop_event.set()
+            if connector._listener_notify_addr is not None:
+                connector._notify_listener(connector._listener_notify_addr)
+            listener.join(timeout=2)
+            if dealer is not None:
+                dealer.close(linger=0)
+            notify_socket = getattr(connector._worker_local, "notify_socket", None)
+            if notify_socket is not None:
+                notify_socket.close(linger=0)
+            connector.zmq_ctx.term()
+
+        assert not listener.is_alive()
+
+
+class TestDeferredMetadataConsumer:
+    class _FakeDealerSocket:
+        def __init__(self):
+            self.replies = []
+            self.sent = []
+
+        def recv_multipart(self, flags=0):
+            if not self.replies:
+                raise zmq.Again()
+            return [self.replies.pop(0)]
+
+        def send(self, payload, flags=0):
+            self.sent.append(payload)
+
+    def test_subscribes_once_and_returns_deferred_metadata(self):
+        connector = MooncakeTransferEngineConnector.__new__(MooncakeTransferEngineConnector)
+        connector._wait_local = threading.local()
+        connector._metrics = {
+            "readiness_requests": 0,
+            "readiness_responses": 0,
+            "readiness_cache_hits": 0,
+        }
+        socket = self._FakeDealerSocket()
+        connector._get_wait_socket = lambda _: socket
+
+        assert connector._get_metadata_when_ready_at("ready@0_1", "127.0.0.1", 50051) is None
+        assert len(socket.sent) == 1
+        assert socket.sent[0].startswith(WAIT_INFO)
+
+        socket.replies.append(
+            msgspec.msgpack.encode(
+                QueryResponse(
+                    request_id="ready@0_1",
+                    data_size=4096,
+                    is_fast_path=True,
+                )
+            )
+        )
+        metadata = connector._get_metadata_when_ready_at("ready@0_1", "127.0.0.1", 50051)
+
+        assert len(socket.sent) == 1
+        assert metadata["data_size"] == 4096
+        assert metadata["is_fast_path"] is True
+        assert metadata["ready_wait_ms"] >= 0
+        assert connector._metrics == {
+            "readiness_requests": 1,
+            "readiness_responses": 1,
+            "readiness_cache_hits": 1,
+        }
+
+    def test_packed_lookup_uses_synchronous_query(self):
+        connector = MooncakeTransferEngineConnector.__new__(MooncakeTransferEngineConnector)
+        connector._closed = False
+        connector.sender_host = "127.0.0.1"
+        connector.sender_zmq_port = 50051
+        queried_keys: list[str] = []
+
+        def query(get_key):
+            queried_keys.append(get_key)
+            return {
+                "source_host": "127.0.0.1",
+                "source_port": 50051,
+                "data_size": 0,
+                "is_fast_path": True,
+            }
+
+        connector._query_metadata_from_sender = query
+
+        def deferred(_get_key):
+            pytest.fail("packed lookup must not use deferred metadata")
+
+        connector._get_metadata_when_ready_from_sender = deferred
+
+        assert connector.get("0", "1", "request@packed") is None
+        assert queried_keys == ["request@packed@0_1"]
 
 
 # ---------------------------------------------------------------------------

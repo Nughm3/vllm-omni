@@ -14,13 +14,17 @@ import subprocess
 import threading
 import time
 
+import msgspec
 import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector import (
+    INFO_NOT_FOUND,
     ManagedBuffer,
     MooncakeTransferEngineConnector,
+    QueryRequest,
+    QueryResponse,
     TransferEngine,
 )
 
@@ -194,6 +198,33 @@ def _connector_config(
 def _md5(tensor: torch.Tensor) -> str:
     t = tensor.cpu() if tensor.is_cuda else tensor
     return hashlib.md5(t.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
+
+
+class TestMetadataQueryResponse:
+    @staticmethod
+    def _connector_with_item(item=None):
+        connector = MooncakeTransferEngineConnector.__new__(MooncakeTransferEngineConnector)
+        connector._local_buffers_lock = threading.Lock()
+        connector._local_buffers = {} if item is None else {"ready@0_1": item}
+        return connector
+
+    def test_found(self):
+        item = ([1234], [4096], None, False, True, time.monotonic())
+        connector = self._connector_with_item(item)
+        payload = msgspec.msgpack.encode(QueryRequest(request_id="ready@0_1"))
+        response = msgspec.msgpack.decode(connector._build_query_response(payload), type=QueryResponse)
+        assert response.request_id == "ready@0_1"
+        assert response.data_size == 4096
+        assert response.is_fast_path is True
+
+    def test_missing(self):
+        connector = self._connector_with_item()
+        payload = msgspec.msgpack.encode(QueryRequest(request_id="missing@0_1"))
+        assert connector._build_query_response(payload) == INFO_NOT_FOUND
+
+    def test_malformed_payload(self):
+        connector = self._connector_with_item()
+        assert connector._build_query_response(b"not-msgpack") == INFO_NOT_FOUND
 
 
 # ---------------------------------------------------------------------------

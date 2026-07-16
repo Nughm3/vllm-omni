@@ -38,7 +38,10 @@ _TRANSFER_TIMEOUT_PER_STEP_MS = 5_000
 TRANS_DONE = b"trans_done"
 TRANS_ERROR = b"trans_error"
 QUERY_INFO = b"query_info"
+WAIT_INFO = b"wait_info"
 INFO_NOT_FOUND = b"info_not_found"
+
+_WAIT_RETRY_SECONDS = 5.0
 
 
 @dataclass
@@ -119,10 +122,14 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self._local_buffers_lock = threading.Lock()
         self._put_lock = threading.Lock()
         self._req_local = threading.local()
+        self._wait_local = threading.local()
         self._worker_local = threading.local()
         self._last_ttl_check: float = _time_mod.monotonic()
         self._sender_endpoints: dict[int, tuple[str, int]] = {}
         self._in_flight_buffers: set[str] = set()
+        self._metadata_waiters: dict[str, dict[tuple[bytes, ...], float]] = {}
+        self._ready_keys: queue.Queue[str] = queue.Queue()
+        self._listener_notify_addr: str | None = None
 
         self._metrics = {
             "puts": 0,
@@ -130,6 +137,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             "bytes_transferred": 0,
             "errors": 0,
             "timeouts": 0,
+            "readiness_requests": 0,
+            "readiness_responses": 0,
+            "readiness_cache_hits": 0,
         }
 
         self.config = config
@@ -381,6 +391,106 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             except Exception:
                 pass  # Best-effort; zmq_ctx.term() will reclaim if needed
 
+    def _get_wait_socket(self, zmq_addr: str) -> zmq.Socket:
+        """Get a thread-local DEALER socket for deferred metadata readiness."""
+
+        cache: dict[str, zmq.Socket] = getattr(self._wait_local, "sockets", None)  # type: ignore[assignment]
+        if cache is None:
+            cache = {}
+            self._wait_local.sockets = cache
+
+        sock = cache.get(zmq_addr)
+        if sock is None:
+            sock = self.zmq_ctx.socket(zmq.DEALER)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.connect(zmq_addr)
+            cache[zmq_addr] = sock
+        return sock
+
+    def _invalidate_wait_socket(self, zmq_addr: str) -> None:
+        """Discard a broken readiness socket and its outstanding requests."""
+
+        cache: dict[str, zmq.Socket] = getattr(self._wait_local, "sockets", None)  # type: ignore[assignment]
+        if cache is not None:
+            sock = cache.pop(zmq_addr, None)
+            if sock is not None:
+                try:
+                    sock.close(linger=0)
+                except Exception:
+                    pass
+
+        pending: dict[tuple[str, str], float] = getattr(self._wait_local, "pending", {})
+        for state_key in [key for key in pending if key[0] == zmq_addr]:
+            pending.pop(state_key, None)
+
+    def _get_metadata_when_ready_at(self, get_key: str, host: str, port: int) -> dict[str, Any] | None:
+        """Subscribe once for a key and drain deferred ready replies.
+
+        The first call sends a wait request without blocking. Later calls return
+        cached metadata after the producer publishes it.
+        """
+
+        zmq_addr = f"tcp://{host}:{port}"
+        pending: dict[tuple[str, str], float] = getattr(self._wait_local, "pending", None)  # type: ignore[assignment]
+        ready: dict[tuple[str, str], dict[str, Any]] = getattr(self._wait_local, "ready", None)  # type: ignore[assignment]
+        if pending is None:
+            pending = {}
+            self._wait_local.pending = pending
+        if ready is None:
+            ready = {}
+            self._wait_local.ready = ready
+
+        state_key = (zmq_addr, get_key)
+        sock = self._get_wait_socket(zmq_addr)
+        try:
+            while True:
+                try:
+                    frames = sock.recv_multipart(zmq.NOBLOCK)
+                except zmq.Again:
+                    break
+                response = msgspec.msgpack.decode(frames[-1], type=QueryResponse)
+                response_key = (zmq_addr, response.request_id)
+                sent_at = pending.pop(response_key, _time_mod.monotonic())
+                ready[response_key] = {
+                    "source_host": host,
+                    "source_port": port,
+                    "data_size": response.data_size,
+                    "is_fast_path": response.is_fast_path,
+                    "ready_wait_ms": (_time_mod.monotonic() - sent_at) * 1000,
+                }
+                self._metrics["readiness_responses"] += 1
+        except Exception as e:
+            self._invalidate_wait_socket(zmq_addr)
+            logger.debug("Failed to receive readiness metadata at %s: %s", zmq_addr, e)
+            return None
+
+        metadata = ready.pop(state_key, None)
+        if metadata is not None:
+            self._metrics["readiness_cache_hits"] += 1
+            return metadata
+
+        now = _time_mod.monotonic()
+        sent_at = pending.get(state_key)
+        if sent_at is None or now - sent_at >= _WAIT_RETRY_SECONDS:
+            try:
+                sock.send(WAIT_INFO + msgspec.msgpack.encode(QueryRequest(request_id=get_key)), zmq.NOBLOCK)
+                pending[state_key] = now
+                self._metrics["readiness_requests"] += 1
+            except Exception as e:
+                self._invalidate_wait_socket(zmq_addr)
+                logger.debug("Failed to subscribe for metadata at %s for %s: %s", zmq_addr, get_key, e)
+        return None
+
+    def _get_metadata_when_ready_from_sender(
+        self,
+        get_key: str,
+        sender_rank: int | None = None,
+    ) -> dict[str, Any] | None:
+        endpoint = self._resolve_sender_endpoint(sender_rank)
+        if endpoint is None:
+            return None
+        return self._get_metadata_when_ready_at(get_key, *endpoint)
+
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """
         Producer Side.
@@ -542,6 +652,11 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     is_fast_path,
                     _time_mod.monotonic(),
                 )
+                notify_waiters = bool(self._metadata_waiters.get(put_key))
+
+            if notify_waiters and self._listener_notify_addr is not None:
+                self._ready_keys.put(put_key)
+                self._notify_listener(self._listener_notify_addr)
 
             # Metadata for Consumer
             metadata = {
@@ -663,9 +778,15 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         if self._closed:
             raise RuntimeError("Cannot get data: MooncakeTransferEngineConnector is closed")
 
+        # Packet sends publish the packed buffer before the sidecar. Once the
+        # sidecar is visible, the nested packed lookup is already committed.
+        # Resolve it synchronously: reconstruction performs this lookup only
+        # once, so a deferred send cannot safely return before its immediate
+        # reply reaches the DEALER socket.
+        is_packed_lookup = get_key.endswith("@packed")
         get_key = self._make_key(get_key, from_stage, to_stage)
         _t0 = _time_mod.perf_counter()
-        metadata = self._resolve_metadata(get_key, metadata)
+        metadata = self._resolve_metadata(get_key, metadata, is_packed_lookup=is_packed_lookup)
         if not metadata:
             return None
 
@@ -676,6 +797,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         src_port = metadata.get("source_port")
         data_size = int(metadata.get("data_size", 0) or 0)
         is_fast_path = bool(metadata.get("is_fast_path", False))
+        ready_wait_ms = float(metadata.get("ready_wait_ms", 0.0) or 0.0)
         if not src_host or not src_port or str(src_host).lower() == "auto":
             logger.error(
                 f"Invalid metadata for {get_key}: source_host={src_host!r}, "
@@ -735,19 +857,35 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 recv_buffer=recv_buffer,
                 data_size=data_size,
                 is_fast_path=is_fast_path,
-                query_ms=query_ms,
-                alloc_ms=alloc_ms,
-                rdma_ms=rdma_ms,
-                sync_ms=sync_ms,
                 start_time=_t0,
+                timings={
+                    "query_ms": query_ms,
+                    "alloc_ms": alloc_ms,
+                    "rdma_ms": rdma_ms,
+                    "sync_ms": sync_ms,
+                    "ready_wait_ms": ready_wait_ms,
+                },
             )
         except Exception as e:
             self._metrics["errors"] += 1
             logger.error(f"RDMA result decode failed for {get_key}: {e}", exc_info=True)
             return None
 
-    def _resolve_metadata(self, get_key: str, metadata: dict[str, Any] | None) -> dict[str, Any] | None:
-        """Resolve full transfer metadata for a receive request."""
+    def _resolve_metadata(
+        self,
+        get_key: str,
+        metadata: dict[str, Any] | None,
+        *,
+        is_packed_lookup: bool = False,
+    ) -> dict[str, Any] | None:
+        """Resolve full transfer metadata for a receive request.
+
+        ``is_packed_lookup`` selects the query strategy for the "no metadata"
+        path: packed lookups must resolve synchronously (the reconstruction
+        performs this lookup only once), while ordinary lookups use the
+        deferred readiness mechanism to avoid busy-polling/raising when the
+        producer hasn't published yet.
+        """
         if not metadata:
             # Path 3: no metadata at all — query default sender
             if not self.sender_host or not self.sender_zmq_port or str(self.sender_host).lower() == "auto":
@@ -756,7 +894,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     f"but sender_host={self.sender_host!r}, sender_zmq_port={self.sender_zmq_port!r}. "
                     f"Call update_sender_info(host, port) before using get() without metadata."
                 )
-            return self._query_metadata_from_sender(get_key)
+            if is_packed_lookup:
+                return self._query_metadata_from_sender(get_key)
+            return self._get_metadata_when_ready_from_sender(get_key)
 
         if "data_size" in metadata:
             # Path 1: metadata is complete
@@ -832,21 +972,20 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         recv_buffer: ManagedBuffer,
         data_size: int,
         is_fast_path: bool,
-        query_ms: float,
-        alloc_ms: float,
-        rdma_ms: float,
-        sync_ms: float,
         start_time: float,
+        timings: dict[str, float] | None = None,
     ) -> tuple[Any, int]:
         """Decode a completed transfer result."""
+        if timings is None:
+            timings = {}
         if is_fast_path:
             try:
-                total_ms = (_time_mod.perf_counter() - start_time) * 1000
-                mbps = (data_size / 1024 / 1024) / (total_ms / 1000) if total_ms > 0 else 0
+                timings["total_ms"] = (_time_mod.perf_counter() - start_time) * 1000
+                timings["mbps"] = (
+                    (data_size / 1024 / 1024) / (timings["total_ms"] / 1000) if timings["total_ms"] > 0 else 0
+                )
                 logger.info(
-                    f"[RDMA GET] {get_key}: query={query_ms:.1f}ms, alloc={alloc_ms:.1f}ms, "
-                    f"rdma={rdma_ms:.1f}ms, sync={sync_ms:.1f}ms, "
-                    f"total={total_ms:.1f}ms, {mbps:.1f} MB/s (fast_path, zero-copy)"
+                    f"[RDMA GET] {get_key} (fast path): " + ", ".join(f"{k}={v:.1f}" for k, v in timings.items())
                 )
                 self._metrics["gets"] += 1
                 self._metrics["bytes_transferred"] += data_size
@@ -858,7 +997,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         try:
             copy_start = _time_mod.perf_counter()
             raw_bytes = recv_buffer.to_bytes()
-            copy_ms = (_time_mod.perf_counter() - copy_start) * 1000
+            timings["copy_ms"] = (_time_mod.perf_counter() - copy_start) * 1000
 
             deser_start = _time_mod.perf_counter()
             payload = raw_bytes[:data_size]
@@ -867,15 +1006,11 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             except msgspec.DecodeError:
                 payload = raw_bytes[1 : data_size + 1]
                 value = OmniSerializer.deserialize(payload)
-            deser_ms = (_time_mod.perf_counter() - deser_start) * 1000
+            timings["deser_ms"] = (_time_mod.perf_counter() - deser_start) * 1000
 
-            total_ms = (_time_mod.perf_counter() - start_time) * 1000
-            mbps = (data_size / 1024 / 1024) / (total_ms / 1000) if total_ms > 0 else 0
-            logger.info(
-                f"[RDMA GET] {get_key}: query={query_ms:.1f}ms, alloc={alloc_ms:.1f}ms, "
-                f"rdma={rdma_ms:.1f}ms, sync={sync_ms:.1f}ms, copy={copy_ms:.1f}ms, "
-                f"deser={deser_ms:.1f}ms, total={total_ms:.1f}ms, {mbps:.1f} MB/s"
-            )
+            timings["total_ms"] = (_time_mod.perf_counter() - start_time) * 1000
+            timings["mbps"] = (data_size / 1024 / 1024) / (timings["total_ms"] / 1000) if timings["total_ms"] > 0 else 0
+            logger.info(f"[RDMA GET] {get_key} (slow path): " + ", ".join(f"{k}={v:.1f}" for k, v in timings.items()))
             self._metrics["gets"] += 1
             self._metrics["bytes_transferred"] += data_size
             return value, data_size
@@ -964,6 +1099,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     holder.release()
             self._local_buffers.clear()
             self._in_flight_buffers.clear()
+            self._metadata_waiters.clear()
 
         # 5. Close thread-local cached REQ sockets (for the calling thread).
         #    Sockets cached in *other* threads are not directly accessible here
@@ -978,6 +1114,17 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 except Exception:
                     pass  # Best-effort; zmq_ctx.term() below will reclaim
             cache.clear()
+
+        wait_sockets: dict[str, zmq.Socket] = getattr(self._wait_local, "sockets", None)  # type: ignore[assignment]
+        if wait_sockets:
+            for sock in wait_sockets.values():
+                try:
+                    sock.close(linger=0)
+                except Exception:
+                    pass
+            wait_sockets.clear()
+        self._wait_local.pending = {}
+        self._wait_local.ready = {}
 
         # 6. Unregister memory from engine (if supported)
         try:
@@ -1025,6 +1172,53 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 if should_release and isinstance(holder, ManagedBuffer):
                     holder.release()
                 logger.warning(f"TTL expired ({self.buffer_ttl_seconds}s): cleaned up stale buffer for {k}")
+            stale_waiter_count = 0
+            for request_id, waiters in list(self._metadata_waiters.items()):
+                for envelope, created_at in list(waiters.items()):
+                    if now - created_at > self.buffer_ttl_seconds:
+                        waiters.pop(envelope, None)
+                        stale_waiter_count += 1
+                if not waiters:
+                    self._metadata_waiters.pop(request_id, None)
+            if stale_waiter_count:
+                logger.warning(f"TTL expired: cleaned up {stale_waiter_count} stale metadata waiters")
+
+    @staticmethod
+    def _encode_query_response(request_id: str, item: tuple[Any, ...]) -> bytes:
+        _, src_lengths, _, _, is_fast_path, _ = item
+        return msgspec.msgpack.encode(
+            QueryResponse(
+                request_id=request_id,
+                data_size=src_lengths[0] if src_lengths else 0,
+                is_fast_path=is_fast_path,
+            )
+        )
+
+    def _register_metadata_waiter(
+        self,
+        envelope: tuple[bytes, ...],
+        payload: bytes,
+    ) -> bytes | None:
+        """Return ready metadata now, or retain the reply envelope until put."""
+
+        try:
+            query = msgspec.msgpack.decode(payload, type=QueryRequest)
+            with self._local_buffers_lock:
+                item = self._local_buffers.get(query.request_id)
+                if item is None:
+                    self._metadata_waiters.setdefault(query.request_id, {})[envelope] = _time_mod.monotonic()
+                    return None
+                return self._encode_query_response(query.request_id, item)
+        except Exception as e:
+            logger.error(f"Wait request failed: {e}")
+            return INFO_NOT_FOUND
+
+    def _pop_ready_waiters(self, request_id: str) -> tuple[list[tuple[bytes, ...]], bytes | None]:
+        with self._local_buffers_lock:
+            waiters = list(self._metadata_waiters.pop(request_id, {}))
+            item = self._local_buffers.get(request_id)
+            response = self._encode_query_response(request_id, item) if item is not None else None
+        return waiters, response
 
     def _zmq_listener_loop(self):
         socket = self.zmq_ctx.socket(zmq.ROUTER)
@@ -1039,18 +1233,19 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             self._listener_ready.set()
             return  # let __init__ propagate the error
 
-        # Successfully bound - signal ready
-        self._listener_ready.set()
-
         # Create inproc socket pair for worker thread notifications
         # This allows workers to wake up the listener immediately when done
         notify_addr = f"inproc://notify-{id(self)}"
         notify_recv = self.zmq_ctx.socket(zmq.PULL)
         notify_recv.bind(notify_addr)
+        self._listener_notify_addr = notify_addr
 
         poller = zmq.Poller()
         poller.register(socket, zmq.POLLIN)
         poller.register(notify_recv, zmq.POLLIN)
+
+        # Both request and notification sockets are ready for producer puts.
+        self._listener_ready.set()
 
         # Response queue for thread-safe socket operations
         response_queue: queue.Queue = queue.Queue()
@@ -1077,6 +1272,17 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                         except queue.Empty:
                             break
 
+                    # Publish metadata for keys whose producer buffers became ready.
+                    while True:
+                        try:
+                            request_id = self._ready_keys.get_nowait()
+                        except queue.Empty:
+                            break
+                        waiters, response = self._pop_ready_waiters(request_id)
+                        if response is not None:
+                            for envelope in waiters:
+                                socket.send_multipart([*envelope, response])
+
                     # Periodic TTL cleanup (~every 10s)
                     now = _time_mod.monotonic()
                     if now - self._last_ttl_check >= 10.0:
@@ -1087,14 +1293,19 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     if socket in events:
                         frames = socket.recv_multipart()
                         if len(frames) >= 2:
+                            envelope = tuple(frames[:-1])
                             identity = frames[0]
                             payload = frames[-1]
-                            if payload.startswith(QUERY_INFO):
+                            if payload.startswith(WAIT_INFO):
+                                response = self._register_metadata_waiter(envelope, payload[len(WAIT_INFO) :])
+                                if response is not None:
+                                    socket.send_multipart([*envelope, response])
+                            elif payload.startswith(QUERY_INFO):
                                 # Metadata lookup is a short local operation. Handle it
                                 # on the listener thread so polling misses cannot occupy
                                 # the executor used by synchronous RDMA writes.
                                 response = self._build_query_response(payload[len(QUERY_INFO) :])
-                                socket.send_multipart([identity, b"", response])
+                                socket.send_multipart([*envelope, response])
                             else:
                                 self._sender_executor.submit(
                                     self._handle_pull_request,
@@ -1108,6 +1319,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 except Exception:
                     logger.debug("Listener loop error", exc_info=True)
         finally:
+            self._listener_notify_addr = None
             try:
                 notify_recv.close(linger=0)
                 socket.close(linger=0)
@@ -1170,14 +1382,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             if not item:
                 return INFO_NOT_FOUND
 
-            _, src_lengths, _, _, is_fast_path, _ = item
-            response = QueryResponse(
-                request_id=query.request_id,
-                data_size=src_lengths[0] if src_lengths else 0,
-                is_fast_path=is_fast_path,
-            )
-            return msgspec.msgpack.encode(response)
-
+            return self._encode_query_response(query.request_id, item)
         except Exception as e:
             logger.error(f"Query request failed: {e}")
             return INFO_NOT_FOUND

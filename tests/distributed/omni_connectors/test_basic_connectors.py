@@ -195,3 +195,75 @@ def test_mooncake_connector_defaults_missing_host_to_detected_ip(monkeypatch: py
         assert connector.get_connection_info()["host"] == "10.20.30.40"
     finally:
         connector.close()
+
+
+def _patch_fake_mooncake(monkeypatch: pytest.MonkeyPatch):
+    """Monkeypatch the Mooncake engine/pool so the connector builds without RDMA."""
+    import vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector as mooncake_module
+
+    class _FakePool:
+        is_cuda = False
+
+        def pin_memory(self):
+            return self
+
+        def data_ptr(self):
+            return 1234
+
+    class _FakeTransferEngine:
+        def initialize(self, host, mode, protocol, device_name):
+            return 0
+
+        def get_rpc_port(self):
+            return 23456
+
+        def register_memory(self, base_ptr, pool_size):
+            return 0
+
+        def unregister_memory(self, base_ptr):
+            return 0
+
+    monkeypatch.setattr(mooncake_module, "TransferEngine", _FakeTransferEngine)
+    monkeypatch.setattr(mooncake_module.torch, "empty", lambda *args, **kwargs: _FakePool())
+    monkeypatch.setattr(
+        mooncake_module.MooncakeTransferEngineConnector,
+        "_get_local_ip",
+        lambda self: "10.20.30.40",
+    )
+    monkeypatch.setattr(
+        mooncake_module.MooncakeTransferEngineConnector,
+        "_zmq_listener_loop",
+        lambda self: self._listener_ready.set(),
+    )
+    return mooncake_module
+
+
+def test_mooncake_connector_duplex_role_binds_and_gets(monkeypatch: pytest.MonkeyPatch):
+    """role='duplex' binds the outbound listener (can_put) and also allows
+    get() from upstream (can_get) on a single instance."""
+    mooncake_module = _patch_fake_mooncake(monkeypatch)
+
+    connector = mooncake_module.MooncakeTransferEngineConnector(
+        {
+            "zmq_port": 50052,
+            "memory_pool_size": 4096,
+            "role": "duplex",
+            "sender_host": "10.20.30.41",
+            "sender_zmq_port": 50051,
+        }
+    )
+    try:
+        assert connector.can_put is True
+        assert connector.can_get is True
+        # A duplex instance binds its own listener (can_put) yet also holds the
+        # upstream endpoint for get().
+        assert connector.sender_host == "10.20.30.41"
+        assert connector.sender_zmq_port == 50051
+    finally:
+        connector.close()
+
+
+def test_mooncake_connector_rejects_unknown_role(monkeypatch: pytest.MonkeyPatch):
+    mooncake_module = _patch_fake_mooncake(monkeypatch)
+    with pytest.raises(ValueError, match="Invalid role"):
+        mooncake_module.MooncakeTransferEngineConnector({"zmq_port": 50051, "memory_pool_size": 4096, "role": "bogus"})

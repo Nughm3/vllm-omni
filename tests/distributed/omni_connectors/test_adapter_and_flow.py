@@ -199,23 +199,137 @@ def test_get_connectors_for_stage():
     # Config has edges: 0->1, 1->2
     config = OmniTransferConfig(connectors={("0", "1"): ConnectorSpec(name="C1"), ("1", "2"): ConnectorSpec(name="C2")})
 
-    # Get config for Stage 1
-    # Stage 1 receives from 0 (input) and sends to 2 (output)
-    # get_connectors_config_for_stage ONLY returns INPUT connectors for the worker to initialize
-
+    # Stage 1 receives from 0 and sends to 2 — both edges are returned so
+    # resolve_stage_connector_specs can split them into (input, output).
     stage_config = get_connectors_config_for_stage(config, stage_id=1)
 
-    # Should contain "from_stage_0"
     assert "from_stage_0" in stage_config
     assert stage_config["from_stage_0"]["spec"]["name"] == "C1"
 
-    # Should NOT contain "from_stage_1" or related to output
+    assert "to_stage_2" in stage_config
+    assert stage_config["to_stage_2"]["spec"]["name"] == "C2"
+
+    # Unrelated edges must not appear.
     assert "from_stage_1" not in stage_config
 
-    # Verify Stage 2
     stage_2_config = get_connectors_config_for_stage(config, stage_id=2)
     assert "from_stage_1" in stage_2_config
     assert stage_2_config["from_stage_1"]["spec"]["name"] == "C2"
+    assert "to_stage_2" not in stage_2_config
+
+    stage_0_config = get_connectors_config_for_stage(config, stage_id=0)
+    assert "to_stage_1" in stage_0_config
+    assert "from_stage_0" not in stage_0_config
+
+
+def test_resolve_stage_connector_specs_same_type_mooncake():
+    """A same-type middle stage yields two Mooncake specs (input + output),
+    each with its own role and ports; the mixin collapses them into one duplex
+    instance. Stage 0 has only an output spec; the last stage only an input."""
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        resolve_stage_connector_specs,
+    )
+
+    config = OmniTransferConfig(
+        connectors={
+            ("0", "1"): ConnectorSpec(
+                name="MooncakeTransferEngineConnector",
+                extra={
+                    "host": "auto",
+                    "zmq_port": 50051,
+                    "sender_host": "10.248.12.80",
+                    "protocol": "rdma",
+                },
+            ),
+            ("1", "2"): ConnectorSpec(
+                name="MooncakeTransferEngineConnector",
+                extra={
+                    "host": "auto",
+                    "zmq_port": 50051,
+                    "sender_host": "10.248.12.86",
+                    "protocol": "rdma",
+                },
+            ),
+        }
+    )
+
+    # Middle stage: both edges present, same type.
+    recv_spec, send_spec = resolve_stage_connector_specs(get_connectors_config_for_stage(config, stage_id=1))
+    assert recv_spec["name"] == "MooncakeTransferEngineConnector"
+    assert recv_spec["extra"]["role"] == "receiver"
+    assert recv_spec["extra"]["sender_host"] == "10.248.12.80"
+    assert recv_spec["extra"]["sender_zmq_port"] == 50051
+    assert send_spec["name"] == "MooncakeTransferEngineConnector"
+    assert send_spec["extra"]["role"] == "sender"
+    # Listen on base+stage1 (outbound edge from stage 1).
+    assert send_spec["extra"]["zmq_port"] == 50052
+
+    # Stage 0: outbound only.
+    recv0, send0 = resolve_stage_connector_specs(get_connectors_config_for_stage(config, stage_id=0))
+    assert recv0 is None
+    assert send0["extra"]["role"] == "sender"
+    assert send0["extra"]["zmq_port"] == 50051
+
+    # Last stage: inbound only.
+    recv2, send2 = resolve_stage_connector_specs(get_connectors_config_for_stage(config, stage_id=2))
+    assert send2 is None
+    assert recv2["extra"]["role"] == "receiver"
+    assert recv2["extra"]["sender_host"] == "10.248.12.86"
+    assert recv2["extra"]["sender_zmq_port"] == 50052
+
+
+def test_resolve_stage_connector_specs_hybrid_mooncake_shm():
+    """A hybrid middle stage (Mooncake inbound + SHM outbound) yields two
+    different-type specs; the mixin builds two distinct instances."""
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        resolve_stage_connector_specs,
+    )
+
+    config = OmniTransferConfig(
+        connectors={
+            ("0", "1"): ConnectorSpec(
+                name="MooncakeTransferEngineConnector",
+                extra={
+                    "host": "auto",
+                    "zmq_port": 50051,
+                    "sender_host": "10.248.12.80",
+                    "protocol": "rdma",
+                },
+            ),
+            ("1", "2"): ConnectorSpec(
+                name="SharedMemoryConnector",
+                extra={
+                    "initial_codec_chunk_frames": 4,
+                    "codec_chunk_frames": 25,
+                    "codec_left_context_frames": 25,
+                },
+            ),
+        }
+    )
+
+    recv_spec, send_spec = resolve_stage_connector_specs(get_connectors_config_for_stage(config, stage_id=1))
+    assert recv_spec["name"] == "MooncakeTransferEngineConnector"
+    assert recv_spec["extra"]["sender_host"] == "10.248.12.80"
+    assert recv_spec["extra"]["sender_zmq_port"] == 50051
+    assert send_spec["name"] == "SharedMemoryConnector"
+    assert send_spec["extra"]["codec_chunk_frames"] == 25
+
+    recv0, send0 = resolve_stage_connector_specs(get_connectors_config_for_stage(config, stage_id=0))
+    assert recv0 is None
+    assert send0["name"] == "MooncakeTransferEngineConnector"
+
+    recv2, send2 = resolve_stage_connector_specs(get_connectors_config_for_stage(config, stage_id=2))
+    assert send2 is None
+    assert recv2["name"] == "SharedMemoryConnector"
+
+
+def test_resolve_stage_connector_specs_empty():
+    """No transfer config resolves to (None, None)."""
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        resolve_stage_connector_specs,
+    )
+
+    assert resolve_stage_connector_specs({}) == (None, None)
 
 
 def test_recv_with_missing_metadata(mocker: MockerFixture):

@@ -9,7 +9,6 @@ GPU or vLLM runtime.
 from __future__ import annotations
 
 import time
-import unittest
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -78,9 +77,25 @@ def _make_request(req_id: str, external_req_id: str | None = None):
 
 
 class MixinHost(OmniConnectorModelRunnerMixin):
-    """Minimal class that mixes in the mixin for testing."""
+    """Minimal class that mixes in the mixin for testing.
 
-    pass
+    Exposes a back-compat ``_omni_connector`` property: the mixin now holds
+    separate ``_recv_connector`` / ``_send_connector`` (one duplex instance
+    for same-type stages, two for hybrid). Tests that inject a single mock via
+    ``host._omni_connector = mock`` still work — the setter points both
+    directions at it, and the getter returns the send connector (falling back
+    to recv), matching the old single-connector semantics.
+    """
+
+    @property
+    def _omni_connector(self):
+        send = getattr(self, "_send_connector", None)
+        return send if send is not None else getattr(self, "_recv_connector", None)
+
+    @_omni_connector.setter
+    def _omni_connector(self, connector):
+        self._recv_connector = connector
+        self._send_connector = connector
 
 
 class _FakeTPGroup:
@@ -102,7 +117,7 @@ class _FakeTPGroup:
 # ------------------------------------------------------------------ #
 
 
-class TestMixinAsyncChunkSendRecv(unittest.TestCase):
+class TestMixinAsyncChunkSendRecv:
     """Test 2: Async chunk send/recv + bg threads."""
 
     def test_send_chunk_passes_is_finished_and_connector(self):
@@ -136,8 +151,8 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
                 "pooling_output": {"value": 42},
             }
         )
-        self.assertIs(seen["connector"], connector)
-        self.assertTrue(seen["is_finished"])
+        assert seen["connector"] is connector
+        assert seen["is_finished"]
 
         sender.shutdown_omni_connectors()
 
@@ -163,13 +178,13 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
         request = _make_request("req-1", "ext-req-1")
         request.is_finished = lambda: True
         ok = sender.send_chunk(request, pooling_output={"value": 42})
-        self.assertFalse(ok)
-        self.assertEqual(seen["calls"], 1)
+        assert not ok
+        assert seen["calls"] == 1
 
         sender.shutdown_omni_connectors()
 
 
-class TestMixinKVCacheTransfer(unittest.TestCase):
+class TestMixinKVCacheTransfer:
     """Test 3: KV cache delegation to OmniKVTransferManager."""
 
     def test_send_kv_delegates(self):
@@ -188,7 +203,7 @@ class TestMixinKVCacheTransfer(unittest.TestCase):
             block_size=16,
             cache_dtype="float16",
         )
-        self.assertEqual(result, ["req-1"])
+        assert result == ["req-1"]
         mock_kvm.handle_finished_requests_kv_transfer.assert_called_once()
 
         host.shutdown_omni_connectors()
@@ -204,8 +219,8 @@ class TestMixinKVCacheTransfer(unittest.TestCase):
         )
 
         data, size = host.recv_kv_cache("req-1")
-        self.assertIsNotNone(data)
-        self.assertEqual(size, 100)
+        assert data is not None
+        assert size == 100
         mock_kvm.receive_kv_cache_for_request.assert_called_once()
 
         host.shutdown_omni_connectors()
@@ -234,16 +249,13 @@ class TestMixinKVCacheTransfer(unittest.TestCase):
             sampling_params=SimpleNamespace(cfg_kv_request_ids={"cfg_text": "req-1__cfg_text"}),
         )
         ok = host.receive_multi_kv_cache(req, cfg_kv_collect_func=collect_cfg)
-        self.assertTrue(ok)
+        assert ok
         host.recv_kv_cache.assert_any_call("req-1", target_device=None)
         host.recv_kv_cache.assert_any_call("req-1__cfg_text", target_device=None)
         mock_kvm.apply_kv_cache_to_request.assert_called_once_with(req, {"layer_blocks": {"k": [1]}})
-        self.assertEqual(seen["request_id"], "req-1")
-        self.assertEqual(
-            seen["cfg_role_payloads"],
-            {"cfg_text": ({"layer_blocks": {"k": [2]}}, 32)},
-        )
-        self.assertEqual(req.sampling_params.cfg_text_kv_metadata, {"seq_len": 3})
+        assert seen["request_id"] == "req-1"
+        assert seen["cfg_role_payloads"] == {"cfg_text": ({"layer_blocks": {"k": [2]}}, 32)}
+        assert req.sampling_params.cfg_text_kv_metadata == {"seq_len": 3}
 
         host.shutdown_omni_connectors()
 
@@ -262,14 +274,14 @@ class TestMixinKVCacheTransfer(unittest.TestCase):
 
         ok = host.receive_multi_kv_cache(req)
 
-        self.assertFalse(ok)
+        assert not ok
         host.recv_kv_cache.assert_not_called()
         mock_kvm.apply_kv_cache_to_request.assert_not_called()
 
         host.shutdown_omni_connectors()
 
 
-class TestOmniConnectorOutput(unittest.TestCase):
+class TestOmniConnectorOutput:
     """Test 4: Output aggregation across transfer modes."""
 
     def test_output_aggregation(self):
@@ -284,20 +296,20 @@ class TestOmniConnectorOutput(unittest.TestCase):
         host._stage_recv_req_ids.add("req-3")
 
         output = host.get_omni_connector_output()
-        self.assertIsInstance(output, OmniConnectorOutput)
-        self.assertEqual(output.chunk_ready_req_ids, {"req-1"})
-        self.assertEqual(output.chunk_finished_req_ids, {"req-2"})
-        self.assertEqual(output.request_metadata, {"req-1": {"next_stage_prompt_len": 10}})
-        self.assertEqual(output.stage_recv_req_ids, {"req-3"})
+        assert isinstance(output, OmniConnectorOutput)
+        assert output.chunk_ready_req_ids == {"req-1"}
+        assert output.chunk_finished_req_ids == {"req-2"}
+        assert output.request_metadata == {"req-1": {"next_stage_prompt_len": 10}}
+        assert output.stage_recv_req_ids == {"req-3"}
 
         output2 = host.get_omni_connector_output()
-        self.assertEqual(output2.chunk_ready_req_ids, set())
-        self.assertEqual(output2.request_metadata, {})
+        assert output2.chunk_ready_req_ids == set()
+        assert output2.request_metadata == {}
 
         host.shutdown_omni_connectors()
 
 
-class TestMixinNoConnector(unittest.TestCase):
+class TestMixinNoConnector:
     """Edge case: mixin works gracefully without a connector."""
 
     def test_no_connector(self):
@@ -305,24 +317,24 @@ class TestMixinNoConnector(unittest.TestCase):
         host.init_omni_connectors(
             model_config=_make_model_config(),
         )
-        self.assertIsNone(host._omni_connector)
+        assert host._omni_connector is None
 
         results = host.recv_full_payload_inputs(scheduler_output=None)
-        self.assertIsNone(results)
+        assert results is None
 
         sent = host.send_full_payload_outputs(None, {"req-1": {}})
-        self.assertEqual(sent, [])
+        assert sent == []
 
         ok = host.send_chunk(_make_request("req-1"), pooling_output={})
-        self.assertFalse(ok)
+        assert not ok
 
         output = host.get_omni_connector_output()
-        self.assertIsInstance(output, OmniConnectorOutput)
+        assert isinstance(output, OmniConnectorOutput)
 
         host.shutdown_omni_connectors()
 
 
-class TestFinishedLoadReqsDrain(unittest.TestCase):
+class TestFinishedLoadReqsDrain:
     """Test A1 fix: get_omni_connector_output drains _finished_load_reqs."""
 
     def test_finished_load_reqs_flow_to_chunk_ready(self):
@@ -335,16 +347,16 @@ class TestFinishedLoadReqsDrain(unittest.TestCase):
         host._finished_load_reqs.add("req-2")
 
         output = host.get_omni_connector_output()
-        self.assertIn("req-1", output.chunk_ready_req_ids)
-        self.assertIn("req-2", output.chunk_ready_req_ids)
+        assert "req-1" in output.chunk_ready_req_ids
+        assert "req-2" in output.chunk_ready_req_ids
 
-        self.assertEqual(len(host._finished_load_reqs), 0)
-        self.assertEqual(len(host._chunk_ready_req_ids), 0)
+        assert len(host._finished_load_reqs) == 0
+        assert len(host._chunk_ready_req_ids) == 0
 
         host.shutdown_omni_connectors()
 
 
-class TestLoadCustomFuncSelection(unittest.TestCase):
+class TestLoadCustomFuncSelection:
     def test_skips_non_payload_stage_input_processors_for_full_payload_mode(self):
         incompatible_paths = [
             "vllm_omni.model_executor.stage_input_processors.mimo_audio.llm2code2wav",
@@ -365,7 +377,7 @@ class TestLoadCustomFuncSelection(unittest.TestCase):
             assert func is None or MixinHost._is_connector_payload_builder(func)
 
 
-class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
+class TestFullPayloadSendWithCustomFunc:
     """Test B4: send_full_payload_outputs with full_payload_mode custom process func."""
 
     def test_full_payload_send_passes_is_finished_and_connector(self):
@@ -392,16 +404,13 @@ class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
             scheduler_output=None,
             outputs={"req-1": ({"raw": 100}, req)},
         )
-        self.assertEqual(sent, ["req-1"])
-        self.assertEqual(
-            seen,
-            {
-                "connector": host._omni_connector,
-                "is_finished": True,
-                "data": {"raw": 100},
-                "rid": "req-1",
-            },
-        )
+        assert sent == ["req-1"]
+        assert seen == {
+            "connector": host._omni_connector,
+            "is_finished": True,
+            "data": {"raw": 100},
+            "rid": "req-1",
+        }
 
         host.shutdown_omni_connectors()
 
@@ -422,18 +431,18 @@ class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
 
         req = _make_request("req-1")
         host.accumulate_full_payload_output("req-1", {"raw": 42}, req)
-        self.assertEqual(len(host._pending_full_payload_send), 1)
+        assert len(host._pending_full_payload_send) == 1
 
         host.flush_full_payload_outputs({"req-1"})
-        self.assertEqual(len(host._pending_full_payload_send), 0)
-        self.assertEqual(len(call_log), 1)
-        self.assertEqual(call_log[0], "req-1")
+        assert len(host._pending_full_payload_send) == 0
+        assert len(call_log) == 1
+        assert call_log[0] == "req-1"
 
         time.sleep(0.1)
         host.shutdown_omni_connectors()
 
 
-class TestKVSentReqIdsAccumulation(unittest.TestCase):
+class TestKVSentReqIdsAccumulation:
     """Test that kv_sent_req_ids accumulates results from send_kv_cache."""
 
     def test_kv_sent_accumulation(self):
@@ -454,16 +463,16 @@ class TestKVSentReqIdsAccumulation(unittest.TestCase):
         )
 
         output = host.get_omni_connector_output()
-        self.assertIn("req-1", output.kv_sent_req_ids)
-        self.assertIn("req-2", output.kv_sent_req_ids)
+        assert "req-1" in output.kv_sent_req_ids
+        assert "req-2" in output.kv_sent_req_ids
 
         output2 = host.get_omni_connector_output()
-        self.assertEqual(output2.kv_sent_req_ids, [])
+        assert output2.kv_sent_req_ids == []
 
         host.shutdown_omni_connectors()
 
 
-class TestChunkStreamCompletedGuard(unittest.TestCase):
+class TestChunkStreamCompletedGuard:
     """Test that register_chunk_recv is skipped after finish sentinel.
 
     This validates the fix for the race condition where the scheduling
@@ -498,11 +507,7 @@ class TestChunkStreamCompletedGuard(unittest.TestCase):
         host.register_chunk_recv(req)
 
         # The request must NOT appear in _pending_load_reqs
-        self.assertNotIn(
-            "req-1",
-            host._pending_load_reqs,
-            "register_chunk_recv should skip requests whose chunk stream is already complete",
-        )
+        assert "req-1" not in host._pending_load_reqs
 
         host.shutdown_omni_connectors()
 
@@ -512,11 +517,7 @@ class TestChunkStreamCompletedGuard(unittest.TestCase):
         req = _make_request("req-1", "ext-req-1")
 
         host.register_chunk_recv(req)
-        self.assertIn(
-            "req-1",
-            host._pending_load_reqs,
-            "register_chunk_recv should add request to pending when stream is not yet complete",
-        )
+        assert "req-1" in host._pending_load_reqs
 
         host.shutdown_omni_connectors()
 
@@ -534,12 +535,12 @@ class TestChunkStreamCompletedGuard(unittest.TestCase):
             host._finished_load_reqs.add(req_id)
             host._pending_load_reqs.pop(req_id, None)
 
-        self.assertIn(req_id, host._chunk_stream_completed)
+        assert req_id in host._chunk_stream_completed
 
         # Subsequent register_chunk_recv should be blocked
         req = _make_request(req_id, f"ext-{req_id}")
         host.register_chunk_recv(req)
-        self.assertNotIn(req_id, host._pending_load_reqs)
+        assert req_id not in host._pending_load_reqs
 
         host.shutdown_omni_connectors()
 
@@ -550,7 +551,7 @@ class TestChunkStreamCompletedGuard(unittest.TestCase):
 
         req = _make_request("req-1")
         host.register_chunk_recv(req)
-        self.assertNotIn("req-1", host._pending_load_reqs)
+        assert "req-1" not in host._pending_load_reqs
 
         host.shutdown_omni_connectors()
 
@@ -563,12 +564,12 @@ class TestChunkStreamCompletedGuard(unittest.TestCase):
 
         req = _make_request("req-1", "ext-req-1")
         host.register_chunk_recv(req)
-        self.assertNotIn("req-1", host._pending_load_reqs)
+        assert "req-1" not in host._pending_load_reqs
 
         host.shutdown_omni_connectors()
 
 
-class TestCleanupFinishedRequest(unittest.TestCase):
+class TestCleanupFinishedRequest:
     """Test cleanup_finished_request frees per-request mixin state."""
 
     def _make_host(self, stage_id: int = 1) -> MixinHost:
@@ -603,16 +604,16 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         host.cleanup_finished_request(req_id)
 
         # All state should be gone
-        self.assertNotIn(req_id, host._request_ids_mapping)
-        self.assertNotIn(ext_id, host._put_req_chunk)
-        self.assertNotIn(req_id, host._get_req_chunk)
-        self.assertNotIn(ext_id, host._send_side_request_payload)
-        self.assertNotIn(ext_id, host._code_prompt_token_ids)
-        self.assertNotIn(ext_id, host._cached_ic)
-        self.assertNotIn(req_id, host._chunk_stream_completed)
-        self.assertNotIn(req_id, host._stage_recv_req_ids)
-        self.assertNotIn(req_id, host._local_stage_payload_cache)
-        self.assertNotIn(req_id, host._local_request_metadata)
+        assert req_id not in host._request_ids_mapping
+        assert ext_id not in host._put_req_chunk
+        assert req_id not in host._get_req_chunk
+        assert ext_id not in host._send_side_request_payload
+        assert ext_id not in host._code_prompt_token_ids
+        assert ext_id not in host._cached_ic
+        assert req_id not in host._chunk_stream_completed
+        assert req_id not in host._stage_recv_req_ids
+        assert req_id not in host._local_stage_payload_cache
+        assert req_id not in host._local_request_metadata
 
         host.shutdown_omni_connectors()
 
@@ -628,10 +629,10 @@ class TestCleanupFinishedRequest(unittest.TestCase):
 
         host.cleanup_finished_request(req_id)
 
-        self.assertNotIn(req_id, host._pending_load_reqs)
-        self.assertNotIn(req_id, host._finished_load_reqs)
-        self.assertNotIn(req_id, host._chunk_ready_req_ids)
-        self.assertNotIn(req_id, host._chunk_finished_req_ids)
+        assert req_id not in host._pending_load_reqs
+        assert req_id not in host._finished_load_reqs
+        assert req_id not in host._chunk_ready_req_ids
+        assert req_id not in host._chunk_finished_req_ids
 
         host.shutdown_omni_connectors()
 
@@ -648,9 +649,9 @@ class TestCleanupFinishedRequest(unittest.TestCase):
 
         host.cleanup_finished_request(req_id)
 
-        self.assertNotIn(req_id, host._put_req_chunk)
-        self.assertNotIn(req_id, host._get_req_chunk)
-        self.assertNotIn(req_id, host._cached_ic)
+        assert req_id not in host._put_req_chunk
+        assert req_id not in host._get_req_chunk
+        assert req_id not in host._cached_ic
 
         host.shutdown_omni_connectors()
 
@@ -665,13 +666,13 @@ class TestCleanupFinishedRequest(unittest.TestCase):
 
         host.cleanup_finished_request(req_id)
 
-        self.assertIn(ext_id, host._deferred_send_cleanup)
-        self.assertIn(ext_id, host._cached_ic)
+        assert ext_id in host._deferred_send_cleanup
+        assert ext_id in host._cached_ic
 
         host._decrement_pending_save_count(ext_id)
 
-        self.assertNotIn(ext_id, host._deferred_send_cleanup)
-        self.assertNotIn(ext_id, host._cached_ic)
+        assert ext_id not in host._deferred_send_cleanup
+        assert ext_id not in host._cached_ic
 
         host.shutdown_omni_connectors()
 
@@ -696,21 +697,21 @@ class TestCleanupFinishedRequest(unittest.TestCase):
 
         pruned = host.prune_inactive_requests({active_req_id})
 
-        self.assertEqual(pruned, {stale_req_id})
-        self.assertIn(active_req_id, host._request_ids_mapping)
-        self.assertIn(active_req_id, host._chunk_ready_req_ids)
-        self.assertIn(active_req_id, host._stage_recv_req_ids)
-        self.assertNotIn(stale_req_id, host._request_ids_mapping)
-        self.assertNotIn(stale_ext_id, host._put_req_chunk)
-        self.assertNotIn(stale_req_id, host._get_req_chunk)
-        self.assertNotIn(stale_req_id, host._pending_load_reqs)
-        self.assertNotIn(stale_req_id, host._finished_load_reqs)
-        self.assertNotIn(stale_req_id, host._chunk_ready_req_ids)
-        self.assertNotIn(stale_req_id, host._chunk_finished_req_ids)
-        self.assertNotIn(stale_req_id, host._chunk_stream_completed)
-        self.assertNotIn(stale_req_id, host._stage_recv_req_ids)
-        self.assertNotIn(stale_ext_id, host._send_side_request_payload)
-        self.assertNotIn(stale_ext_id, host._code_prompt_token_ids)
+        assert pruned == {stale_req_id}
+        assert active_req_id in host._request_ids_mapping
+        assert active_req_id in host._chunk_ready_req_ids
+        assert active_req_id in host._stage_recv_req_ids
+        assert stale_req_id not in host._request_ids_mapping
+        assert stale_ext_id not in host._put_req_chunk
+        assert stale_req_id not in host._get_req_chunk
+        assert stale_req_id not in host._pending_load_reqs
+        assert stale_req_id not in host._finished_load_reqs
+        assert stale_req_id not in host._chunk_ready_req_ids
+        assert stale_req_id not in host._chunk_finished_req_ids
+        assert stale_req_id not in host._chunk_stream_completed
+        assert stale_req_id not in host._stage_recv_req_ids
+        assert stale_ext_id not in host._send_side_request_payload
+        assert stale_ext_id not in host._code_prompt_token_ids
 
         host.shutdown_omni_connectors()
 
@@ -728,12 +729,12 @@ class TestCleanupFinishedRequest(unittest.TestCase):
 
         pruned = host.prune_inactive_requests(set())
 
-        self.assertEqual(pruned, set())
-        self.assertIn(req_id, host._request_ids_mapping)
-        self.assertIn(req_id, host._local_stage_payload_cache)
-        self.assertIn(req_id, host._local_request_metadata)
-        self.assertIn(req_id, host._stage_recv_req_ids)
-        self.assertIn(ext_id, host._put_req_chunk)
+        assert pruned == set()
+        assert req_id in host._request_ids_mapping
+        assert req_id in host._local_stage_payload_cache
+        assert req_id in host._local_request_metadata
+        assert req_id in host._stage_recv_req_ids
+        assert ext_id in host._put_req_chunk
 
         # Once the scheduler has consumed the wake-up and the request really
         # disappears from all protected sets, prune should clean it up.
@@ -743,14 +744,14 @@ class TestCleanupFinishedRequest(unittest.TestCase):
 
         pruned = host.prune_inactive_requests(set())
 
-        self.assertEqual(pruned, {req_id})
-        self.assertNotIn(req_id, host._request_ids_mapping)
-        self.assertNotIn(ext_id, host._put_req_chunk)
+        assert pruned == {req_id}
+        assert req_id not in host._request_ids_mapping
+        assert ext_id not in host._put_req_chunk
 
         host.shutdown_omni_connectors()
 
 
-class TestSendChunkCachesMapping(unittest.TestCase):
+class TestSendChunkCachesMapping:
     """Test that send_chunk caches internal→external req ID mapping."""
 
     def test_send_chunk_populates_request_ids_mapping(self):
@@ -772,16 +773,13 @@ class TestSendChunkCachesMapping(unittest.TestCase):
         host.send_chunk(request, pooling_output={"v": 1})
 
         # The mapping should be cached
-        self.assertEqual(
-            host._request_ids_mapping.get("internal-1"),
-            "external-1",
-        )
+        assert host._request_ids_mapping.get("internal-1") == "external-1"
 
         time.sleep(0.1)
         host.shutdown_omni_connectors()
 
 
-class TestLocalPayloadCacheLifecycle(unittest.TestCase):
+class TestLocalPayloadCacheLifecycle:
     """Unit tests for the local payload cache API (RFC §2.4)."""
 
     def _make_host(self) -> MixinHost:
@@ -798,10 +796,10 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         payload = {"engine_inputs": {"ids": [1, 2, 3]}}
         host.put_local_stage_payload("r1", payload)
 
-        self.assertEqual(host.get_local_stage_payload("r1"), payload)
+        assert host.get_local_stage_payload("r1") == payload
         popped = host.pop_local_stage_payload("r1")
-        self.assertEqual(popped, payload)
-        self.assertIsNone(host.get_local_stage_payload("r1"))
+        assert popped == payload
+        assert host.get_local_stage_payload("r1") is None
         host.shutdown_omni_connectors()
 
     def test_recv_full_payload_inputs_populates_local_cache(self):
@@ -815,7 +813,7 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
             host._stage_recv_req_ids.add("r1")
 
         host.recv_full_payload_inputs(scheduler_output=None)
-        self.assertEqual(host.get_local_stage_payload("r1"), {"tok": [10]})
+        assert host.get_local_stage_payload("r1") == {"tok": [10]}
         host.shutdown_omni_connectors()
 
     def test_rank0_only_polls_connector_for_tp_full_payload(self):
@@ -833,13 +831,13 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
             made_progress = host._poll_single_request("r1")
 
-        self.assertTrue(made_progress)
+        assert made_progress
         host._omni_connector.get.assert_called_once_with("1", "2", "ext-r1_1_0")
-        self.assertEqual(tp_group.broadcast_inputs, [])
-        self.assertEqual(host.get_local_stage_payload("r1"), payload)
-        self.assertIn("r1", host._full_payload_pending_broadcast_req_ids)
-        self.assertNotIn("r1", host._stage_recv_req_ids)
-        self.assertIsNone(host.get_local_request_metadata("r1"))
+        assert tp_group.broadcast_inputs == []
+        assert host.get_local_stage_payload("r1") == payload
+        assert "r1" in host._full_payload_pending_broadcast_req_ids
+        assert "r1" not in host._stage_recv_req_ids
+        assert host.get_local_request_metadata("r1") is None
         host.shutdown_omni_connectors()
 
     def test_tp_follower_skips_connector_poll_for_full_payload(self):
@@ -854,10 +852,10 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
             made_progress = host._poll_single_request("r1")
 
-        self.assertFalse(made_progress)
+        assert not made_progress
         host._omni_connector.get.assert_not_called()
-        self.assertEqual(tp_group.broadcast_inputs, [])
-        self.assertNotIn("r1", host._local_stage_payload_cache)
+        assert tp_group.broadcast_inputs == []
+        assert "r1" not in host._local_stage_payload_cache
         host.shutdown_omni_connectors()
 
     def test_recv_full_payload_inputs_broadcasts_tp_leader_results_to_followers(self):
@@ -872,16 +870,16 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
             results = host.recv_full_payload_inputs(scheduler_output=None)
 
-        self.assertEqual(results, {"r1": payload})
-        self.assertEqual(host.get_local_stage_payload("r1"), payload)
-        self.assertEqual(host.get_local_request_metadata("r1"), {})
-        self.assertEqual(host._stage_recv_req_ids, {"r1"})
-        self.assertNotIn("r1", host._pending_load_reqs)
-        self.assertEqual(tp_group.broadcast_inputs, [None])
+        assert results == {"r1": payload}
+        assert host.get_local_stage_payload("r1") == payload
+        assert host.get_local_request_metadata("r1") == {}
+        assert host._stage_recv_req_ids == {"r1"}
+        assert "r1" not in host._pending_load_reqs
+        assert tp_group.broadcast_inputs == [None]
         host.shutdown_omni_connectors()
 
 
-class TestTPAsyncChunkFanout(unittest.TestCase):
+class TestTPAsyncChunkFanout:
     def _make_host(self, rank: int) -> MixinHost:
         host = MixinHost()
         host.init_omni_connectors(
@@ -908,12 +906,12 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
         with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
             made_progress = host._poll_single_request("r1")
 
-        self.assertTrue(made_progress)
+        assert made_progress
         host._omni_connector.get.assert_called_once_with("1", "2", "ext-r1_1_0")
-        self.assertEqual(host.get_local_stage_payload("r1"), payload)
-        self.assertIn("r1", host._finished_load_reqs)
-        self.assertIn("r1", host._async_chunk_updated_req_ids)
-        self.assertEqual(tp_group.broadcast_inputs, [])
+        assert host.get_local_stage_payload("r1") == payload
+        assert "r1" in host._finished_load_reqs
+        assert "r1" in host._async_chunk_updated_req_ids
+        assert tp_group.broadcast_inputs == []
         host.shutdown_omni_connectors()
 
     def test_tp_follower_skips_connector_poll_for_async_chunk(self):
@@ -923,10 +921,10 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
         with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
             made_progress = host._poll_single_request("r1")
 
-        self.assertFalse(made_progress)
+        assert not made_progress
         host._omni_connector.get.assert_not_called()
-        self.assertIsNone(host.get_local_stage_payload("r1"))
-        self.assertEqual(tp_group.broadcast_inputs, [])
+        assert host.get_local_stage_payload("r1") is None
+        assert tp_group.broadcast_inputs == []
         host.shutdown_omni_connectors()
 
     def test_get_output_broadcasts_tp_async_chunk_payloads_to_followers(self):
@@ -948,20 +946,17 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
         with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
             output = host.get_omni_connector_output()
 
-        self.assertEqual(output.chunk_ready_req_ids, {"r1"})
-        self.assertEqual(output.chunk_finished_req_ids, {"r1"})
-        self.assertEqual(
-            output.request_metadata,
-            {"r1": {"code_predictor_codes": [10, 11], "left_context_size": 0}},
-        )
-        self.assertEqual(host.get_local_stage_payload("r1"), payload)
-        self.assertNotIn("r1", host._pending_load_reqs)
-        self.assertIn("r1", host._chunk_stream_completed)
-        self.assertEqual(tp_group.broadcast_inputs, [None])
+        assert output.chunk_ready_req_ids == {"r1"}
+        assert output.chunk_finished_req_ids == {"r1"}
+        assert output.request_metadata == {"r1": {"code_predictor_codes": [10, 11], "left_context_size": 0}}
+        assert host.get_local_stage_payload("r1") == payload
+        assert "r1" not in host._pending_load_reqs
+        assert "r1" in host._chunk_stream_completed
+        assert tp_group.broadcast_inputs == [None]
         host.shutdown_omni_connectors()
 
 
-class TestKVTransferLifecycle(unittest.TestCase):
+class TestKVTransferLifecycle:
     """Unit tests for KV transfer lifecycle methods."""
 
     def _make_host(self) -> MixinHost:
@@ -973,27 +968,27 @@ class TestKVTransferLifecycle(unittest.TestCase):
 
     def test_mark_drain_ack_complete(self):
         host = self._make_host()
-        self.assertFalse(host.has_pending_kv_work())
+        assert not host.has_pending_kv_work()
 
         host.mark_kv_transfer("r1", seq_len=100, block_ids=[0, 1, 2])
-        self.assertTrue(host.has_pending_kv_work())
-        self.assertTrue(host.is_kv_transfer_triggered("r1"))
+        assert host.has_pending_kv_work()
+        assert host.is_kv_transfer_triggered("r1")
 
         # Drain moves pending → active
         pending = host.drain_pending_kv_transfers()
-        self.assertEqual(pending, {"r1": {"seq_len": 100, "block_ids": [0, 1, 2]}})
-        self.assertIn("r1", host._kv_active_transfers)
-        self.assertTrue(host.has_pending_kv_work())
+        assert pending == {"r1": {"seq_len": 100, "block_ids": [0, 1, 2]}}
+        assert "r1" in host._kv_active_transfers
+        assert host.has_pending_kv_work()
 
         # Ack moves active → completed
         host.ack_kv_transfers(["r1"])
-        self.assertNotIn("r1", host._kv_active_transfers)
-        self.assertIn("r1", host._kv_completed_transfers)
+        assert "r1" not in host._kv_active_transfers
+        assert "r1" in host._kv_completed_transfers
 
         # Drain completed
         completed = host.drain_completed_kv_transfers()
-        self.assertEqual(completed, {"r1"})
-        self.assertFalse(host.has_pending_kv_work())
+        assert completed == {"r1"}
+        assert not host.has_pending_kv_work()
         host.shutdown_omni_connectors()
 
     def test_mark_dedup(self):
@@ -1001,7 +996,7 @@ class TestKVTransferLifecycle(unittest.TestCase):
         host.mark_kv_transfer("r1", seq_len=100, block_ids=[0])
         host.mark_kv_transfer("r1", seq_len=200, block_ids=[0, 1])
         # Second mark is a no-op
-        self.assertEqual(host._kv_pending_transfers["r1"]["seq_len"], 100)
+        assert host._kv_pending_transfers["r1"]["seq_len"] == 100
         host.shutdown_omni_connectors()
 
     def test_cleanup_removes_kv_state(self):
@@ -1009,13 +1004,13 @@ class TestKVTransferLifecycle(unittest.TestCase):
         host.mark_kv_transfer("r1", seq_len=50, block_ids=[0])
         host.drain_pending_kv_transfers()
         host.cleanup_finished_request("r1")
-        self.assertFalse(host.is_kv_transfer_triggered("r1"))
-        self.assertNotIn("r1", host._kv_active_transfers)
-        self.assertFalse(host.has_pending_kv_work())
+        assert not host.is_kv_transfer_triggered("r1")
+        assert "r1" not in host._kv_active_transfers
+        assert not host.has_pending_kv_work()
         host.shutdown_omni_connectors()
 
 
-class TestAsyncPayloadLifecycle(unittest.TestCase):
+class TestAsyncPayloadLifecycle:
     """Regression tests for async payload delivery lifecycle."""
 
     def test_send_side_request_payload_not_cleared_before_payload_is_consumable(self):
@@ -1038,7 +1033,7 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
             host._finished_load_reqs.add("r1")
 
         host.get_omni_connector_output()
-        self.assertIn("r1", host._send_side_request_payload)
+        assert "r1" in host._send_side_request_payload
         host.shutdown_omni_connectors()
 
     def test_payload_consumable_ignores_token_horizon_only_updates(self):
@@ -1058,7 +1053,7 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
                 ],
             },
         }
-        self.assertFalse(host._payload_is_consumable(payload))
+        assert not host._payload_is_consumable(payload)
         host.shutdown_omni_connectors()
 
     def test_payload_consumable_accepts_decode_embeddings(self):
@@ -1071,7 +1066,7 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
             "embed": {"decode": torch.ones(1, 2)},
             "meta": {"finished": torch.tensor(False)},
         }
-        self.assertTrue(host._payload_is_consumable(payload))
+        assert host._payload_is_consumable(payload)
         host.shutdown_omni_connectors()
 
     def test_ar_metadata_only_followup_chunk_does_not_rewake_request(self):
@@ -1104,12 +1099,12 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
 
         host._poll_single_request("r1")
         output1 = host.get_omni_connector_output()
-        self.assertEqual(output1.chunk_ready_req_ids, {"r1"})
+        assert output1.chunk_ready_req_ids == {"r1"}
 
         host._poll_single_request("r1")
         output2 = host.get_omni_connector_output()
-        self.assertEqual(output2.chunk_ready_req_ids, set())
-        self.assertEqual(output2.request_metadata, {"r1": {"next_stage_prompt_len": 7}})
+        assert output2.chunk_ready_req_ids == set()
+        assert output2.request_metadata == {"r1": {"next_stage_prompt_len": 7}}
 
         host.shutdown_omni_connectors()
 
@@ -1132,9 +1127,9 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
 
         made_progress = host._poll_single_request("r1")
 
-        self.assertFalse(made_progress)
+        assert not made_progress
         host._omni_connector.get.assert_not_called()
-        self.assertEqual(host._get_req_chunk["r1"], 1)
+        assert host._get_req_chunk["r1"] == 1
 
         host.shutdown_omni_connectors()
 
@@ -1157,13 +1152,13 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
 
         made_progress = host._poll_single_request("r1")
 
-        self.assertFalse(made_progress)
+        assert not made_progress
         host._omni_connector.get.assert_not_called()
-        self.assertEqual(host._get_req_chunk["r1"], 1)
+        assert host._get_req_chunk["r1"] == 1
 
         output = host.get_omni_connector_output()
-        self.assertEqual(output.request_metadata["r1"]["code_predictor_codes"], [10, 11, 12])
-        self.assertEqual(output.chunk_ready_req_ids, {"r1"})
+        assert output.request_metadata["r1"]["code_predictor_codes"] == [10, 11, 12]
+        assert output.chunk_ready_req_ids == {"r1"}
 
         host._omni_connector.get.return_value = (
             {
@@ -1174,44 +1169,45 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         )
         made_progress = host._poll_single_request("r1")
 
-        self.assertTrue(made_progress)
+        assert made_progress
         host._omni_connector.get.assert_called_once()
-        self.assertEqual(host._get_req_chunk["r1"], 2)
+        assert host._get_req_chunk["r1"] == 2
 
         host.shutdown_omni_connectors()
 
 
-class TestRankAwareKVRouting(unittest.TestCase):
+class TestRankAwareKVRouting:
     def _make_host(self, *, from_tp: int, to_tp: int, local_rank: int) -> MixinHost:
         host = MixinHost()
         host.init_omni_connectors(model_config=_make_model_config(stage_id=1))
-        host._from_tp = from_tp
-        host._to_tp = to_tp
+        # Both directions share the same topology here; these tests exercise
+        # recv-side and send-side routing independently, not asymmetric TP.
+        host._recv_from_tp = from_tp
+        host._recv_to_tp = to_tp
+        host._send_from_tp = from_tp
+        host._send_to_tp = to_tp
         host._local_rank = local_rank
         return host
 
     def test_recv_keys_use_remote_rank_as_from_rank(self):
         host = self._make_host(from_tp=4, to_tp=2, local_rank=1)
-        self.assertEqual(
-            host.get_rank_aware_kv_keys("req", from_stage=0),
-            ["req_0_0_2_1", "req_0_0_3_1"],
-        )
+        assert host.get_rank_aware_kv_keys("req", from_stage=0) == ["req_0_0_2_1", "req_0_0_3_1"]
         host.shutdown_omni_connectors()
 
     def test_send_keys_route_from_rank_gt_to_rank(self):
         host = self._make_host(from_tp=4, to_tp=2, local_rank=3)
-        self.assertEqual(host.get_rank_aware_kv_send_keys("req", from_stage=0), ["req_0_0_3_1"])
+        assert host.get_rank_aware_kv_send_keys("req", from_stage=0) == ["req_0_0_3_1"]
         host.shutdown_omni_connectors()
 
     def test_invalid_recv_rank_mapping_raises(self):
         host = self._make_host(from_tp=3, to_tp=2, local_rank=1)
-        with self.assertRaises(ValueError):
+        with pytest.raises(ValueError):
             host.get_rank_aware_kv_keys("req", from_stage=0)
         host.shutdown_omni_connectors()
 
     def test_invalid_send_rank_mapping_raises(self):
         host = self._make_host(from_tp=3, to_tp=2, local_rank=1)
-        with self.assertRaises(ValueError):
+        with pytest.raises(ValueError):
             host.get_rank_aware_kv_send_keys("req", from_stage=0)
         host.shutdown_omni_connectors()
 
@@ -1222,9 +1218,9 @@ class TestRankAwareKVRouting(unittest.TestCase):
             {"layer_blocks": {"key_cache": [torch.full((2, 1, 3), 2.0)], "value_cache": [torch.full((2, 1, 3), 2.0)]}},
         ]
         merged = host._merge_rank_sharded_kv_payloads(payloads)
-        self.assertEqual(tuple(merged["layer_blocks"]["key_cache"][0].shape), (2, 2, 3))
-        self.assertTrue(torch.equal(merged["layer_blocks"]["key_cache"][0][:, 0], torch.ones(2, 3)))
-        self.assertTrue(torch.equal(merged["layer_blocks"]["key_cache"][0][:, 1], torch.full((2, 3), 2.0)))
+        assert tuple(merged["layer_blocks"]["key_cache"][0].shape) == (2, 2, 3)
+        assert torch.equal(merged["layer_blocks"]["key_cache"][0][:, 0], torch.ones(2, 3))
+        assert torch.equal(merged["layer_blocks"]["key_cache"][0][:, 1], torch.full((2, 3), 2.0))
         host.shutdown_omni_connectors()
 
     def test_slice_rank_sharded_payload_splits_head_dimension(self):
@@ -1237,13 +1233,166 @@ class TestRankAwareKVRouting(unittest.TestCase):
             "metadata": {},
         }
         sliced = host._slice_rank_sharded_kv_payload(payload)
-        self.assertEqual(tuple(sliced["layer_blocks"]["key_cache"][0].shape), (2, 2, 3))
+        assert tuple(sliced["layer_blocks"]["key_cache"][0].shape) == (2, 2, 3)
         expected = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)[:, 2:4, :]
-        self.assertTrue(torch.equal(sliced["layer_blocks"]["key_cache"][0], expected))
+        assert torch.equal(sliced["layer_blocks"]["key_cache"][0], expected)
         host.shutdown_omni_connectors()
 
 
-class TestAttachOmniConnectorOutput(unittest.TestCase):
+class TestRankMappingResolutionFromConnectorConfig:
+    """A stage's recv (inbound) and send (outbound) edges may have different
+    TP ratios. init_omni_connectors must resolve each independently from the
+    inbound stage_connector_config and outbound stage_output_connector_config,
+    and must still support the single-edge case (stage 0 / last stage) applying
+    one mapping to both."""
+
+    def test_distinct_recv_and_send_tp_from_two_specs(self):
+        # Middle stage with different TP ratios on each edge (heterogeneous TP):
+        # thinker TP=4 -> talker TP=2 -> code2wav TP=1.
+        model_config = _make_model_config(stage_id=1)
+        model_config.stage_connector_config = {
+            "name": "MooncakeTransferEngineConnector",
+            "extra": {"role": "receiver", "rank_mapping": {"from_tp": 4, "to_tp": 2}},
+        }
+        model_config.stage_output_connector_config = {
+            "name": "MooncakeTransferEngineConnector",
+            "extra": {"role": "sender", "rank_mapping": {"from_tp": 2, "to_tp": 1}},
+        }
+
+        host = MixinHost()
+        with patch(
+            "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
+            side_effect=lambda spec: MockConnector(),
+        ):
+            host.init_omni_connectors(vllm_config=None, model_config=model_config)
+
+        assert host._recv_from_tp == 4
+        assert host._recv_to_tp == 2
+        assert host._send_from_tp == 2
+        assert host._send_to_tp == 1
+
+        host.shutdown_omni_connectors()
+
+    def test_same_type_two_edges_collapse_to_one_duplex_instance(self):
+        # Both edges use the same connector type -> one shared duplex instance.
+        model_config = _make_model_config(stage_id=1)
+        model_config.stage_connector_config = {
+            "name": "MooncakeTransferEngineConnector",
+            "extra": {"role": "receiver"},
+        }
+        model_config.stage_output_connector_config = {
+            "name": "MooncakeTransferEngineConnector",
+            "extra": {"role": "sender"},
+        }
+
+        built: list[Any] = []
+
+        def _create(spec):
+            conn = MockConnector()
+            built.append(spec)
+            return conn
+
+        host = MixinHost()
+        with patch(
+            "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
+            side_effect=_create,
+        ):
+            host.init_omni_connectors(vllm_config=None, model_config=model_config)
+
+        # One instance built, shared by both directions, with role="duplex".
+        assert len(built) == 1
+        assert built[0].extra.get("role") == "duplex"
+        assert host._recv_connector is host._send_connector
+        assert host._recv_connector is not None
+
+        host.shutdown_omni_connectors()
+
+    def test_hybrid_two_edges_build_two_instances(self):
+        # Different connector types (Mooncake in / SHM out) -> two instances.
+        model_config = _make_model_config(stage_id=1)
+        model_config.stage_connector_config = {
+            "name": "MooncakeTransferEngineConnector",
+            "extra": {"role": "receiver"},
+        }
+        model_config.stage_output_connector_config = {
+            "name": "SharedMemoryConnector",
+            "extra": {},
+        }
+
+        def _create(spec):
+            return MockConnector()
+
+        host = MixinHost()
+        with patch(
+            "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
+            side_effect=_create,
+        ):
+            host.init_omni_connectors(vllm_config=None, model_config=model_config)
+
+        assert host._recv_connector is not None
+        assert host._send_connector is not None
+        assert host._recv_connector is not host._send_connector
+
+        host.shutdown_omni_connectors()
+
+    def test_stage0_output_only_has_no_recv_connector(self):
+        # Stage 0 has an outbound edge but no inbound edge.
+        model_config = _make_model_config(stage_id=0)
+        model_config.stage_connector_config = None
+        model_config.stage_output_connector_config = {
+            "name": "MooncakeTransferEngineConnector",
+            "extra": {"role": "sender"},
+        }
+
+        host = MixinHost()
+        with patch(
+            "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
+            side_effect=lambda spec: MockConnector(),
+        ):
+            host.init_omni_connectors(vllm_config=None, model_config=model_config)
+
+        assert host._recv_connector is None
+        assert host._send_connector is not None
+
+        host.shutdown_omni_connectors()
+
+    def test_flat_single_edge_spec_applies_same_mapping_to_both(self):
+        """Regression guard: stage 0 / the last stage only has one edge, so
+        the flat spec's rank_mapping must still resolve for both recv and
+        send (there's no ambiguity with a single edge)."""
+        model_config = _make_model_config(stage_id=0)
+        model_config.stage_connector_config = {
+            "name": "MooncakeTransferEngineConnector",
+            "extra": {"role": "sender", "rank_mapping": {"from_tp": 2, "to_tp": 1}},
+        }
+
+        host = MixinHost()
+        with patch(
+            "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
+            return_value=MockConnector(),
+        ):
+            host.init_omni_connectors(vllm_config=None, model_config=model_config)
+
+        assert host._recv_from_tp == 2
+        assert host._recv_to_tp == 1
+        assert host._send_from_tp == 2
+        assert host._send_to_tp == 1
+
+        host.shutdown_omni_connectors()
+
+    def test_missing_stage_connector_config_defaults_to_homogeneous(self):
+        host = MixinHost()
+        host.init_omni_connectors(vllm_config=None, model_config=_make_model_config(stage_id=0))
+
+        assert host._recv_from_tp == 1
+        assert host._recv_to_tp == 1
+        assert host._send_from_tp == 1
+        assert host._send_to_tp == 1
+
+        host.shutdown_omni_connectors()
+
+
+class TestAttachOmniConnectorOutput:
     def test_wraps_empty_model_runner_output_when_signals_exist(self):
         from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 
@@ -1252,11 +1401,11 @@ class TestAttachOmniConnectorOutput(unittest.TestCase):
 
         wrapped = host.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
 
-        self.assertIsNot(wrapped, EMPTY_MODEL_RUNNER_OUTPUT)
-        self.assertEqual(wrapped.omni_connector_output.chunk_ready_req_ids, {"req-1"})
+        assert wrapped is not EMPTY_MODEL_RUNNER_OUTPUT
+        assert wrapped.omni_connector_output.chunk_ready_req_ids == {"req-1"}
 
 
-class TestConnectorConfigValidation(unittest.TestCase):
+class TestConnectorConfigValidation:
     def test_invalid_connector_name_raises(self):
         host = MixinHost()
         model_config = _make_model_config(stage_id=1)
@@ -1289,7 +1438,7 @@ class _FailingConnector:
         pass
 
 
-class TestSendRetry(unittest.TestCase):
+class TestSendRetry:
     """Tests for P1-2: failed connector sends must be retried."""
 
     def _make_sender(self, connector):
@@ -1315,7 +1464,7 @@ class TestSendRetry(unittest.TestCase):
         sender = self._make_sender(connector)
 
         result = sender._send_single_request(self._make_task())
-        self.assertFalse(result)
+        assert not result
         sender.shutdown_omni_connectors()
 
     def test_send_single_request_does_not_decrement_on_failure(self):
@@ -1324,7 +1473,7 @@ class TestSendRetry(unittest.TestCase):
         sender._pending_save_counts["r1"] = 1
 
         sender._send_single_request(self._make_task())
-        self.assertEqual(sender._pending_save_counts.get("r1"), 1, "pending count must NOT be decremented on failure")
+        assert sender._pending_save_counts.get("r1") == 1
         sender.shutdown_omni_connectors()
 
     def test_send_single_request_decrements_on_success(self):
@@ -1333,8 +1482,8 @@ class TestSendRetry(unittest.TestCase):
         sender._pending_save_counts["r1"] = 1
 
         result = sender._send_single_request(self._make_task())
-        self.assertTrue(result)
-        self.assertNotIn("r1", sender._pending_save_counts, "pending count should be zero/removed on success")
+        assert result
+        assert "r1" not in sender._pending_save_counts
         sender.shutdown_omni_connectors()
 
     def test_requeue_or_drop_requeues_on_first_failure(self):
@@ -1343,11 +1492,11 @@ class TestSendRetry(unittest.TestCase):
 
         sender._requeue_or_drop_failed_send(task)
 
-        self.assertEqual(task.get("_retry_count"), 1)
+        assert task.get("_retry_count") == 1
         with sender._lock:
             dq = sender._pending_save_reqs.get("r1")
-        self.assertIsNotNone(dq)
-        self.assertEqual(len(dq), 1)
+        assert dq is not None
+        assert len(dq) == 1
         sender.shutdown_omni_connectors()
 
     def test_requeue_or_drop_drops_after_max_retries(self):
@@ -1360,8 +1509,8 @@ class TestSendRetry(unittest.TestCase):
 
         with sender._lock:
             dq = sender._pending_save_reqs.get("r1")
-        self.assertTrue(dq is None or len(dq) == 0, "task should NOT be re-enqueued after max retries")
-        self.assertNotIn("r1", sender._pending_save_counts, "pending count should be cleaned up on final drop")
+        assert dq is None or len(dq) == 0
+        assert "r1" not in sender._pending_save_counts
         sender.shutdown_omni_connectors()
 
     def test_save_loop_retries_on_exception(self):
@@ -1404,16 +1553,12 @@ class TestSendRetry(unittest.TestCase):
         # After first failure, task should be re-enqueued
         with sender._lock:
             dq = sender._pending_save_reqs.get("r1")
-        self.assertIsNotNone(dq)
-        self.assertEqual(len(dq), 1)
+        assert dq is not None
+        assert len(dq) == 1
         requeued = dq[0]
-        self.assertEqual(requeued.get("_retry_count"), 1)
+        assert requeued.get("_retry_count") == 1
 
         # Second attempt should succeed (connector now returns True)
         success = sender._send_single_request(requeued)
-        self.assertTrue(success)
+        assert success
         sender.shutdown_omni_connectors()
-
-
-if __name__ == "__main__":
-    unittest.main()

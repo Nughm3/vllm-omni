@@ -29,11 +29,11 @@ from vllm_omni.config.omni_config import BaseVllmOmniStageConfig
 from vllm_omni.config.stage_config import StageType
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
-from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.inc_config import OmniINCConfig
 
@@ -50,6 +50,7 @@ class ReplicaInitPlan:
     stage_cfg: Any
     metadata: Any
     stage_connector_spec: dict[str, Any]
+    stage_output_connector_spec: dict[str, Any] | None
     omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None]
     stage_vllm_config: Any | None = None
     executor_class: type | None = None
@@ -752,6 +753,7 @@ def build_engine_args_dict(
     stage_config: Any,
     model: str,
     stage_connector_spec: dict[str, Any] | None = None,
+    stage_output_connector_spec: dict[str, Any] | None = None,
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
     """Build the normalized engine args dict for one stage."""
@@ -823,8 +825,12 @@ def build_engine_args_dict(
     # Stage id must come from stage config instead of inherited CLI kwargs
     # (e.g. `--stage-id` defaulting to None).
     engine_args_dict["stage_id"] = stage_id
-    if stage_connector_spec:
-        engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
+    # Always attach the connector spec — full-payload Mooncake stages need it
+    # too now, not just async_chunk streaming (see get_stage_worker_connector_specs).
+    engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
+    # Outbound spec is optional (None for the last stage or a single-edge stage).
+    if stage_output_connector_spec is not None:
+        engine_args_dict["stage_output_connector_spec"] = dict(stage_output_connector_spec)
 
     if stage_type == "diffusion":
         from vllm_omni.diffusion.data import parse_attention_config
@@ -859,6 +865,7 @@ def build_vllm_config(
     stage_config: Any,
     model: str,
     stage_connector_spec: dict[str, Any] | None = None,
+    stage_output_connector_spec: dict[str, Any] | None = None,
     engine_args_dict: dict[str, Any] | None = None,
     headless: bool = False,
 ) -> tuple[Any, type]:
@@ -872,6 +879,7 @@ def build_vllm_config(
             stage_config,
             model,
             stage_connector_spec=stage_connector_spec,
+            stage_output_connector_spec=stage_output_connector_spec,
         )
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
@@ -1159,22 +1167,42 @@ def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> 
         return None
 
 
+def get_stage_worker_connector_specs(
+    omni_transfer_config: Any,
+    stage_id: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Return ``(input_spec, output_spec)`` for a stage worker.
+
+    ``input_spec`` drives the inbound (recv) connector, ``output_spec`` the
+    outbound (send) connector. Either may be ``None`` (stage 0 has no input;
+    the last stage has no output). A middle stage whose two edges use the same
+    connector type is collapsed to one duplex instance by the mixin; a hybrid
+    stage (different types) keeps two instances.
+    """
+    from vllm_omni.distributed.omni_connectors import get_stage_connector_config
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        resolve_stage_connector_specs,
+    )
+
+    stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
+    return resolve_stage_connector_specs(stage_connectors_cfg)
+
+
 def get_stage_connector_spec(
     omni_transfer_config: Any,
     stage_id: int,
     async_chunk: bool,
 ) -> dict[str, Any]:
-    """Return the first connector spec for a stage data-plane edge."""
+    """Return the legacy single connector spec for async-chunk callers."""
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config
 
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
     for cfg in stage_connectors_cfg.values():
         return dict(cfg.get("spec", {}))
 
-    # A producer does not consume connector data itself. Keep its connector
-    # for both async-chunk and terminal full-payload sends, but mark it
-    # sender-only so the scheduler does not park orchestrator-provided inputs
-    # waiting for an upstream payload.
+    # An async producer may have no inbound edge. Keep its connector for
+    # save_async(), but mark it sender-only so the scheduler does not wait for
+    # a chunk from the orchestrator.
     target_stage = str(stage_id)
     for (from_stage, _to_stage), spec in getattr(omni_transfer_config, "connectors", {}).items():
         if from_stage == target_stage:

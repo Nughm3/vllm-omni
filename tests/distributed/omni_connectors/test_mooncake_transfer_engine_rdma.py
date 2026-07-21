@@ -203,14 +203,52 @@ def _md5(tensor: torch.Tensor) -> str:
     return hashlib.md5(t.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
 
 
+def _stub_connector(**attrs):
+    """Partial connector for unit tests that avoid full TransferEngine init.
+
+    Mirrors the early teardown fields set at the top of
+    ``MooncakeTransferEngineConnector.__init__`` so ``close()`` / ``__del__``
+    are safe when the object is garbage-collected.
+    """
+    connector = MooncakeTransferEngineConnector.__new__(MooncakeTransferEngineConnector)
+    connector._closed = False
+    connector._bind_error = None
+    connector._stop_event = threading.Event()
+    connector._sender_executor = None
+    connector._listener_thread = None
+    connector._listener_ready = threading.Event()
+    connector._local_buffers = {}
+    connector._local_buffers_lock = threading.Lock()
+    connector._put_lock = threading.Lock()
+    connector._req_local = threading.local()
+    connector._wait_local = threading.local()
+    connector._worker_local = threading.local()
+    connector._last_ttl_check = time.monotonic()
+    connector._sender_endpoints = {}
+    connector._metadata_waiters = {}
+    connector._ready_keys = queue.Queue()
+    connector._listener_notify_addr = None
+    connector._metrics = {
+        "puts": 0,
+        "gets": 0,
+        "bytes_transferred": 0,
+        "errors": 0,
+        "timeouts": 0,
+        "readiness_requests": 0,
+        "readiness_responses": 0,
+        "readiness_cache_hits": 0,
+    }
+    for key, value in attrs.items():
+        setattr(connector, key, value)
+    return connector
+
+
 class TestMetadataQueryResponse:
     @staticmethod
     def _connector_with_item(item=None):
-        connector = MooncakeTransferEngineConnector.__new__(MooncakeTransferEngineConnector)
-        connector._local_buffers_lock = threading.Lock()
-        connector._local_buffers = {} if item is None else {"ready@0_1": item}
-        connector._metadata_waiters = {}
-        return connector
+        return _stub_connector(
+            _local_buffers={} if item is None else {"ready@0_1": item},
+        )
 
     def test_found(self):
         item = ([1234], [4096], None, False, True, time.monotonic())
@@ -263,24 +301,15 @@ class TestMetadataQueryResponse:
         assert connector._metadata_waiters == {}
 
     def test_listener_delivers_metadata_after_ready_notification(self):
-        connector = MooncakeTransferEngineConnector.__new__(MooncakeTransferEngineConnector)
-        connector.zmq_ctx = zmq.Context()
-        connector.host = RDMA_HOST
-        connector.zmq_port = _free_port()
-        connector.can_put = True
-        connector._bind_error = None
-        connector._listener_ready = threading.Event()
-        connector._stop_event = threading.Event()
-        connector._local_buffers_lock = threading.Lock()
-        connector._local_buffers = {}
-        connector._metadata_waiters = {}
-        connector._ready_keys = queue.Queue()
-        connector._listener_notify_addr = None
-        connector._last_ttl_check = time.monotonic()
-        connector._worker_local = threading.local()
-        connector._sender_executor = None
+        connector = _stub_connector(
+            zmq_ctx=zmq.Context(),
+            host=RDMA_HOST,
+            zmq_port=_free_port(),
+            can_put=True,
+        )
 
         listener = threading.Thread(target=connector._zmq_listener_loop)
+        connector._listener_thread = listener
         listener.start()
         dealer = None
         try:
@@ -314,16 +343,9 @@ class TestMetadataQueryResponse:
             assert response.request_id == "ready@0_1"
             assert response.data_size == 4096
         finally:
-            connector._stop_event.set()
-            if connector._listener_notify_addr is not None:
-                connector._notify_listener(connector._listener_notify_addr)
-            listener.join(timeout=2)
             if dealer is not None:
                 dealer.close(linger=0)
-            notify_socket = getattr(connector._worker_local, "notify_socket", None)
-            if notify_socket is not None:
-                notify_socket.close(linger=0)
-            connector.zmq_ctx.term()
+            connector.close()
 
         assert not listener.is_alive()
 
@@ -343,13 +365,7 @@ class TestDeferredMetadataConsumer:
             self.sent.append(payload)
 
     def test_subscribes_once_and_returns_deferred_metadata(self):
-        connector = MooncakeTransferEngineConnector.__new__(MooncakeTransferEngineConnector)
-        connector._wait_local = threading.local()
-        connector._metrics = {
-            "readiness_requests": 0,
-            "readiness_responses": 0,
-            "readiness_cache_hits": 0,
-        }
+        connector = _stub_connector()
         socket = self._FakeDealerSocket()
         connector._get_wait_socket = lambda _: socket
 
@@ -372,17 +388,11 @@ class TestDeferredMetadataConsumer:
         assert metadata["data_size"] == 4096
         assert metadata["is_fast_path"] is True
         assert metadata["ready_wait_ms"] >= 0
-        assert connector._metrics == {
-            "readiness_requests": 1,
-            "readiness_responses": 1,
-            "readiness_cache_hits": 1,
-        }
+        assert connector._metrics["readiness_requests"] == 1
+        assert connector._metrics["readiness_responses"] == 1
+        assert connector._metrics["readiness_cache_hits"] == 1
 
     def test_packed_lookup_uses_synchronous_query(self):
-        connector = MooncakeTransferEngineConnector.__new__(MooncakeTransferEngineConnector)
-        connector._closed = False
-        connector.sender_host = "127.0.0.1"
-        connector.sender_zmq_port = 50051
         queried_keys: list[str] = []
 
         def query(get_key):
@@ -394,11 +404,14 @@ class TestDeferredMetadataConsumer:
                 "is_fast_path": True,
             }
 
-        connector._query_metadata_from_sender = query
-
         def deferred(_get_key):
             pytest.fail("packed lookup must not use deferred metadata")
 
+        connector = _stub_connector(
+            sender_host="127.0.0.1",
+            sender_zmq_port=50051,
+        )
+        connector._query_metadata_from_sender = query
         connector._get_metadata_when_ready_from_sender = deferred
 
         assert connector.get("0", "1", "request@packed") is None

@@ -96,7 +96,10 @@ class OmniConnectorModelRunnerMixin:
             model_config: Stage-level model config with connector settings.
             kv_transfer_manager: Existing KV transfer manager to delegate to.
         """
-        self._omni_connector: OmniConnectorBase | None = self._create_connector(model_config)
+        # Build the recv (inbound) and send (outbound) connectors. Same-type
+        # two-edge stages collapse to one duplex instance shared by both
+        # references; hybrid stages get two; single-edge stages get one.
+        self._recv_connector, self._send_connector = self._build_stage_connectors(model_config)
         self._kv_transfer_manager = kv_transfer_manager
 
         self._async_chunk: bool = getattr(model_config, "async_chunk", False)
@@ -109,21 +112,26 @@ class OmniConnectorModelRunnerMixin:
         self._custom_process_func_path, self._custom_process_func = self._load_custom_func(model_config)
         self._custom_process_supports_is_finished = self._custom_process_supports_is_finished_kwarg()
         logger.debug(
-            "[Stage-%s] init_omni_connectors: async_chunk=%s, custom_process_func=%s, connector=%s, func_path=%s",
+            "[Stage-%s] init_omni_connectors: async_chunk=%s, custom_process_func=%s, "
+            "recv_connector=%s, send_connector=%s, duplex=%s, func_path=%s",
             self._stage_id,
             self._async_chunk,
             self._custom_process_func,
-            type(self._omni_connector).__name__ if self._omni_connector else None,
+            type(self._recv_connector).__name__ if self._recv_connector else None,
+            type(self._send_connector).__name__ if self._send_connector else None,
+            self._recv_connector is not None and self._recv_connector is self._send_connector,
             self._custom_process_func_path,
         )
 
         # -- next stage ID (from connector config or default stage_id + 1) --
         self._next_stage_id: int = self._resolve_next_stage_id(model_config)
 
-        # -- heterogeneous TP rank support --
+        # -- heterogeneous TP rank support (independent per direction) --
         rank_cfg = self._parse_rank_mapping(model_config)
-        self._from_tp: int = rank_cfg["from_tp"]
-        self._to_tp: int = rank_cfg["to_tp"]
+        self._recv_from_tp: int = rank_cfg["recv"]["from_tp"]
+        self._recv_to_tp: int = rank_cfg["recv"]["to_tp"]
+        self._send_from_tp: int = rank_cfg["send"]["from_tp"]
+        self._send_to_tp: int = rank_cfg["send"]["to_tp"]
         self._local_rank: int = rank_cfg["local_rank"]
         if self._kv_transfer_manager is not None:
             self._kv_transfer_manager.kv_send_key_builder = self.get_rank_aware_kv_send_keys
@@ -191,16 +199,19 @@ class OmniConnectorModelRunnerMixin:
         self._stop_event = threading.Event()
         self._work_available = threading.Event()
 
-        # Start background threads only when there's a connector
+        # Start each background thread only when its direction has a connector:
+        # recv loop needs an inbound connector, save loop an outbound one. A
+        # duplex stage (recv is send) runs both.
         self._recv_thread: threading.Thread | None = None
         self._save_thread: threading.Thread | None = None
-        if self._omni_connector is not None:
+        if self._recv_connector is not None:
             self._recv_thread = threading.Thread(
                 target=self._recv_loop,
                 daemon=True,
                 name="omni-mixin-recv",
             )
             self._recv_thread.start()
+        if self._send_connector is not None:
             self._save_thread = threading.Thread(
                 target=self._save_loop,
                 daemon=True,
@@ -222,9 +233,14 @@ class OmniConnectorModelRunnerMixin:
             self._recv_thread.join(timeout=5)
         if self._save_thread is not None:
             self._save_thread.join(timeout=5)
-        if self._omni_connector is not None:
+        # Close both connectors, de-duplicated when duplex (recv is send).
+        seen: set[int] = set()
+        for conn in (self._recv_connector, self._send_connector):
+            if conn is None or id(conn) in seen:
+                continue
+            seen.add(id(conn))
             try:
-                self._omni_connector.close()
+                conn.close()
             except Exception:
                 pass
 
@@ -734,7 +750,7 @@ class OmniConnectorModelRunnerMixin:
         _custom_process_func, both of which are set at init time. Avoid
         the per-step dynamic import inside the model decode loop.
         """
-        if getattr(self, "_omni_connector", None) is None:
+        if getattr(self, "_send_connector", None) is None:
             # No connector at all: send_full_payload_outputs would no-op.
             # Skip the per-step accumulator+build that would otherwise be
             # silently discarded.  Defends against a terminal stage whose
@@ -744,7 +760,8 @@ class OmniConnectorModelRunnerMixin:
             #
             # Known limitation: a *terminal-consumer* stage that has a
             # connector configured for receiving upstream input is NOT
-            # caught here -- ``_omni_connector`` is non-None for it, and
+            # caught here -- ``_send_connector`` is non-None for it (a
+            # receive-only stage reuses its recv connector as send), and
             # ``_load_custom_func`` may still resolve a ``*_full_payload``
             # derivative from this stage's ``custom_process_input_func``.
             # In that case the accumulator builds payloads that
@@ -947,7 +964,7 @@ class OmniConnectorModelRunnerMixin:
 
         Returns list of request IDs successfully enqueued.
         """
-        if self._omni_connector is None:
+        if self._send_connector is None:
             logger.debug("[Stage-%s] send_full_payload_outputs: connector is None, skip", self._stage_id)
             return []
         if not self.is_data_transfer_rank():
@@ -1093,7 +1110,7 @@ class OmniConnectorModelRunnerMixin:
         ``connector.put()`` is done by the background save thread.
         Non-KV data is identical across TP ranks; only rank 0 sends.
         """
-        if self._omni_connector is None:
+        if self._send_connector is None:
             logger.warning("[Stage-%s] send_chunk: connector is None", self._stage_id)
             return False
         if not self.is_data_transfer_rank():
@@ -1280,14 +1297,18 @@ class OmniConnectorModelRunnerMixin:
         ]
 
     def get_kv_target_ranks_for_send(self) -> list[int]:
-        """Determine which target ranks this local rank should send KV shards to."""
-        self._validate_kv_tp_topology()
-        if self._from_tp == self._to_tp:
+        """Determine which target ranks this local rank should send KV shards to.
+
+        Uses the send-side (outbound edge) TP mapping.
+        """
+        from_tp, to_tp = self._send_from_tp, self._send_to_tp
+        self._validate_kv_tp_topology(from_tp, to_tp)
+        if from_tp == to_tp:
             return [self._local_rank]
-        if self._from_tp > self._to_tp:
-            tp_ratio = self._from_tp // self._to_tp
+        if from_tp > to_tp:
+            tp_ratio = from_tp // to_tp
             return [self._local_rank // tp_ratio]
-        tp_ratio = self._to_tp // self._from_tp
+        tp_ratio = to_tp // from_tp
         base_rank = self._local_rank * tp_ratio
         return [base_rank + i for i in range(tp_ratio)]
 
@@ -1350,11 +1371,14 @@ class OmniConnectorModelRunnerMixin:
         return merged
 
     def _slice_rank_sharded_kv_payload(self, payload: dict[str, Any] | None) -> dict[str, Any] | None:
-        """Slice a duplicated source-rank KV shard for ``from_tp < to_tp`` cases."""
-        if payload is None or self._from_tp >= self._to_tp:
+        """Slice a duplicated source-rank KV shard for ``from_tp < to_tp`` cases.
+
+        Uses the send-side (outbound edge) TP mapping.
+        """
+        if payload is None or self._send_from_tp >= self._send_to_tp:
             return payload
 
-        tp_ratio = self._to_tp // self._from_tp
+        tp_ratio = self._send_to_tp // self._send_from_tp
         shard_index = self._local_rank % tp_ratio
         layer_blocks = payload.get("layer_blocks") if isinstance(payload, dict) else None
         if not isinstance(layer_blocks, dict):
@@ -1398,11 +1422,13 @@ class OmniConnectorModelRunnerMixin:
         """Return the current rank mapping configuration.
 
         Useful for debugging and for downstream code that needs to know
-        the TP topology without re-parsing model config.
+        the TP topology without re-parsing model config. ``recv``/``send``
+        are independent since a stage's inbound and outbound edges may have
+        different TP ratios.
         """
         return {
-            "from_tp": self._from_tp,
-            "to_tp": self._to_tp,
+            "recv": {"from_tp": self._recv_from_tp, "to_tp": self._recv_to_tp},
+            "send": {"from_tp": self._send_from_tp, "to_tp": self._send_to_tp},
             "local_rank": self._local_rank,
             "remote_ranks": self.get_kv_remote_ranks(),
             "is_data_transfer_rank": self.is_data_transfer_rank(),
@@ -1596,7 +1622,10 @@ class OmniConnectorModelRunnerMixin:
 
     @property
     def connector(self) -> Any | None:
-        return self._omni_connector
+        # Payload builders reference ``transfer_manager.connector`` on the send
+        # path; expose the send connector (falls back to recv for a receive-only
+        # last stage).
+        return self._send_connector or self._recv_connector
 
     # ------------------------------------------------------------------ #
     #  Background I/O threads
@@ -1701,7 +1730,7 @@ class OmniConnectorModelRunnerMixin:
 
     def _poll_single_request(self, req_id: str) -> bool:
         """Poll connector for one chunk of a request (non-blocking)."""
-        connector = self._omni_connector
+        connector = self._recv_connector
         if connector is None:
             return False
 
@@ -1913,7 +1942,7 @@ class OmniConnectorModelRunnerMixin:
         ``success=False``), returns False **without** decrementing
         ``_pending_save_counts`` so the caller can retry or clean up.
         """
-        connector = self._omni_connector
+        connector = self._send_connector
         if connector is None:
             return True
 
@@ -2048,34 +2077,130 @@ class OmniConnectorModelRunnerMixin:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _create_connector(model_config: Any) -> OmniConnectorBase | None:
-        """Create a connector from model_config, or None if unconfigured."""
-        connector_config = getattr(model_config, "stage_connector_config", None)
+    def _freeze_request_attr(value: Any) -> Any:
+        if isinstance(value, list):
+            return list(value)
+        if isinstance(value, tuple):
+            return list(value)
+        if isinstance(value, torch.Tensor):
+            return value.clone()
+        raw_list = getattr(value, "_x", None)
+        if raw_list is not None:
+            return list(raw_list)
+        return value
+
+    def _snapshot_request_for_send(self, request: Any, external_req_id: str) -> Any:
+        finished = bool(getattr(request, "is_finished", lambda: False)())
+        attrs: dict[str, Any] = {}
+        try:
+            attrs.update(vars(request))
+        except TypeError:
+            pass
+
+        for name in (
+            "request_id",
+            "req_id",
+            "external_req_id",
+            "prompt_token_ids",
+            "output_token_ids",
+            "all_token_ids",
+            "additional_information",
+            "sampling_params",
+            "multi_modal_data",
+            "mm_hashes",
+        ):
+            if hasattr(request, name):
+                attrs[name] = self._freeze_request_attr(getattr(request, name))
+
+        attrs["external_req_id"] = external_req_id
+        attrs["_frozen_is_finished"] = finished
+        snapshot = SimpleNamespace(**attrs)
+        snapshot.is_finished = lambda: finished
+        return snapshot
+
+    @staticmethod
+    def _normalize_connector_config(connector_config: Any) -> tuple[str, dict[str, Any]] | None:
+        """Return ``(name, extra)`` for a connector config dict, or None."""
         if connector_config is None:
             return None
-
         if not isinstance(connector_config, dict):
             connector_config = {
                 "name": getattr(connector_config, "name", None),
                 "extra": getattr(connector_config, "extra", None),
             }
-
         name = connector_config.get("name")
         if not isinstance(name, str) or not name.strip():
             raise RuntimeError("Invalid stage connector config: missing connector name")
         name = name.strip()
-
         extra = connector_config.get("extra")
         if extra is None:
             extra = {}
         elif not isinstance(extra, dict):
             raise RuntimeError(f"Invalid extra config for connector {name}: expected dict, got {type(extra).__name__}")
+        return name, extra
 
+    @staticmethod
+    def _build_connector_from_spec(name: str, extra: dict[str, Any]) -> OmniConnectorBase:
+        """Instantiate a connector from a normalized (name, extra) spec."""
         spec = ConnectorSpec(name=name, extra=extra)
         try:
             return OmniConnectorFactory.create_connector(spec)
         except Exception as exc:
             raise RuntimeError(f"Failed to create connector {name}") from exc
+
+    @staticmethod
+    def _duplex_union_extra(recv_extra: dict[str, Any], send_extra: dict[str, Any]) -> dict[str, Any]:
+        """Merge inbound + outbound extras into one duplex connector config.
+
+        Shared backend knobs come from the outbound extra; direction-specific
+        fields are taken from the edge that owns them: the outbound edge's
+        listen ``zmq_port`` and the inbound edge's upstream ``sender_host`` /
+        ``sender_zmq_port``. ``role`` becomes ``"duplex"`` so the connector
+        binds its own listener while still pulling from upstream.
+        """
+        merged = dict(recv_extra)
+        merged.update(send_extra)  # outbound wins on shared knobs
+        merged["role"] = "duplex"
+        if "zmq_port" in send_extra:
+            merged["zmq_port"] = send_extra["zmq_port"]  # own outbound listener
+        for key in ("sender_host", "sender_zmq_port"):
+            if recv_extra.get(key) is not None:
+                merged[key] = recv_extra[key]  # upstream query endpoint
+        return merged
+
+    def _build_stage_connectors(self, model_config: Any) -> tuple[OmniConnectorBase | None, OmniConnectorBase | None]:
+        """Build ``(recv_connector, send_connector)`` for this stage.
+
+        - same-type two edges  → one duplex instance shared by both refs
+        - different-type edges → two instances (hybrid, e.g. Mooncake / SHM)
+        - inbound only         → one instance reused for send (last stage;
+          also the no-transfer-config default where SHM serves both directions)
+        - outbound only        → send instance, no recv (stage 0)
+        """
+        recv_cfg = self._normalize_connector_config(getattr(model_config, "stage_connector_config", None))
+        send_cfg = self._normalize_connector_config(getattr(model_config, "stage_output_connector_config", None))
+
+        if recv_cfg and send_cfg:
+            recv_name, recv_extra = recv_cfg
+            send_name, send_extra = send_cfg
+            if recv_name == send_name:
+                conn = self._build_connector_from_spec(recv_name, self._duplex_union_extra(recv_extra, send_extra))
+                return conn, conn
+            return (
+                self._build_connector_from_spec(recv_name, recv_extra),
+                self._build_connector_from_spec(send_name, send_extra),
+            )
+
+        if recv_cfg and not send_cfg:
+            # Inbound only: one connector reused for both directions (last
+            # stage never sends; no-config SHM default serves both edges).
+            conn = self._build_connector_from_spec(*recv_cfg)
+            return conn, conn
+
+        if send_cfg and not recv_cfg:
+            return None, self._build_connector_from_spec(*send_cfg)
+
+        return None, None
 
     @staticmethod
     def _load_custom_func(model_config: Any) -> tuple[str | None, Any | None]:
@@ -2175,15 +2300,19 @@ class OmniConnectorModelRunnerMixin:
     def _resolve_next_stage_id(self, model_config: Any) -> int:
         """Determine the downstream stage ID from connector config.
 
-        Falls back to ``stage_id + 1`` when the config does not specify
-        a ``to_stage`` explicitly.
+        ``to_stage`` describes the outbound edge, so read it from the output
+        connector config; fall back to the (single) input config, then to
+        ``stage_id + 1``.
         """
-        connector_config = getattr(model_config, "stage_connector_config", None)
-        if connector_config is not None:
-            if isinstance(connector_config, dict):
-                to_stage = connector_config.get("to_stage")
-            else:
-                to_stage = getattr(connector_config, "to_stage", None)
+        for attr in ("stage_output_connector_config", "stage_connector_config"):
+            connector_config = getattr(model_config, attr, None)
+            if connector_config is None:
+                continue
+            if not isinstance(connector_config, dict):
+                connector_config = getattr(connector_config, "__dict__", {})
+            to_stage = connector_config.get("to_stage")
+            if to_stage is None:
+                to_stage = (connector_config.get("extra") or {}).get("to_stage")
             if isinstance(to_stage, int):
                 return to_stage
             if isinstance(to_stage, str) and to_stage.strip():
@@ -2191,22 +2320,40 @@ class OmniConnectorModelRunnerMixin:
         return self._stage_id + 1
 
     @staticmethod
-    def _parse_rank_mapping(model_config: Any) -> dict[str, int]:
-        """Parse rank_mapping from connector config (optional).
+    def _parse_rank_mapping(model_config: Any) -> dict[str, Any]:
+        """Parse per-direction rank_mapping from connector config (optional).
 
-        Returns ``{"from_tp": int, "to_tp": int, "local_rank": int}``.
-        When ``rank_mapping`` is absent, assumes 1:1 homogeneous mapping.
+        Returns ``{"recv": {"from_tp", "to_tp"}, "send": {"from_tp", "to_tp"},
+        "local_rank"}``. ``recv`` comes from the inbound
+        ``stage_connector_config``'s ``rank_mapping`` and ``send`` from the
+        outbound ``stage_output_connector_config``'s — independent TP
+        topologies for a stage's two edges (heterogeneous TP). When the stage
+        has no distinct outbound spec, the inbound spec's mapping is reused for
+        both. Absent ``rank_mapping`` assumes 1:1 homogeneous mapping.
         """
-        connector_config = getattr(model_config, "stage_connector_config", None)
-        if connector_config is not None and not isinstance(connector_config, dict):
-            connector_config = getattr(connector_config, "__dict__", {})
 
-        rank_mapping: dict = {}
-        if isinstance(connector_config, dict):
-            rank_mapping = connector_config.get("rank_mapping", {})
+        def _extra(attr: str) -> dict:
+            cfg = getattr(model_config, attr, None)
+            if cfg is not None and not isinstance(cfg, dict):
+                cfg = getattr(cfg, "__dict__", {})
+            return (cfg.get("extra") or {}) if isinstance(cfg, dict) else {}
 
-        from_tp = int(rank_mapping.get("from_tp", 1))
-        to_tp = int(rank_mapping.get("to_tp", 1))
+        def _tp_pair(rank_mapping: Any) -> dict[str, int]:
+            rank_mapping = rank_mapping if isinstance(rank_mapping, dict) else {}
+            return {
+                "from_tp": int(rank_mapping.get("from_tp", 1)),
+                "to_tp": int(rank_mapping.get("to_tp", 1)),
+            }
+
+        recv_extra = _extra("stage_connector_config")
+        send_extra = _extra("stage_output_connector_config")
+        # No distinct outbound spec → the inbound connector serves both
+        # directions, so reuse its mapping for send.
+        if not send_extra:
+            send_extra = recv_extra
+
+        recv = _tp_pair(recv_extra.get("rank_mapping"))
+        send = _tp_pair(send_extra.get("rank_mapping"))
 
         local_rank = 0
         try:
@@ -2214,40 +2361,43 @@ class OmniConnectorModelRunnerMixin:
         except (ValueError, TypeError):
             pass
 
-        return {"from_tp": from_tp, "to_tp": to_tp, "local_rank": local_rank}
+        return {"recv": recv, "send": send, "local_rank": local_rank}
 
     # ------------------------------------------------------------------ #
     #  Heterogeneous TP rank support
     # ------------------------------------------------------------------ #
 
-    def _validate_kv_tp_topology(self) -> None:
+    @staticmethod
+    def _validate_kv_tp_topology(from_tp: int, to_tp: int) -> None:
         """Reject heterogeneous TP mappings that cannot be routed losslessly."""
-        if self._from_tp <= 0 or self._to_tp <= 0:
-            raise ValueError(f"Invalid KV TP mapping: from_tp={self._from_tp}, to_tp={self._to_tp}")
-        larger = max(self._from_tp, self._to_tp)
-        smaller = min(self._from_tp, self._to_tp)
+        if from_tp <= 0 or to_tp <= 0:
+            raise ValueError(f"Invalid KV TP mapping: from_tp={from_tp}, to_tp={to_tp}")
+        larger = max(from_tp, to_tp)
+        smaller = min(from_tp, to_tp)
         if larger % smaller != 0:
             raise ValueError(
-                f"KV TP mapping must be divisible for rank-aware routing: from_tp={self._from_tp}, to_tp={self._to_tp}"
+                f"KV TP mapping must be divisible for rank-aware routing: from_tp={from_tp}, to_tp={to_tp}"
             )
 
     def get_kv_remote_ranks(self) -> list[int]:
         """Determine which remote ranks this local rank exchanges KV with.
 
-        Follows vLLM's ``TpKVTopology.get_target_remote_ranks()`` pattern:
+        Uses the recv-side (inbound edge) TP mapping. Follows vLLM's
+        ``TpKVTopology.get_target_remote_ranks()`` pattern:
         - ``from_tp > to_tp``: each to-rank reads from multiple from-ranks
         - ``from_tp < to_tp``: multiple to-ranks read from the same from-rank
         - ``from_tp == to_tp``: 1:1 mapping
         """
-        self._validate_kv_tp_topology()
-        if self._from_tp == self._to_tp:
+        from_tp, to_tp = self._recv_from_tp, self._recv_to_tp
+        self._validate_kv_tp_topology(from_tp, to_tp)
+        if from_tp == to_tp:
             return [self._local_rank]
 
-        if self._from_tp > self._to_tp:
-            tp_ratio = self._from_tp // self._to_tp
+        if from_tp > to_tp:
+            tp_ratio = from_tp // to_tp
             return [self._local_rank * tp_ratio + i for i in range(tp_ratio)]
         else:
-            tp_ratio = self._to_tp // self._from_tp
+            tp_ratio = to_tp // from_tp
             return [self._local_rank // tp_ratio]
 
     def is_data_transfer_rank(self) -> bool:

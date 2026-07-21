@@ -798,7 +798,7 @@ def run_headless(args: TrackingNamespace) -> None:
     from vllm_omni.engine.stage_init_utils import (
         build_engine_args_dict,
         build_vllm_config,
-        get_stage_connector_spec,
+        get_stage_worker_connector_specs,
         inject_omni_kv_connector_config,
         load_omni_transfer_config_for_model,
         prepare_engine_environment,
@@ -888,10 +888,9 @@ def run_headless(args: TrackingNamespace) -> None:
 
     omni_transfer_config = load_omni_transfer_config_for_model(model, config_path)
     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
-    stage_connector_spec = get_stage_connector_spec(
+    stage_connector_spec, stage_output_connector_spec = get_stage_worker_connector_specs(
         omni_transfer_config=omni_transfer_config,
         stage_id=stage_id,
-        async_chunk=False,
     )
 
     # ``runtime_cfg`` is mostly inherited from the parent's
@@ -902,6 +901,7 @@ def run_headless(args: TrackingNamespace) -> None:
         stage_cfg,
         model,
         stage_connector_spec=stage_connector_spec,
+        stage_output_connector_spec=stage_output_connector_spec,
         cli_tokenizer=getattr(args, "tokenizer", None),
     )
 
@@ -911,6 +911,7 @@ def run_headless(args: TrackingNamespace) -> None:
         stage_cfg,
         model,
         stage_connector_spec=stage_connector_spec,
+        stage_output_connector_spec=stage_output_connector_spec,
         engine_args_dict=engine_args_dict,
         headless=True,
     )

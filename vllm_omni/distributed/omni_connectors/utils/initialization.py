@@ -143,46 +143,128 @@ def create_connectors_from_config(
     return connectors
 
 
+def _stage_port_offset(stage_id: str | int) -> int:
+    try:
+        return int(stage_id)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _apply_transfer_engine_ports(
+    extra: dict[str, Any],
+    *,
+    from_stage: str,
+    is_put: bool,
+    is_get: bool,
+) -> None:
+    """Resolve listen / query ZMQ ports for transfer-engine connectors.
+
+    ``zmq_port`` in YAML is treated as a *base* port. The local listen port
+    for the outbound edge is ``base + from_stage``. The upstream query port
+    for the inbound edge is ``base + upstream_stage`` unless
+    ``sender_zmq_port`` is already set.
+    """
+    base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
+    local_rank = get_connector_local_rank()
+    rank_offset = local_rank * KV_RANK_PORT_STRIDE
+
+    if is_put:
+        # Outbound edge: from_stage is this stage — bind base + this_stage (+ rank).
+        extra["zmq_port"] = base_port + _stage_port_offset(from_stage) + rank_offset
+    if is_get:
+        # Inbound edge: query the upstream sender's listen port.
+        computed_sender_port = base_port + _stage_port_offset(from_stage) + rank_offset
+        if extra.get("sender_zmq_port") is None:
+            extra["sender_zmq_port"] = computed_sender_port
+        else:
+            extra["sender_zmq_port"] = expand_env_int(extra["sender_zmq_port"], "sender_zmq_port")
+        extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))
+
+
 def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, stage_id: str | int) -> dict[str, Any]:
     """
     Extract connector configurations relevant for a specific stage worker.
 
-    Returns a dict compatible with worker initialization:
+    Returns a dict keyed by edge direction for edges that touch this stage:
     {
-        "from_stage_X": {
-            "spec": {
-                "name": "ConnectorName",
-                "extra": {...}
-            }
-        },
-        ...
+        "from_stage_X": {"spec": {"name": ..., "extra": {...}}},  # inbound
+        "to_stage_Y":   {"spec": {"name": ..., "extra": {...}}},  # outbound
     }
+
+    Each edge entry is role-aware for this stage:
+    - inbound  → role=receiver
+    - outbound → role=sender
+
+    Middle stages receive both keys; ``resolve_stage_connector_specs`` splits
+    them into ``(input_spec, output_spec)``, which the mixin builds as one
+    duplex instance (same type) or two instances (hybrid).
     """
     if not transfer_config:
         return {}
 
-    stage_connectors_config = {}
+    stage_connectors_config: dict[str, Any] = {}
     target_stage = str(stage_id)
 
-    # Iterate through all configured edges and inject direction-specific role.
-    # The shared edge-level ConnectorSpec is role-neutral; each stage gets
-    # the correct role ("sender" or "receiver") based on its position in
-    # the edge so that MooncakeTransferEngineConnector (and any future
-    # role-aware connector) initializes correctly.
     for (from_stage, to_stage), spec in transfer_config.connectors.items():
-        if to_stage == target_stage:
-            # Incoming edge → this stage is the receiver
-            extra = dict(spec.extra) if spec.extra else {}
-            extra.setdefault("role", "receiver")
-            stage_connectors_config[f"from_stage_{from_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
-        elif from_stage == target_stage and target_stage == "0":
-            # Outgoing edge for stage 0 — included for async_chunk spec
-            # extraction (omni_stage.py), NOT for connector instantiation.
-            extra = dict(spec.extra) if spec.extra else {}
+        is_put = from_stage == target_stage
+        is_get = to_stage == target_stage
+        if not is_put and not is_get:
+            continue
+
+        extra = dict(spec.extra) if spec.extra else {}
+
+        # Role for single-direction connectors (Mori, Yuanrong, Mooncake).
+        if is_put and not is_get:
             extra.setdefault("role", "sender")
-            stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
+        elif is_get and not is_put:
+            extra.setdefault("role", "receiver")
+
+        if spec.name in TRANSFER_ENGINE_CONNECTOR_NAMES:
+            _apply_transfer_engine_ports(
+                extra,
+                from_stage=from_stage,
+                is_put=is_put,
+                is_get=is_get,
+            )
+
+        if is_get:
+            stage_connectors_config[f"from_stage_{from_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
+        if is_put:
+            # Outbound edges for every stage (not only stage 0) so middle-stage
+            # duplex merge and stage-0 sender spec extraction both work.
+            stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": dict(extra)}}
 
     return stage_connectors_config
+
+
+def resolve_stage_connector_specs(
+    stage_connectors_cfg: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Split per-edge stage connector entries into ``(input_spec, output_spec)``.
+
+    ``input_spec`` drives the inbound (recv) connector, ``output_spec`` the
+    outbound (send) connector. Each is a flat single-direction spec
+    (``{"name", "extra"}``) carrying its own ``role`` / ports / ``rank_mapping``.
+    Either may be ``None`` — stage 0 has no input, the last stage no output.
+
+    The mixin decides whether both specs collapse to one duplex instance
+    (same connector type) or stay as two (hybrid, e.g. Mooncake in / SHM out).
+    """
+    input_spec: dict[str, Any] | None = None
+    output_spec: dict[str, Any] | None = None
+
+    for edge_key, cfg in stage_connectors_cfg.items():
+        spec = cfg.get("spec") or {}
+        name = spec.get("name")
+        if not name:
+            continue
+        flat = {"name": name, "extra": dict(spec.get("extra") or {})}
+        if edge_key.startswith("from_stage_"):
+            input_spec = flat
+        elif edge_key.startswith("to_stage_"):
+            output_spec = flat
+
+    return input_spec, output_spec
 
 
 def load_omni_transfer_config(

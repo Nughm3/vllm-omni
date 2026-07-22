@@ -278,6 +278,111 @@ def test_resolve_stage_connector_specs_same_type_mooncake():
     assert recv2["extra"]["sender_zmq_port"] == 50052
 
 
+def test_resolve_stage_connector_specs_replica_offset(mocker: MockerFixture):
+    """Multiple Omni replicas of the same stage, co-located on one node, must
+    bind non-colliding ports: replica_id offsets every port by
+    KV_REPLICA_PORT_STRIDE, independent of TP rank (fixed at 0 here)."""
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        KV_REPLICA_PORT_STRIDE,
+        resolve_stage_connector_specs,
+    )
+
+    config = OmniTransferConfig(
+        connectors={
+            ("0", "1"): ConnectorSpec(
+                name="MooncakeTransferEngineConnector",
+                extra={"host": "auto", "zmq_port": 50051, "protocol": "rdma"},
+            ),
+            ("1", "2"): ConnectorSpec(
+                name="MooncakeTransferEngineConnector",
+                extra={"host": "auto", "zmq_port": 50051, "protocol": "rdma"},
+            ),
+        }
+    )
+
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.utils.initialization.get_connector_local_rank",
+        return_value=0,
+    )
+
+    # Replica 0 (baseline): same ports as the non-replicated case.
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.utils.initialization.get_omni_replica_id",
+        return_value=0,
+    )
+    recv0, send0 = resolve_stage_connector_specs(get_connectors_config_for_stage(config, stage_id=1))
+    assert send0["extra"]["zmq_port"] == 50052
+    assert recv0["extra"]["sender_zmq_port"] == 50051
+
+    # Replica 2, co-located on the same node: every port shifts by
+    # 2 * KV_REPLICA_PORT_STRIDE, so it cannot collide with replica 0's ports.
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.utils.initialization.get_omni_replica_id",
+        return_value=2,
+    )
+    recv2, send2 = resolve_stage_connector_specs(get_connectors_config_for_stage(config, stage_id=1))
+    replica_shift = 2 * KV_REPLICA_PORT_STRIDE
+    assert send2["extra"]["zmq_port"] == 50052 + replica_shift
+    assert recv2["extra"]["sender_zmq_port"] == 50051 + replica_shift
+
+    # Distinct replicas of the same stage never share a port.
+    assert send0["extra"]["zmq_port"] != send2["extra"]["zmq_port"]
+    assert recv0["extra"]["sender_zmq_port"] != recv2["extra"]["sender_zmq_port"]
+
+
+def test_resolve_stage_connector_specs_replica_and_tp_offset(mocker: MockerFixture):
+    """TP > 1 *and* multiple co-located replicas at once: each (replica, TP
+    rank) pair must land on a distinct port, combining the replica block
+    offset with the per-rank stride within it."""
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        KV_RANK_PORT_STRIDE,
+        KV_REPLICA_PORT_STRIDE,
+        resolve_stage_connector_specs,
+    )
+
+    config = OmniTransferConfig(
+        connectors={
+            ("0", "1"): ConnectorSpec(
+                name="MooncakeTransferEngineConnector",
+                extra={"host": "auto", "zmq_port": 50051, "protocol": "rdma"},
+            ),
+            ("1", "2"): ConnectorSpec(
+                name="MooncakeTransferEngineConnector",
+                extra={"host": "auto", "zmq_port": 50051, "protocol": "rdma"},
+            ),
+        }
+    )
+
+    def ports_for(replica_id: int, local_rank: int) -> tuple[int, int]:
+        mocker.patch(
+            "vllm_omni.distributed.omni_connectors.utils.initialization.get_omni_replica_id",
+            return_value=replica_id,
+        )
+        mocker.patch(
+            "vllm_omni.distributed.omni_connectors.utils.initialization.get_connector_local_rank",
+            return_value=local_rank,
+        )
+        _, send = resolve_stage_connector_specs(get_connectors_config_for_stage(config, stage_id=1))
+        return send["extra"]["zmq_port"]
+
+    # TP=4 within replica 0: ranks 0..3 each land on their own port.
+    replica0_ports = {rank: ports_for(replica_id=0, local_rank=rank) for rank in range(4)}
+    assert len(set(replica0_ports.values())) == 4
+    for rank, port in replica0_ports.items():
+        assert port == 50052 + rank * KV_RANK_PORT_STRIDE
+
+    # Same TP ranks, but replica 1 co-located on the same node: every port
+    # shifts by a full KV_REPLICA_PORT_STRIDE block, so replica 1's TP ranks
+    # never collide with replica 0's TP ranks.
+    replica1_ports = {rank: ports_for(replica_id=1, local_rank=rank) for rank in range(4)}
+    assert len(set(replica1_ports.values())) == 4
+    for rank, port in replica1_ports.items():
+        assert port == 50052 + KV_REPLICA_PORT_STRIDE + rank * KV_RANK_PORT_STRIDE
+
+    # No port is shared between any (replica, rank) pair across both replicas.
+    assert set(replica0_ports.values()).isdisjoint(replica1_ports.values())
+
+
 def test_resolve_stage_connector_specs_hybrid_mooncake_shm():
     """A hybrid middle stage (Mooncake inbound + SHM outbound) yields two
     different-type specs; the mixin builds two distinct instances."""

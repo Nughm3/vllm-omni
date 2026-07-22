@@ -826,7 +826,7 @@ def build_engine_args_dict(
     # (e.g. `--stage-id` defaulting to None).
     engine_args_dict["stage_id"] = stage_id
     # Always attach the connector spec — full-payload Mooncake stages need it
-    # too now, not just async_chunk streaming (see get_stage_worker_connector_specs).
+    # too now, not just async_chunk streaming (see get_stage_connector_specs).
     engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
     # Outbound spec is optional (None for the last stage or a single-edge stage).
     if stage_output_connector_spec is not None:
@@ -1167,7 +1167,7 @@ def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> 
         return None
 
 
-def get_stage_worker_connector_specs(
+def get_stage_connector_specs(
     omni_transfer_config: Any,
     stage_id: int,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:

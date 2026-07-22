@@ -52,7 +52,7 @@ from vllm_omni.engine.stage_init_utils import (
     build_vllm_config,
     compute_replica_layout,
     extract_legacy_stage_metadata,
-    get_stage_worker_connector_specs,
+    get_stage_connector_specs,
     inject_kv_stage_info,
     inject_omni_kv_connector_config,
     load_omni_transfer_config_for_model,
@@ -354,7 +354,7 @@ class StageRuntime:
                     "orchestrator indexes stage pools by stage_id."
                 )
 
-            stage_connector_spec, stage_output_connector_spec = get_stage_worker_connector_specs(
+            stage_connector_spec, stage_output_connector_spec = get_stage_connector_specs(
                 omni_transfer_config=omni_transfer_config,
                 stage_id=stage_id,
             )

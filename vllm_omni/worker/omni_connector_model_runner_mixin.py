@@ -1609,12 +1609,13 @@ class OmniConnectorModelRunnerMixin:
     def _slice_rank_sharded_kv_payload(self, payload: dict[str, Any] | None) -> dict[str, Any] | None:
         """Slice a duplicated source-rank KV shard for ``from_tp < to_tp`` cases.
 
-        Uses the send-side (outbound edge) TP mapping.
+        Registered as ``kv_payload_slicer`` on the receive path, so it must use
+        the recv-side (inbound edge) TP mapping.
         """
-        if payload is None or self._send_from_tp >= self._send_to_tp:
+        if payload is None or self._recv_from_tp >= self._recv_to_tp:
             return payload
 
-        tp_ratio = self._send_to_tp // self._send_from_tp
+        tp_ratio = self._recv_to_tp // self._recv_from_tp
         shard_index = self._local_rank % tp_ratio
         layer_blocks = payload.get("layer_blocks") if isinstance(payload, dict) else None
         if not isinstance(layer_blocks, dict):
@@ -1871,10 +1872,10 @@ class OmniConnectorModelRunnerMixin:
         return self._code_prompt_token_ids
 
     @property
-    def connector(self) -> Any | None:
-        # Payload builders reference ``transfer_manager.connector`` on the send
-        # path; expose the send connector (falls back to recv for a receive-only
-        # last stage).
+    def send_connector(self) -> Any | None:
+        # Payload builders reference ``transfer_manager.send_connector`` on the
+        # send path only; falls back to recv for a receive-only last stage
+        # (whose ``_send_connector`` is the reused recv instance anyway).
         return self._send_connector or self._recv_connector
 
     # ------------------------------------------------------------------ #
@@ -2461,12 +2462,16 @@ class OmniConnectorModelRunnerMixin:
         recv_cfg = self._normalize_connector_config(getattr(model_config, "stage_connector_config", None))
         send_cfg = self._normalize_connector_config(getattr(model_config, "stage_output_connector_config", None))
 
+        def _shared(name: str, extra: dict[str, Any]) -> tuple[OmniConnectorBase, OmniConnectorBase]:
+            """Build one connector instance and reuse it for both directions."""
+            conn = self._build_connector_from_spec(name, extra)
+            return conn, conn
+
         if recv_cfg and send_cfg:
             recv_name, recv_extra = recv_cfg
             send_name, send_extra = send_cfg
             if recv_name == send_name:
-                conn = self._build_connector_from_spec(recv_name, self._dual_union_extra(recv_extra, send_extra))
-                return conn, conn
+                return _shared(recv_name, self._dual_union_extra(recv_extra, send_extra))
             return (
                 self._build_connector_from_spec(recv_name, recv_extra),
                 self._build_connector_from_spec(send_name, send_extra),
@@ -2475,8 +2480,7 @@ class OmniConnectorModelRunnerMixin:
         if recv_cfg and not send_cfg:
             # Inbound only: one connector reused for both directions (last
             # stage never sends; no-config SHM default serves both edges).
-            conn = self._build_connector_from_spec(*recv_cfg)
-            return conn, conn
+            return _shared(*recv_cfg)
 
         if send_cfg and not recv_cfg:
             return None, self._build_connector_from_spec(*send_cfg)

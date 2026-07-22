@@ -17,6 +17,7 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import init_logger
 
 from .initialization import KV_RANK_PORT_STRIDE, KV_REPLICA_PORT_STRIDE, KV_TRANSFER_PORT_OFFSET
+from .local_rank import get_omni_replica_id
 
 logger = init_logger(__name__)
 
@@ -92,15 +93,6 @@ def get_tp_world_size() -> int:
     except Exception:
         logger.debug("TP parallel state not initialized, defaulting world_size=1", exc_info=True)
     return 1
-
-
-def get_omni_replica_id() -> int:
-    """Return the Omni replica id for this worker process."""
-    try:
-        replica_id = int(os.environ.get("VLLM_OMNI_REPLICA_ID", "0"))
-    except (ValueError, TypeError):
-        return 0
-    return max(replica_id, 0)
 
 
 # ------------------------------------------------------------------ #

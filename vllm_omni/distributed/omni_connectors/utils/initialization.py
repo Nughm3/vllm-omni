@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 from ..factory import OmniConnectorFactory
 from .config import TRANSFER_ENGINE_CONNECTOR_NAMES, ConnectorSpec, OmniTransferConfig
 from .env import expand_env_int
-from .local_rank import get_connector_local_rank
+from .local_rank import get_connector_local_rank, get_omni_replica_id
 from .logging import get_connector_logger
 
 if TYPE_CHECKING:
@@ -29,14 +29,15 @@ KV_TRANSFER_PORT_OFFSET = 100
 # Port stride between TP ranks so each worker binds a unique ZMQ port
 # when TP > 1.  Must be larger than the maximum number of pipeline stages.
 # Formula:
-#   zmq_port = base + KV_TRANSFER_PORT_OFFSET
+#   zmq_port = base + [KV_TRANSFER_PORT_OFFSET]
 #            + replica * KV_REPLICA_PORT_STRIDE
 #            + rank * KV_RANK_PORT_STRIDE
 #            + stage
 KV_RANK_PORT_STRIDE = 16
 
-# Port stride between Omni replicas of the same stage.  This reserves a
-# comfortably sized block per replica for TP-rank and stage offsets.
+# Port stride between Omni replicas of the same stage, so co-located replicas
+# each bind a distinct port range. This reserves a comfortably sized block
+# per replica for TP-rank and stage offsets.
 KV_REPLICA_PORT_STRIDE = 1024
 
 
@@ -103,12 +104,14 @@ def create_connectors_from_config(
                 except (TypeError, ValueError):
                     stage_offset = 0
 
-                local_rank = 0 if str(caller_stage_id) == "orchestrator" else get_connector_local_rank()
-                if str(caller_stage_id) == "orchestrator":
+                is_orchestrator = str(caller_stage_id) == "orchestrator"
+                local_rank = 0 if is_orchestrator else get_connector_local_rank()
+                replica_offset = 0 if is_orchestrator else get_omni_replica_id() * KV_REPLICA_PORT_STRIDE
+                if is_orchestrator:
                     rank0_port = base_port + orchestrator_port_offset + stage_offset
                 else:
                     rank0_port = base_port + port_offset + stage_offset
-                adjusted_port = rank0_port + local_rank * KV_RANK_PORT_STRIDE
+                adjusted_port = rank0_port + replica_offset + local_rank * KV_RANK_PORT_STRIDE
                 extra["zmq_port"] = adjusted_port
 
                 if is_sender is not None:
@@ -168,14 +171,14 @@ def _apply_transfer_engine_ports(
     """
     base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
     local_rank = get_connector_local_rank()
-    rank_offset = local_rank * KV_RANK_PORT_STRIDE
+    port_offset = get_omni_replica_id() * KV_REPLICA_PORT_STRIDE + local_rank * KV_RANK_PORT_STRIDE
 
     if is_put:
-        # Outbound edge: from_stage is this stage — bind base + this_stage (+ rank).
-        extra["zmq_port"] = base_port + _stage_port_offset(from_stage) + rank_offset
+        # Outbound edge: from_stage is this stage — bind base + this_stage (+ replica/rank).
+        extra["zmq_port"] = base_port + _stage_port_offset(from_stage) + port_offset
     if is_get:
         # Inbound edge: query the upstream sender's listen port.
-        computed_sender_port = base_port + _stage_port_offset(from_stage) + rank_offset
+        computed_sender_port = base_port + _stage_port_offset(from_stage) + port_offset
         if extra.get("sender_zmq_port") is None:
             extra["sender_zmq_port"] = computed_sender_port
         else:

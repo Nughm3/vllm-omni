@@ -11,6 +11,8 @@ _LOCAL_RANK_ENV_NAMES = (
 )
 _GLOBAL_RANK_ENV_NAMES = ("RANK", "RANK_ID")
 
+_OMNI_REPLICA_ID_ENV_NAME = "VLLM_OMNI_REPLICA_ID"
+
 
 def _visible_device_count() -> int | None:
     visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -47,3 +49,12 @@ def get_connector_local_rank() -> int:
         return rank % visible_count if visible_count else rank
 
     return 0
+
+
+def get_omni_replica_id() -> int:
+    """Return the Omni replica id for this worker process."""
+    try:
+        replica_id = int(os.environ.get(_OMNI_REPLICA_ID_ENV_NAME, "0"))
+    except (ValueError, TypeError):
+        return 0
+    return max(replica_id, 0)

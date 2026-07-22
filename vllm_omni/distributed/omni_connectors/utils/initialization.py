@@ -263,8 +263,18 @@ def resolve_stage_connector_specs(
             continue
         flat = {"name": name, "extra": dict(spec.get("extra") or {})}
         if edge_key.startswith("from_stage_"):
+            if input_spec is not None:
+                raise ValueError(
+                    "Fan-in (multiple inbound edges) is not supported: got a second "
+                    f"inbound edge {edge_key!r} in addition to an already-resolved one."
+                )
             input_spec = flat
         elif edge_key.startswith("to_stage_"):
+            if output_spec is not None:
+                raise ValueError(
+                    "Fan-out (multiple outbound edges) is not supported: got a second "
+                    f"outbound edge {edge_key!r} in addition to an already-resolved one."
+                )
             output_spec = flat
 
     return input_spec, output_spec

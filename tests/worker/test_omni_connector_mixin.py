@@ -134,7 +134,7 @@ class TestMixinAsyncChunkSendRecv:
         seen = {}
 
         def mock_process(transfer_manager, pooling_output, request, is_finished=False):
-            seen["connector"] = transfer_manager.connector
+            seen["connector"] = transfer_manager.send_connector
             seen["is_finished"] = is_finished
             return {"data": pooling_output, "finished": is_finished}
 
@@ -384,7 +384,7 @@ class TestFullPayloadSendWithCustomFunc:
         seen = {}
 
         def full_payload_func(transfer_manager, pooling_output, request, is_finished=False):
-            seen["connector"] = transfer_manager.connector
+            seen["connector"] = transfer_manager.send_connector
             seen["is_finished"] = is_finished
             seen["data"] = pooling_output
             seen["rid"] = request.request_id if request else None

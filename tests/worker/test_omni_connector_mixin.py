@@ -89,7 +89,25 @@ def _make_request(req_id: str, external_req_id: str | None = None):
 
 
 class MixinHost(OmniConnectorModelRunnerMixin):
-    """Minimal class that mixes in the mixin for testing."""
+    """Minimal class that mixes in the mixin for testing.
+
+    Exposes a back-compat ``_omni_connector`` property: the mixin now holds
+    separate ``_recv_connector`` / ``_send_connector`` (one dual instance
+    for same-type stages, two for hybrid). Tests that inject a single mock via
+    ``host._omni_connector = mock`` still work — the setter points both
+    directions at it, and the getter returns the send connector (falling back
+    to recv), matching the old single-connector semantics.
+    """
+
+    @property
+    def _omni_connector(self):
+        send = getattr(self, "_send_connector", None)
+        return send if send is not None else getattr(self, "_recv_connector", None)
+
+    @_omni_connector.setter
+    def _omni_connector(self, connector):
+        self._recv_connector = connector
+        self._send_connector = connector
 
 
 class _FakeTPGroup:
@@ -1496,8 +1514,8 @@ class TestRankMappingResolutionFromConnectorConfig:
 
         host.shutdown_omni_connectors()
 
-    def test_same_type_two_edges_collapse_to_one_duplex_instance(self):
-        # Both edges use the same connector type -> one shared duplex instance.
+    def test_same_type_two_edges_collapse_to_one_dual_instance(self):
+        # Both edges use the same connector type -> one shared dual instance.
         model_config = _make_model_config(stage_id=1)
         model_config.stage_connector_config = {
             "name": "MooncakeTransferEngineConnector",
@@ -1522,9 +1540,9 @@ class TestRankMappingResolutionFromConnectorConfig:
         ):
             host.init_omni_connectors(vllm_config=None, model_config=model_config)
 
-        # One instance built, shared by both directions, with role="duplex".
+        # One instance built, shared by both directions, with role="dual".
         assert len(built) == 1
-        assert built[0].extra.get("role") == "duplex"
+        assert built[0].extra.get("role") == "dual"
         assert host._recv_connector is host._send_connector
         assert host._recv_connector is not None
 

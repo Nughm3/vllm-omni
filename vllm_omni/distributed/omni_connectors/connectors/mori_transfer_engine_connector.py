@@ -213,18 +213,18 @@ class MoriTransferEngineConnector(OmniConnectorBase):
         # ``receiver`` : no listener, only ``get()`` by querying an
         #                upstream sender whose endpoint lives in
         #                ``sender_host`` / ``sender_zmq_port``.
-        # ``duplex``   : binds the listener (outbound edge) AND ``get()``s from
+        # ``dual``   : binds the listener (outbound edge) AND ``get()``s from
         #                upstream (inbound edge) on one instance.
         role = str(config.get("role", "sender")).lower()
-        if role not in {"sender", "receiver", "duplex"}:
+        if role not in {"sender", "receiver", "dual"}:
             raise ValueError(
-                f"Invalid role={role!r} for MoriTransferEngineConnector. Expected 'sender', 'receiver', or 'duplex'."
+                f"Invalid role={role!r} for MoriTransferEngineConnector. Expected 'sender', 'receiver', or 'dual'."
             )
         self.role = role
         # can_put gates the listener bind and put(); get() is role-agnostic, so
-        # duplex binds its own outbound listener while pulling from upstream.
-        self.can_put = role in {"sender", "duplex"}
-        self.can_get = role in {"receiver", "duplex"}
+        # dual binds its own outbound listener while pulling from upstream.
+        self.can_put = role in {"sender", "dual"}
+        self.can_get = role in {"receiver", "dual"}
 
         # ---- Mori IOEngine ----
         if self.device_name:

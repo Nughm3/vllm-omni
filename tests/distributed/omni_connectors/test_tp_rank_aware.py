@@ -23,6 +23,8 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
 )
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     KV_RANK_PORT_STRIDE,
+    KV_REPLICA_PORT_STRIDE,
+    KV_TRANSFER_PORT_OFFSET,
 )
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import (
     KVTPTopology,
@@ -31,6 +33,7 @@ from vllm_omni.distributed.omni_connectors.utils.kv_utils import (
     get_kv_connector_key,
     get_kv_source_ranks,
     get_kv_target_ranks,
+    kv_zmq_port,
     merge_received_rank_shards,
     slice_received_rank_shard,
 )
@@ -288,6 +291,58 @@ class TestUpdateSenderInfoBase:
         )
         assert mgr._sender_base_host == "10.0.0.2"
         assert mgr._sender_base_zmq_port == 50152
+
+
+# ── kv_zmq_port: replica + TP-rank port offsets ──────────────────────
+
+
+class TestKvZmqPortReplicaOffset:
+    """Multiple Omni replicas of the same stage, co-located on one node, and/or
+    TP > 1 within a replica must each resolve to a distinct ZMQ port."""
+
+    def test_replica_0_rank_0_matches_legacy_port(self):
+        """Backward compatibility: replica 0 / rank 0 == base + OFFSET + stage."""
+        port = kv_zmq_port(50051, from_stage=3, local_rank=0, replica_id=0)
+        assert port == 50051 + KV_TRANSFER_PORT_OFFSET + 3
+
+    def test_replica_offset_applied_independent_of_rank(self):
+        base_port = kv_zmq_port(50051, from_stage=3, local_rank=0, replica_id=0)
+        replica2_port = kv_zmq_port(50051, from_stage=3, local_rank=0, replica_id=2)
+        assert replica2_port == base_port + 2 * KV_REPLICA_PORT_STRIDE
+
+    def test_replicas_on_same_node_never_collide(self):
+        """Simulates N co-located replicas of the same stage: every
+        (replica_id) must map to a unique port at a fixed TP rank."""
+        ports = {
+            replica_id: kv_zmq_port(50051, from_stage=1, local_rank=0, replica_id=replica_id) for replica_id in range(8)
+        }
+        assert len(set(ports.values())) == 8
+
+    def test_replica_and_tp_rank_offsets_combine_without_collision(self):
+        """TP > 1 *and* multiple co-located replicas at once: every
+        (replica, rank) pair must land on a distinct port."""
+        ports = {
+            (replica_id, rank): kv_zmq_port(50051, from_stage=2, local_rank=rank, replica_id=replica_id)
+            for replica_id in range(4)
+            for rank in range(4)
+        }
+        assert len(set(ports.values())) == len(ports)
+
+        # Spot-check the exact formula for a couple of (replica, rank) pairs.
+        assert ports[(0, 0)] == 50051 + KV_TRANSFER_PORT_OFFSET + 2
+        assert (
+            ports[(1, 3)] == 50051 + KV_TRANSFER_PORT_OFFSET + 1 * KV_REPLICA_PORT_STRIDE + 3 * KV_RANK_PORT_STRIDE + 2
+        )
+
+    def test_replica_id_none_falls_back_to_env(self, monkeypatch):
+        """replica_id=None resolves via VLLM_OMNI_REPLICA_ID (get_omni_replica_id)."""
+        monkeypatch.setenv("VLLM_OMNI_REPLICA_ID", "3")
+        port = kv_zmq_port(50051, from_stage=0, local_rank=0)
+        assert port == 50051 + KV_TRANSFER_PORT_OFFSET + 3 * KV_REPLICA_PORT_STRIDE
+
+    def test_negative_replica_id_clamped_to_zero(self):
+        port = kv_zmq_port(50051, from_stage=0, local_rank=0, replica_id=-5)
+        assert port == 50051 + KV_TRANSFER_PORT_OFFSET
 
 
 # ── receive path constructs per-rank metadata ────────────────────────

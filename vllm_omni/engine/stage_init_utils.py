@@ -1066,7 +1066,7 @@ def get_stage_worker_connector_specs(
     ``input_spec`` drives the inbound (recv) connector, ``output_spec`` the
     outbound (send) connector. Either may be ``None`` (stage 0 has no input;
     the last stage has no output). A middle stage whose two edges use the same
-    connector type is collapsed to one duplex instance by the mixin; a hybrid
+    connector type is collapsed to one dual instance by the mixin; a hybrid
     stage (different types) keeps two instances.
     """
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config

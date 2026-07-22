@@ -224,7 +224,7 @@ def test_get_connectors_for_stage():
 
 def test_resolve_stage_connector_specs_same_type_mooncake():
     """A same-type middle stage yields two Mooncake specs (input + output),
-    each with its own role and ports; the mixin collapses them into one duplex
+    each with its own role and ports; the mixin collapses them into one dual
     instance. Stage 0 has only an output spec; the last stage only an input."""
     from vllm_omni.distributed.omni_connectors.utils.initialization import (
         resolve_stage_connector_specs,

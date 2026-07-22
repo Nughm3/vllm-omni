@@ -275,8 +275,8 @@ def _patch_fake_mooncake(monkeypatch: pytest.MonkeyPatch):
     return mooncake_module
 
 
-def test_mooncake_connector_duplex_role_binds_and_gets(monkeypatch: pytest.MonkeyPatch):
-    """role='duplex' binds the outbound listener (can_put) and also allows
+def test_mooncake_connector_dual_role_binds_and_gets(monkeypatch: pytest.MonkeyPatch):
+    """role='dual' binds the outbound listener (can_put) and also allows
     get() from upstream (can_get) on a single instance."""
     mooncake_module = _patch_fake_mooncake(monkeypatch)
 
@@ -284,7 +284,7 @@ def test_mooncake_connector_duplex_role_binds_and_gets(monkeypatch: pytest.Monke
         {
             "zmq_port": 50052,
             "memory_pool_size": 4096,
-            "role": "duplex",
+            "role": "dual",
             "sender_host": "10.20.30.41",
             "sender_zmq_port": 50051,
         }
@@ -292,7 +292,7 @@ def test_mooncake_connector_duplex_role_binds_and_gets(monkeypatch: pytest.Monke
     try:
         assert connector.can_put is True
         assert connector.can_get is True
-        # A duplex instance binds its own listener (can_put) yet also holds the
+        # A dual instance binds its own listener (can_put) yet also holds the
         # upstream endpoint for get().
         assert connector.sender_host == "10.20.30.41"
         assert connector.sender_zmq_port == 50051

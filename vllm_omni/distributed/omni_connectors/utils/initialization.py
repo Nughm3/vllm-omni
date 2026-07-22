@@ -200,7 +200,7 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
 
     Middle stages receive both keys; ``resolve_stage_connector_specs`` splits
     them into ``(input_spec, output_spec)``, which the mixin builds as one
-    duplex instance (same type) or two instances (hybrid).
+    dual instance (same type) or two instances (hybrid).
     """
     if not transfer_config:
         return {}
@@ -234,7 +234,7 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
             stage_connectors_config[f"from_stage_{from_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
         if is_put:
             # Outbound edges for every stage (not only stage 0) so middle-stage
-            # duplex merge and stage-0 sender spec extraction both work.
+            # dual merge and stage-0 sender spec extraction both work.
             stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": dict(extra)}}
 
     return stage_connectors_config
@@ -250,7 +250,7 @@ def resolve_stage_connector_specs(
     (``{"name", "extra"}``) carrying its own ``role`` / ports / ``rank_mapping``.
     Either may be ``None`` — stage 0 has no input, the last stage no output.
 
-    The mixin decides whether both specs collapse to one duplex instance
+    The mixin decides whether both specs collapse to one dual instance
     (same connector type) or stay as two (hybrid, e.g. Mooncake in / SHM out).
     """
     input_spec: dict[str, Any] | None = None

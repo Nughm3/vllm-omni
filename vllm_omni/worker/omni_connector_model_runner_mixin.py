@@ -97,7 +97,7 @@ class OmniConnectorModelRunnerMixin:
             kv_transfer_manager: Existing KV transfer manager to delegate to.
         """
         # Build the recv (inbound) and send (outbound) connectors. Same-type
-        # two-edge stages collapse to one duplex instance shared by both
+        # two-edge stages collapse to one dual instance shared by both
         # references; hybrid stages get two; single-edge stages get one.
         self._recv_connector, self._send_connector = self._build_stage_connectors(model_config)
         self._kv_transfer_manager = kv_transfer_manager
@@ -113,7 +113,7 @@ class OmniConnectorModelRunnerMixin:
         self._custom_process_supports_is_finished = self._custom_process_supports_is_finished_kwarg()
         logger.debug(
             "[Stage-%s] init_omni_connectors: async_chunk=%s, custom_process_func=%s, "
-            "recv_connector=%s, send_connector=%s, duplex=%s, func_path=%s",
+            "recv_connector=%s, send_connector=%s, dual=%s, func_path=%s",
             self._stage_id,
             self._async_chunk,
             self._custom_process_func,
@@ -201,7 +201,7 @@ class OmniConnectorModelRunnerMixin:
 
         # Start each background thread only when its direction has a connector:
         # recv loop needs an inbound connector, save loop an outbound one. A
-        # duplex stage (recv is send) runs both.
+        # dual stage (recv is send) runs both.
         self._recv_thread: threading.Thread | None = None
         self._save_thread: threading.Thread | None = None
         if self._recv_connector is not None:
@@ -233,7 +233,7 @@ class OmniConnectorModelRunnerMixin:
             self._recv_thread.join(timeout=5)
         if self._save_thread is not None:
             self._save_thread.join(timeout=5)
-        # Close both connectors, de-duplicated when duplex (recv is send).
+        # Close both connectors, de-duplicated when dual (recv is send).
         seen: set[int] = set()
         for conn in (self._recv_connector, self._send_connector):
             if conn is None or id(conn) in seen:
@@ -2149,18 +2149,18 @@ class OmniConnectorModelRunnerMixin:
             raise RuntimeError(f"Failed to create connector {name}") from exc
 
     @staticmethod
-    def _duplex_union_extra(recv_extra: dict[str, Any], send_extra: dict[str, Any]) -> dict[str, Any]:
-        """Merge inbound + outbound extras into one duplex connector config.
+    def _dual_union_extra(recv_extra: dict[str, Any], send_extra: dict[str, Any]) -> dict[str, Any]:
+        """Merge inbound + outbound extras into one dual connector config.
 
         Shared backend knobs come from the outbound extra; direction-specific
         fields are taken from the edge that owns them: the outbound edge's
         listen ``zmq_port`` and the inbound edge's upstream ``sender_host`` /
-        ``sender_zmq_port``. ``role`` becomes ``"duplex"`` so the connector
+        ``sender_zmq_port``. ``role`` becomes ``"dual"`` so the connector
         binds its own listener while still pulling from upstream.
         """
         merged = dict(recv_extra)
         merged.update(send_extra)  # outbound wins on shared knobs
-        merged["role"] = "duplex"
+        merged["role"] = "dual"
         if "zmq_port" in send_extra:
             merged["zmq_port"] = send_extra["zmq_port"]  # own outbound listener
         for key in ("sender_host", "sender_zmq_port"):
@@ -2171,7 +2171,7 @@ class OmniConnectorModelRunnerMixin:
     def _build_stage_connectors(self, model_config: Any) -> tuple[OmniConnectorBase | None, OmniConnectorBase | None]:
         """Build ``(recv_connector, send_connector)`` for this stage.
 
-        - same-type two edges  → one duplex instance shared by both refs
+        - same-type two edges  → one dual instance shared by both refs
         - different-type edges → two instances (hybrid, e.g. Mooncake / SHM)
         - inbound only         → one instance reused for send (last stage;
           also the no-transfer-config default where SHM serves both directions)
@@ -2184,7 +2184,7 @@ class OmniConnectorModelRunnerMixin:
             recv_name, recv_extra = recv_cfg
             send_name, send_extra = send_cfg
             if recv_name == send_name:
-                conn = self._build_connector_from_spec(recv_name, self._duplex_union_extra(recv_extra, send_extra))
+                conn = self._build_connector_from_spec(recv_name, self._dual_union_extra(recv_extra, send_extra))
                 return conn, conn
             return (
                 self._build_connector_from_spec(recv_name, recv_extra),

@@ -215,23 +215,17 @@ class MoriTransferEngineConnector(OmniConnectorBase):
         #                ``sender_host`` / ``sender_zmq_port``.
         # ``dual``   : binds the listener (outbound edge) AND ``get()``s from
         #                upstream (inbound edge) on one instance.
-        role = str(config.get("role", "sender")).lower()
-        if role not in {"sender", "receiver", "dual"}:
-            raise ValueError(
-                f"Invalid role={role!r} for MoriTransferEngineConnector. Expected 'sender', 'receiver', or 'dual'."
-            )
-        self.role = role
+        self.role = str(config.get("role", "sender")).lower()
         # can_put gates the listener bind and put(); get() is role-agnostic, so
         # dual binds its own outbound listener while pulling from upstream.
-        self.can_put = role in {"sender", "dual"}
-        self.can_get = role in {"receiver", "dual"}
+        self.can_put, self.can_get = self.resolve_role(self.role, connector_name="MoriTransferEngineConnector")
 
         # ---- Mori IOEngine ----
         if self.device_name:
             os.environ["MORI_RDMA_DEVICES"] = self.device_name
 
         engine_config = IOEngineConfig(host=self.host, port=0)
-        self.engine_key = f"omni-{role}-{uuid.uuid4().hex[:8]}-pid{os.getpid()}-{self.host}"
+        self.engine_key = f"omni-{self.role}-{uuid.uuid4().hex[:8]}-pid{os.getpid()}-{self.host}"
         self.engine = IOEngine(self.engine_key, engine_config)
 
         # ---- Backend creation (per backend_type) ----

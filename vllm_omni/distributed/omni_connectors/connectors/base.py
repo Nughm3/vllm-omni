@@ -118,3 +118,20 @@ class OmniConnectorBase(ABC):
         Connectors with different key conventions can override this method.
         """
         return f"{key}{separator}{from_stage}_{to_stage}"
+
+    @staticmethod
+    def resolve_role(role: str, *, connector_name: str) -> tuple[bool, bool]:
+        """Resolve a ``role`` config value into ``(can_put, can_get)``.
+
+        - ``"sender"``: bind a listener, accept ``put()`` calls only.
+        - ``"receiver"``: skip the listener bind, accept ``get()`` calls only.
+        - ``"dual"``: bind a listener AND accept ``get()`` — a middle stage
+          whose two edges use the same connector type shares one instance.
+
+        Shared by connectors (e.g. Mooncake/Mori transfer engines) whose
+        listener bind and ``put()``/``get()`` gating depend on role.
+        """
+        role = role.lower()
+        if role not in {"sender", "receiver", "dual"}:
+            raise ValueError(f"Invalid role={role!r} for {connector_name}. Expected 'sender', 'receiver', or 'dual'.")
+        return role in {"sender", "dual"}, role in {"receiver", "dual"}

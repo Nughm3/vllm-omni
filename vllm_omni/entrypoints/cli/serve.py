@@ -798,7 +798,7 @@ def run_headless(args: TrackingNamespace) -> None:
     from vllm_omni.engine.stage_init_utils import (
         build_engine_args_dict,
         build_vllm_config,
-        get_stage_worker_connector_specs,
+        get_stage_connector_specs,
         inject_omni_kv_connector_config,
         load_omni_transfer_config_for_model,
         prepare_engine_environment,
@@ -888,7 +888,7 @@ def run_headless(args: TrackingNamespace) -> None:
 
     omni_transfer_config = load_omni_transfer_config_for_model(model, config_path)
     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
-    stage_connector_spec, stage_output_connector_spec = get_stage_worker_connector_specs(
+    stage_connector_spec, stage_output_connector_spec = get_stage_connector_specs(
         omni_transfer_config=omni_transfer_config,
         stage_id=stage_id,
     )

@@ -169,22 +169,21 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # --- Role ---
         # "sender": bind ZMQ listener, accept put() calls.
         # "receiver": skip ZMQ bind, only accept get() calls.
-        # "duplex": bind ZMQ listener (outbound edge) AND get() from upstream
+        # "dual": bind ZMQ listener (outbound edge) AND get() from upstream
         #   (inbound edge) on one instance — a middle stage whose two edges use
         #   the same connector type shares a single pool this way.
         # The orchestration layer (get_connectors_config_for_stage /
         # kv_transfer_manager) is responsible for injecting the correct role.
         role = str(config.get("role", "sender")).lower()
-        if role not in {"sender", "receiver", "duplex"}:
+        if role not in {"sender", "receiver", "dual"}:
             raise ValueError(
-                f"Invalid role={role!r} for MooncakeTransferEngineConnector. "
-                "Expected 'sender', 'receiver', or 'duplex'."
+                f"Invalid role={role!r} for MooncakeTransferEngineConnector. Expected 'sender', 'receiver', or 'dual'."
             )
         # can_put gates the listener bind and put(); get() is role-agnostic and
-        # resolves against sender_host/sender_zmq_port, so duplex binds its own
+        # resolves against sender_host/sender_zmq_port, so dual binds its own
         # outbound listener while still pulling from the upstream sender.
-        self.can_put = role in {"sender", "duplex"}
-        self.can_get = role in {"receiver", "duplex"}
+        self.can_put = role in {"sender", "dual"}
+        self.can_get = role in {"receiver", "dual"}
 
         self.engine_id = str(uuid.uuid4())
 

@@ -104,7 +104,7 @@ class OmniModelConfig(ModelConfig):
          stage_output_connector_config: Outbound (send) stage connector
              configuration. Same shape as stage_connector_config. When both
              edges of a middle stage use the same connector type the mixin
-             collapses them into one duplex instance.
+             collapses them into one dual instance.
          task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
              If not specified, will be inferred from model path.
 

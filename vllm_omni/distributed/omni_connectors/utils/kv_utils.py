@@ -16,7 +16,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.logger import init_logger
 
-from .local_rank import get_omni_replica_id
+from .local_rank import get_connector_local_rank, get_omni_replica_id
 
 logger = init_logger(__name__)
 
@@ -142,6 +142,23 @@ def kv_zmq_port(
     """
     replica = get_omni_replica_id() if replica_id is None else max(int(replica_id), 0)
     return base_port + purpose_offset + replica * KV_REPLICA_PORT_STRIDE + local_rank * KV_RANK_PORT_STRIDE + from_stage
+
+
+def worker_rank_port_offset(local_rank: int | None = None, replica_id: int | None = None) -> int:
+    """This worker's TP-rank + replica port delta, in isolation.
+
+    For callers that already hold a stage-resolved *base* port — computed
+    once, before per-rank worker processes exist (e.g.
+    ``_apply_transfer_engine_ports`` in initialization.py) — and that must
+    add the per-worker offset themselves, at actual connector-construction
+    time inside each worker process, where ``local_rank`` /
+    ``VLLM_OMNI_REPLICA_ID`` resolve correctly. Resolving this offset any
+    earlier bakes the same port into every rank/replica's shared config,
+    so all but one fails to bind.
+    """
+    rank = get_connector_local_rank() if local_rank is None else local_rank
+    replica = get_omni_replica_id() if replica_id is None else max(int(replica_id), 0)
+    return replica * KV_REPLICA_PORT_STRIDE + rank * KV_RANK_PORT_STRIDE
 
 
 # ------------------------------------------------------------------ #

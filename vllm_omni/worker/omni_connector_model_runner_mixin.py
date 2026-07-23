@@ -564,36 +564,6 @@ class OmniConnectorModelRunnerMixin:
             return None
         return connector.get(from_stage, to_stage, connector_get_key)
 
-    def _recv_full_payload_result(
-        self,
-        connector: OmniConnectorBase,
-        from_stage: str,
-        to_stage: str,
-        connector_get_key: str,
-    ) -> Any:
-        """Receive one full-payload transfer on the local leader rank only."""
-        return self._recv_ordinary_stage_result(
-            connector,
-            from_stage,
-            to_stage,
-            connector_get_key,
-        )
-
-    def _recv_async_chunk_result(
-        self,
-        connector: OmniConnectorBase,
-        from_stage: str,
-        to_stage: str,
-        connector_get_key: str,
-    ) -> Any:
-        """Receive one ordinary async chunk on the local leader rank only."""
-        return self._recv_ordinary_stage_result(
-            connector,
-            from_stage,
-            to_stage,
-            connector_get_key,
-        )
-
     @staticmethod
     def _snapshot_payload(payload: Any) -> Any:
         if isinstance(payload, dict):
@@ -1049,103 +1019,6 @@ class OmniConnectorModelRunnerMixin:
                 return
             self._pending_load_reqs[request_id] = request
         self._work_available.set()
-
-    def recv_chunk(self) -> dict[str, Any]:
-        """Collect chunks received by the bg thread since last call.
-
-        Returns a dict ``{request_id: chunk_payload}`` for newly arrived
-        chunks.  Empty dict when nothing is ready.
-
-        This method reads from ``_finished_load_reqs`` without clearing
-        it -- ``get_omni_connector_output()`` is the sole consumer that
-        drains and resets ``_finished_load_reqs`` at the end of each
-        ``execute_model`` cycle.
-
-        Returns **shallow copies** of the cached payloads so that the
-        caller can read them without racing against the background recv
-        thread, which may concurrently mutate the live cache entries via
-        ``dict.update()``.
-        """
-        with self._lock:
-            finished = set(self._finished_load_reqs)
-            if not finished:
-                return {}
-            # Snapshot the payloads under the lock to avoid racing with
-            # _poll_single_request which does existing.update(payload_data)
-            # on the same dict objects.
-            result = {}
-            for rid in finished:
-                payload = self._local_stage_payload_cache.get(rid)
-                result[rid] = dict(payload) if isinstance(payload, dict) else payload
-
-        self._chunk_ready_req_ids.update(finished)
-        return result
-
-    def send_chunk(
-        self,
-        request: Any,
-        pooling_output: Any | None = None,
-    ) -> bool:
-        """Derive and enqueue one chunk for async sending.
-
-        Payload extraction runs in the caller thread (via
-        ``custom_process_stage_input_func``); the actual
-        ``connector.put()`` is done by the background save thread.
-        Non-KV data is identical across TP ranks; only rank 0 sends.
-        """
-        if self._omni_connector is None:
-            logger.warning("[Stage-%s] send_chunk: connector is None", self._stage_id)
-            return False
-        if not self.is_data_transfer_rank():
-            return True
-        raw_req_id = getattr(request, "request_id", None) or getattr(request, "req_id", None)
-        request_id = self._resolve_external_req_id(request, raw_req_id)
-        # Cache the internal→external mapping so that finish sentinels can
-        # resolve the external ID even after the request is freed.
-        if raw_req_id and raw_req_id != request_id:
-            self._request_ids_mapping.setdefault(raw_req_id, request_id)
-        chunk_id = self._put_req_chunk[request_id]
-
-        payload_data = self._build_custom_process_payload(
-            request_id=request_id,
-            request=request,
-            pooling_output=pooling_output,
-        )
-        if payload_data is None:
-            if chunk_id == 0:
-                logger.warning(
-                    "[Stage-%s] send_chunk: payload is None for req=%s chunk=%s (process_func=%s)",
-                    self._stage_id,
-                    request_id,
-                    chunk_id,
-                    self._custom_process_func,
-                )
-            return False
-
-        self._put_req_chunk[request_id] += 1
-        next_stage_id = self._next_stage_id
-        connector_put_key = f"{request_id}_{self._stage_id}_{chunk_id}"
-
-        if chunk_id == 0:
-            logger.debug(
-                "[Stage-%s] send_chunk: first chunk enqueued, req=%s key=%s",
-                self._stage_id,
-                request_id,
-                connector_put_key,
-            )
-
-        task = {
-            "stage_id": self._stage_id,
-            "next_stage_id": next_stage_id,
-            "put_key": connector_put_key,
-            "data": payload_data,
-            "request_id": request_id,
-        }
-        with self._lock:
-            self._pending_save_reqs.setdefault(request_id, deque()).append(task)
-            self._pending_save_counts[request_id] += 1
-        self._work_available.set()
-        return True
 
     # ------------------------------------------------------------------ #
     #  KV cache  (delegates to OmniKVTransferManager)
@@ -1723,20 +1596,12 @@ class OmniConnectorModelRunnerMixin:
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
-        if self._async_chunk:
-            result = self._recv_async_chunk_result(
-                connector,
-                str(target_stage_id),
-                str(self._stage_id),
-                connector_get_key,
-            )
-        else:
-            result = self._recv_full_payload_result(
-                connector,
-                str(target_stage_id),
-                str(self._stage_id),
-                connector_get_key,
-            )
+        result = self._recv_ordinary_stage_result(
+            connector,
+            str(target_stage_id),
+            str(self._stage_id),
+            connector_get_key,
+        )
 
         if result is None:
             return False

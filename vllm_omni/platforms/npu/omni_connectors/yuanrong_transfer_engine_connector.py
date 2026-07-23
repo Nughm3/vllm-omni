@@ -130,12 +130,19 @@ class YuanrongTransferEngineConnector(OmniConnectorBase):
         sender_zmq_port = config.get("sender_zmq_port")
         self.sender_zmq_port = self._resolve_optional_port(sender_zmq_port, "sender_zmq_port")
 
+        # "sender": bind ZMQ listener, accept put() calls.
+        # "receiver": skip ZMQ bind, only accept get() calls.
+        # "dual": bind ZMQ listener (outbound edge) AND get() from upstream
+        #   (inbound edge) on one instance — a middle stage whose two edges use
+        #   the same connector type shares a single pool this way. get() is
+        #   already role-agnostic (resolves via sender_host/sender_zmq_port),
+        #   so only the listener bind below needs to key off "dual" too.
         role = str(config.get("role", "sender")).lower()
-        if role not in {"sender", "receiver"}:
+        if role not in {"sender", "receiver", "dual"}:
             raise ValueError(
-                f"Invalid role={role!r} for YuanrongTransferEngineConnector. Expected 'sender' or 'receiver'."
+                f"Invalid role={role!r} for YuanrongTransferEngineConnector. Expected 'sender', 'receiver', or 'dual'."
             )
-        self.can_put = role == "sender"
+        self.can_put = role in {"sender", "dual"}
 
         self.engine = TransferEngine()
         local_endpoint = f"{self.host}:{self.rpc_port}"

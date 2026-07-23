@@ -24,6 +24,9 @@ class _DummySenderStage:
     def get_kv_sender_info(self):
         return self._sender_info
 
+    def get_chunk_sender_info(self):
+        return self._sender_info
+
 
 class _DummyDiffusionStage:
     stage_type = "diffusion"
@@ -54,6 +57,21 @@ def _build_sender_pool(stage_id: int, sender_info: dict[str, object]) -> StagePo
     )
 
 
+def test_build_chunk_sender_info_uses_bound_replica():
+    orchestrator = object.__new__(Orchestrator)
+    replica0 = _DummySenderStage({"host": "10.0.0.1", "zmq_port": 50151})
+    replica1 = _DummySenderStage({"host": "10.0.0.2", "zmq_port": 50251})
+    sender_pool = SimpleNamespace(
+        stage_client=replica0,
+        get_bound_client=lambda request_id: replica1 if request_id == "req-on-replica-1" else replica0,
+    )
+    orchestrator.stage_pools = [sender_pool]
+
+    sender_info = orchestrator._build_chunk_sender_info(0, "req-on-replica-1")
+
+    assert sender_info == {"host": "10.0.0.2", "zmq_port": 50251}
+
+
 def test_stage_engine_core_client_builds_kv_sender_info_from_tcp_address():
     client = object.__new__(StageEngineCoreClient)
     client.stage_id = 0
@@ -67,6 +85,27 @@ def test_stage_engine_core_client_builds_kv_sender_info_from_tcp_address():
     assert client.get_kv_sender_info() == {
         "host": "10.20.30.40",
         "zmq_port": 50151,
+    }
+
+
+def test_stage_engine_core_client_builds_chunk_sender_info_for_actual_replica():
+    client = object.__new__(StageEngineCoreClient)
+    client.stage_id = 1
+    client.replica_id = 1
+    client.client_addresses = {"input_address": "tcp://10.20.30.40:1234"}
+    client.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            stage_output_connector_config={
+                "name": "MooncakeTransferEngineConnector",
+                # Stage-resolved port already includes from_stage=1.
+                "extra": {"zmq_port": 50052, "from_stage": "1"},
+            }
+        )
+    )
+
+    assert client.get_chunk_sender_info() == {
+        "host": "10.20.30.40",
+        "zmq_port": 51076,
     }
 
 

@@ -75,9 +75,8 @@ def _patch_fake_yuanrong(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_yuanrong_transfer_engine_connector_dual_role_binds_and_gets(monkeypatch: pytest.MonkeyPatch):
-    """role='dual' binds the outbound listener (can_put) and also allows
-    get() from upstream on a single instance — same contract as the
-    Mooncake/Mori transfer-engine connectors."""
+    """role='dual' binds the outbound listener and retains the upstream
+    sender endpoint needed by the role-agnostic get() path."""
     yuanrong_module = _patch_fake_yuanrong(monkeypatch)
 
     connector = yuanrong_module.YuanrongTransferEngineConnector(

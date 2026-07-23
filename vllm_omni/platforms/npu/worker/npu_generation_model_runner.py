@@ -113,6 +113,16 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             if kv_connector_metadata is not None:
                 get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
+        if getattr(self, "_omni_connector_initialized", False):
+            for request in getattr(scheduler_output, "pending_input_registrations", []):
+                self.register_chunk_recv(request)
+            self.recv_full_payload_inputs(scheduler_output)
+            if self._pending_full_payload_send:
+                flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
+                flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
+                if flush_ids:
+                    self.flush_full_payload_outputs(flush_ids)
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("prepare input"):
             #  -------------------------------------- Omni-new -------------------------------------------------

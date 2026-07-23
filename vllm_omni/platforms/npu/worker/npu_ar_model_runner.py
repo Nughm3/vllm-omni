@@ -380,6 +380,15 @@ class NPUARModelRunner(OmniNPUModelRunner):
             request_id_resolver=self._resolve_global_request_id,
         )
         #  -------------------------------------- Omni-new -------------------------------------------------
+        if getattr(self, "_omni_connector_initialized", False):
+            for request in getattr(scheduler_output, "pending_input_registrations", []):
+                self.register_chunk_recv(request)
+            self.recv_full_payload_inputs(scheduler_output)
+            if self._pending_full_payload_send:
+                flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
+                flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
+                if flush_ids:
+                    self.flush_full_payload_outputs(flush_ids)
         # self._draft_token_ids is None when `input_fits_in_drafter=False`
         # and there is no draft tokens scheduled. so it need to update the
         # spec_decoding info in scheduler_output with async_scheduling.

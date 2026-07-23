@@ -143,14 +143,14 @@ def _apply_transfer_engine_ports(
     is_put: bool,
     is_get: bool,
 ) -> None:
-    """Resolve listen / query ZMQ ports for transfer-engine connectors.
+    """Resolve listen / query ZMQ *base* ports for transfer-engine connectors.
 
-    ``zmq_port`` in YAML is treated as a *base* port. The local listen port
-    for the outbound edge is ``base + from_stage``. The upstream query port
-    for the inbound edge is ``base + upstream_stage`` unless
-    ``sender_zmq_port`` is already set. Both share ``kv_zmq_port``'s
-    replica/rank offset formula (purpose_offset=0 — this namespace doesn't
-    need KV_TRANSFER_PORT_OFFSET's separation from the KV-cache connector).
+    ``zmq_port`` in YAML is a *base* port; the listen port is ``base +
+    from_stage``. This deliberately excludes the per-TP-rank / per-replica
+    offset — this runs once per stage before per-rank worker processes
+    exist, so baking a rank-resolved port in here would copy the same port
+    to every rank. The mixin adds that offset itself at actual
+    connector-construction time (``_apply_worker_port_offset``).
     """
     base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
     stage_base_port = base_port + _stage_port_offset(from_stage)

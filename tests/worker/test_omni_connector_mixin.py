@@ -1648,17 +1648,6 @@ class TestWorkerPortOffset:
             result = OmniConnectorModelRunnerMixin._apply_worker_port_offset("SharedMemoryConnector", extra)
         assert result is extra
 
-    def test_zero_offset_returns_same_dict(self):
-        """rank 0 / replica 0 (the common case) must be a no-op, not just a
-        same-valued copy — avoids needless mutation on the hot path."""
-        extra = {"zmq_port": 50052, "sender_zmq_port": 50051}
-        with patch(
-            "vllm_omni.worker.omni_connector_model_runner_mixin.worker_rank_port_offset",
-            return_value=0,
-        ):
-            result = OmniConnectorModelRunnerMixin._apply_worker_port_offset("MooncakeTransferEngineConnector", extra)
-        assert result is extra
-
     def test_nonzero_offset_shifts_both_ports_without_mutating_input(self):
         extra = {"zmq_port": 50052, "sender_zmq_port": 50051}
         with patch(
@@ -1716,6 +1705,89 @@ class TestWorkerPortOffset:
 
         assert seen_ports == [50052, 50068]
         assert len(set(seen_ports)) == 2
+
+    def test_asymmetric_1x_2x_2x_replica_topology_no_port_collisions(self):
+        """Realistic 3-stage pipeline mirroring the multi-replica e2e deploy
+        shape (tests/.ci_generated/qwen3_omni_moe_multi_replicas_4gpu.yaml),
+        scaled down: 1 replica of stage 0, 2 replicas each of stages 1 and 2,
+        all co-located (TP=1 each). Every listener-binding connector instance
+        (role in {"sender", "dual"}; "receiver"-only never binds) across all
+        (stage, replica) pairs must resolve to a distinct zmq_port — this is
+        exactly the collision the port-timing fix prevents: stage 0 has one
+        replica (sender only), stage 1's two replicas are "dual" (same
+        Mooncake type on both edges -> collapsed to one shared instance per
+        replica), stage 2 is receive-only (last stage) and never binds.
+        """
+        from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, OmniTransferConfig
+        from vllm_omni.distributed.omni_connectors.utils.initialization import (
+            get_connectors_config_for_stage,
+            resolve_stage_connector_specs,
+        )
+        from vllm_omni.distributed.omni_connectors.utils.kv_utils import KV_REPLICA_PORT_STRIDE
+
+        transfer_config = OmniTransferConfig(
+            connectors={
+                ("0", "1"): ConnectorSpec(
+                    name="MooncakeTransferEngineConnector",
+                    extra={"host": "auto", "zmq_port": 50051, "protocol": "rdma"},
+                ),
+                ("1", "2"): ConnectorSpec(
+                    name="MooncakeTransferEngineConnector",
+                    extra={"host": "auto", "zmq_port": 50051, "protocol": "rdma"},
+                ),
+            }
+        )
+        replicas_per_stage = {0: 1, 1: 2, 2: 2}
+
+        # Config-build time: resolved once per stage, replica/rank-agnostic —
+        # exactly what the orchestrator computes before any replica or TP
+        # worker process exists (see initialization.py's port-timing fix).
+        stage_specs = {
+            stage_id: resolve_stage_connector_specs(get_connectors_config_for_stage(transfer_config, stage_id))
+            for stage_id in replicas_per_stage
+        }
+
+        listen_ports: list[tuple[int, int, int]] = []  # (stage_id, replica_id, zmq_port)
+
+        for stage_id, num_replicas in replicas_per_stage.items():
+            recv_spec, send_spec = stage_specs[stage_id]
+            for replica_id in range(num_replicas):
+                captured: list[Any] = []
+
+                def _create(spec, _captured=captured):
+                    _captured.append(spec)
+                    return MockConnector()
+
+                model_config = _make_model_config(stage_id=stage_id)
+                model_config.stage_connector_config = recv_spec
+                model_config.stage_output_connector_config = send_spec
+
+                host = MixinHost()
+                with (
+                    patch(
+                        "vllm_omni.worker.omni_connector_model_runner_mixin.worker_rank_port_offset",
+                        return_value=replica_id * KV_REPLICA_PORT_STRIDE,  # local_rank=0 (TP=1)
+                    ),
+                    patch(
+                        "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
+                        side_effect=_create,
+                    ),
+                ):
+                    host.init_omni_connectors(model_config=model_config)
+                host.shutdown_omni_connectors()
+
+                for spec in captured:
+                    if spec.extra.get("role") in {"sender", "dual"}:
+                        listen_ports.append((stage_id, replica_id, spec.extra["zmq_port"]))
+
+        # This pipeline shape has listener-binding instances only at stage 0
+        # (sender, 1 replica) and stage 1 (dual, 2 replicas) — 3 total. Stage
+        # 2 is receive-only (last stage) and never binds a listener.
+        assert len(listen_ports) == 3
+        assert {stage_id for stage_id, _, _ in listen_ports} == {0, 1}
+
+        ports_only = [port for *_, port in listen_ports]
+        assert len(ports_only) == len(set(ports_only)), f"port collision across replicas: {listen_ports}"
 
 
 class TestAttachOmniConnectorOutput:

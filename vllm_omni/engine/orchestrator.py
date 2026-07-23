@@ -1436,6 +1436,7 @@ class Orchestrator:
                 resumable=resumable,
             )
             request.external_req_id = request.request_id
+            request.sender_info = self._build_chunk_sender_info(next_stage_id - 1, req_id)
             return request
 
         processor = self._get_stage_input_processor(next_stage_id)
@@ -1449,6 +1450,7 @@ class Orchestrator:
         )
         request = self._upgrade_processed_stage_request(request, next_input)
         request.external_req_id = req_id
+        request.sender_info = self._build_chunk_sender_info(next_stage_id - 1, req_id)
         return request
 
     @staticmethod
@@ -1936,6 +1938,7 @@ class Orchestrator:
                     resumable=next_stage_resumable,
                 )
                 request.external_req_id = request.request_id
+                request.sender_info = self._build_chunk_sender_info(src_stage_id, req_id)
                 if already_submitted:
                     replica_id = await next_pool.submit_update(req_id, req_state, request)
                 else:
@@ -2138,6 +2141,7 @@ class Orchestrator:
                     resumable=downstream_resumable,
                 )
                 request.external_req_id = request.request_id
+                request.sender_info = self._build_chunk_sender_info(next_stage_id - 1, request_id)
                 replica_id = await next_pool.submit_initial(
                     request_id,
                     req_state,
@@ -2196,6 +2200,31 @@ class Orchestrator:
             sender_infos[sender_stage_id] = sender_info
 
         return sender_infos or None
+
+    def _build_chunk_sender_info(
+        self,
+        sender_stage_id: int,
+        request_id: str,
+    ) -> dict[str, Any] | None:
+        """Resolve the stage-transfer endpoint of the request's bound producer."""
+        if sender_stage_id < 0 or sender_stage_id >= len(self.stage_pools):
+            return None
+
+        sender_pool = self.stage_pools[sender_stage_id]
+        sender_stage = sender_pool.get_bound_client(request_id)
+        if sender_stage is None:
+            sender_stage = sender_pool.stage_client
+        get_sender_info = getattr(sender_stage, "get_chunk_sender_info", None)
+        if not callable(get_sender_info):
+            return None
+        sender_info = get_sender_info()
+        if not sender_info:
+            logger.warning(
+                "[Orchestrator] Stage-%s has no chunk sender info available",
+                sender_stage_id,
+            )
+            return None
+        return sender_info
 
     # ---- Shutdown / lifecycle ----
 

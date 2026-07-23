@@ -22,10 +22,10 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.distributed.omni_connectors.utils.config import (
     TRANSFER_ENGINE_CONNECTOR_NAMES,
 )
-from vllm_omni.distributed.omni_connectors.utils.initialization import (
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import (
     KV_TRANSFER_PORT_OFFSET,
+    kv_zmq_port,
 )
-from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from ..factory import OmniConnectorFactory
 from .config import TRANSFER_ENGINE_CONNECTOR_NAMES, ConnectorSpec, OmniTransferConfig
 from .env import expand_env_int
+from .kv_utils import KV_TRANSFER_PORT_OFFSET, kv_zmq_port
 from .local_rank import get_connector_local_rank, get_omni_replica_id
 from .logging import get_connector_logger
 
@@ -21,24 +22,6 @@ else:
     OmniConnectorBase = Any
 
 logger = get_connector_logger(__name__)
-
-# Reserve a separate port range for KV-transfer sockets so they do not
-# collide with request-forwarding endpoints that share the same base port.
-KV_TRANSFER_PORT_OFFSET = 100
-
-# Port stride between TP ranks so each worker binds a unique ZMQ port
-# when TP > 1.  Must be larger than the maximum number of pipeline stages.
-# Formula:
-#   zmq_port = base + KV_TRANSFER_PORT_OFFSET
-#            + replica * KV_REPLICA_PORT_STRIDE
-#            + rank * KV_RANK_PORT_STRIDE
-#            + stage
-KV_RANK_PORT_STRIDE = 16
-
-# Port stride between Omni replicas of the same stage, so co-located replicas
-# each bind a distinct port range. This reserves a comfortably sized block
-# per replica for TP-rank and stage offsets.
-KV_REPLICA_PORT_STRIDE = 1024
 
 
 def initialize_connectors_from_config(
@@ -89,7 +72,6 @@ def create_connectors_from_config(
         "request_forwarding": 0,
         "kv_transfer": KV_TRANSFER_PORT_OFFSET,
     }
-    port_offset = purpose_port_offsets.get(purpose, 0)
     orchestrator_port_offset = 200
 
     connectors = {}
@@ -106,12 +88,11 @@ def create_connectors_from_config(
 
                 is_orchestrator = str(caller_stage_id) == "orchestrator"
                 local_rank = 0 if is_orchestrator else get_connector_local_rank()
-                replica_offset = 0 if is_orchestrator else get_omni_replica_id() * KV_REPLICA_PORT_STRIDE
-                if is_orchestrator:
-                    rank0_port = base_port + orchestrator_port_offset + stage_offset
-                else:
-                    rank0_port = base_port + port_offset + stage_offset
-                adjusted_port = rank0_port + replica_offset + local_rank * KV_RANK_PORT_STRIDE
+                replica_id = 0 if is_orchestrator else get_omni_replica_id()
+                purpose_offset = orchestrator_port_offset if is_orchestrator else purpose_port_offsets.get(purpose, 0)
+                adjusted_port = kv_zmq_port(
+                    base_port, stage_offset, local_rank=local_rank, replica_id=replica_id, purpose_offset=purpose_offset
+                )
                 extra["zmq_port"] = adjusted_port
 
                 if is_sender is not None:
@@ -167,20 +148,26 @@ def _apply_transfer_engine_ports(
     ``zmq_port`` in YAML is treated as a *base* port. The local listen port
     for the outbound edge is ``base + from_stage``. The upstream query port
     for the inbound edge is ``base + upstream_stage`` unless
-    ``sender_zmq_port`` is already set.
+    ``sender_zmq_port`` is already set. Both share ``kv_zmq_port``'s
+    replica/rank offset formula (purpose_offset=0 — this namespace doesn't
+    need KV_TRANSFER_PORT_OFFSET's separation from the KV-cache connector).
     """
     base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
-    local_rank = get_connector_local_rank()
-    port_offset = get_omni_replica_id() * KV_REPLICA_PORT_STRIDE + local_rank * KV_RANK_PORT_STRIDE
+    local_listen_port = kv_zmq_port(
+        base_port,
+        _stage_port_offset(from_stage),
+        local_rank=get_connector_local_rank(),
+        replica_id=get_omni_replica_id(),
+        purpose_offset=0,
+    )
 
     if is_put:
         # Outbound edge: from_stage is this stage — bind base + this_stage (+ replica/rank).
-        extra["zmq_port"] = base_port + _stage_port_offset(from_stage) + port_offset
+        extra["zmq_port"] = local_listen_port
     if is_get:
         # Inbound edge: query the upstream sender's listen port.
-        computed_sender_port = base_port + _stage_port_offset(from_stage) + port_offset
         if extra.get("sender_zmq_port") is None:
-            extra["sender_zmq_port"] = computed_sender_port
+            extra["sender_zmq_port"] = local_listen_port
         else:
             extra["sender_zmq_port"] = expand_env_int(extra["sender_zmq_port"], "sender_zmq_port")
         extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))

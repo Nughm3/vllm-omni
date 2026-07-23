@@ -1505,7 +1505,7 @@ class TestRankMappingResolutionFromConnectorConfig:
             "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
             side_effect=lambda spec: MockConnector(),
         ):
-            host.init_omni_connectors(vllm_config=None, model_config=model_config)
+            host.init_omni_connectors(model_config=model_config)
 
         assert host._recv_from_tp == 4
         assert host._recv_to_tp == 2
@@ -1538,7 +1538,7 @@ class TestRankMappingResolutionFromConnectorConfig:
             "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
             side_effect=_create,
         ):
-            host.init_omni_connectors(vllm_config=None, model_config=model_config)
+            host.init_omni_connectors(model_config=model_config)
 
         # One instance built, shared by both directions, with role="dual".
         assert len(built) == 1
@@ -1568,7 +1568,7 @@ class TestRankMappingResolutionFromConnectorConfig:
             "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
             side_effect=_create,
         ):
-            host.init_omni_connectors(vllm_config=None, model_config=model_config)
+            host.init_omni_connectors(model_config=model_config)
 
         assert host._recv_connector is not None
         assert host._send_connector is not None
@@ -1590,7 +1590,7 @@ class TestRankMappingResolutionFromConnectorConfig:
             "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
             side_effect=lambda spec: MockConnector(),
         ):
-            host.init_omni_connectors(vllm_config=None, model_config=model_config)
+            host.init_omni_connectors(model_config=model_config)
 
         assert host._recv_connector is None
         assert host._send_connector is not None
@@ -1612,7 +1612,7 @@ class TestRankMappingResolutionFromConnectorConfig:
             "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
             return_value=MockConnector(),
         ):
-            host.init_omni_connectors(vllm_config=None, model_config=model_config)
+            host.init_omni_connectors(model_config=model_config)
 
         assert host._recv_from_tp == 2
         assert host._recv_to_tp == 1
@@ -1623,7 +1623,7 @@ class TestRankMappingResolutionFromConnectorConfig:
 
     def test_missing_stage_connector_config_defaults_to_homogeneous(self):
         host = MixinHost()
-        host.init_omni_connectors(vllm_config=None, model_config=_make_model_config(stage_id=0))
+        host.init_omni_connectors(model_config=_make_model_config(stage_id=0))
 
         assert host._recv_from_tp == 1
         assert host._recv_to_tp == 1

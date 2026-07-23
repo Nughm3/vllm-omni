@@ -282,10 +282,8 @@ def test_resolve_stage_connector_specs_replica_offset(mocker: MockerFixture):
     """Multiple Omni replicas of the same stage, co-located on one node, must
     bind non-colliding ports: replica_id offsets every port by
     KV_REPLICA_PORT_STRIDE, independent of TP rank (fixed at 0 here)."""
-    from vllm_omni.distributed.omni_connectors.utils.initialization import (
-        KV_REPLICA_PORT_STRIDE,
-        resolve_stage_connector_specs,
-    )
+    from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_stage_connector_specs
+    from vllm_omni.distributed.omni_connectors.utils.kv_utils import KV_REPLICA_PORT_STRIDE
 
     config = OmniTransferConfig(
         connectors={
@@ -334,11 +332,8 @@ def test_resolve_stage_connector_specs_replica_and_tp_offset(mocker: MockerFixtu
     """TP > 1 *and* multiple co-located replicas at once: each (replica, TP
     rank) pair must land on a distinct port, combining the replica block
     offset with the per-rank stride within it."""
-    from vllm_omni.distributed.omni_connectors.utils.initialization import (
-        KV_RANK_PORT_STRIDE,
-        KV_REPLICA_PORT_STRIDE,
-        resolve_stage_connector_specs,
-    )
+    from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_stage_connector_specs
+    from vllm_omni.distributed.omni_connectors.utils.kv_utils import KV_RANK_PORT_STRIDE, KV_REPLICA_PORT_STRIDE
 
     config = OmniTransferConfig(
         connectors={

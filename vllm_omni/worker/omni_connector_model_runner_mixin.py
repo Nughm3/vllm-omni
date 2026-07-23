@@ -17,6 +17,7 @@ import inspect
 import os
 import threading
 from collections import defaultdict, deque
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import torch

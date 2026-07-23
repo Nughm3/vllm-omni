@@ -77,10 +77,15 @@ def _make_model_config(
     )
 
 
-def _make_request(req_id: str, external_req_id: str | None = None):
+def _make_request(
+    req_id: str,
+    external_req_id: str | None = None,
+    sender_info: dict[str, Any] | None = None,
+):
     r = SimpleNamespace(
         request_id=req_id,
         external_req_id=external_req_id or req_id,
+        sender_info=sender_info,
         additional_information=None,
         prompt_token_ids=[],
         num_computed_tokens=0,
@@ -751,6 +756,34 @@ class TestChunkStreamCompletedGuard:
 
         host.shutdown_omni_connectors()
 
+    def test_register_stores_sender_info(self):
+        host = self._make_host(stage_id=1)
+        sender_info = {"host": "10.0.0.8", "zmq_port": 50251}
+
+        host.register_chunk_recv(_make_request("req-1", sender_info=sender_info))
+
+        assert host._sender_info["req-1"] == sender_info
+        host.shutdown_omni_connectors()
+
+    @pytest.mark.parametrize(
+        ("sender_info", "expected_metadata"),
+        [
+            (
+                {"host": "10.0.0.8", "zmq_port": 50251},
+                {"source_host": "10.0.0.8", "source_port": 50251},
+            ),
+            (None, None),
+        ],
+    )
+    def test_recv_ordinary_stage_result_passes_sender_metadata(self, sender_info, expected_metadata):
+        host = self._make_host(stage_id=1)
+        connector = MagicMock()
+
+        host._recv_ordinary_stage_result(connector, "0", "1", "req-1_0_0", sender_info)
+
+        connector.get.assert_called_once_with("0", "1", "req-1_0_0", metadata=expected_metadata)
+        host.shutdown_omni_connectors()
+
     def test_finish_sentinel_populates_completed_set(self):
         """Receiving is_finished=True adds to _chunk_stream_completed."""
         host = self._make_host(stage_id=1)
@@ -1065,7 +1098,7 @@ class TestLocalPayloadCacheLifecycle:
             made_progress = host._poll_single_request("r1")
 
         assert made_progress
-        host._recv_connector.get.assert_called_once_with("1", "2", "ext-r1_1_0")
+        host._omni_connector.get.assert_called_once_with("1", "2", "ext-r1_1_0", metadata=None)
         assert tp_group.broadcast_inputs == []
         assert host.get_local_stage_payload("r1") == payload
         assert "r1" in host._full_payload_pending_broadcast_req_ids
@@ -1141,7 +1174,7 @@ class TestTPAsyncChunkFanout:
             made_progress = host._poll_single_request("r1")
 
         assert made_progress
-        host._recv_connector.get.assert_called_once_with("1", "2", "ext-r1_1_0")
+        host._omni_connector.get.assert_called_once_with("1", "2", "ext-r1_1_0", metadata=None)
         assert host.get_local_stage_payload("r1") == payload
         assert "r1" in host._finished_load_reqs
         assert "r1" in host._async_chunk_updated_req_ids

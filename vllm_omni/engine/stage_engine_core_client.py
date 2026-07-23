@@ -378,6 +378,49 @@ class StageEngineCoreClientBase(StageClientBase):
             ),
         }
 
+    def get_chunk_sender_info(self) -> dict[str, Any] | None:
+        """Build this replica's ordinary stage-transfer sender endpoint."""
+        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        connector_config = getattr(model_config, "stage_output_connector_config", None)
+        if not isinstance(connector_config, dict):
+            return None
+
+        # Engine args wrap resolved connector settings in ``extra``. Keep
+        # accepting a flat dict for lightweight clients/tests as well.
+        resolved_config = connector_config.get("extra")
+        is_resolved_spec = isinstance(resolved_config, dict)
+        if is_resolved_spec:
+            connector_config = resolved_config
+
+        base_port = connector_config.get("zmq_port")
+        if base_port is None:
+            return None
+        # Resolved specs already include the stage offset; flat/raw configs do
+        # not. In either case ordinary stage transfer uses purpose offset 0.
+        from_stage = 0 if is_resolved_spec else connector_config.get("from_stage", self.stage_id)
+        host = self._resolve_contact_host()
+        if host is None:
+            return None
+        try:
+            sender_port = kv_zmq_port(
+                int(os.path.expandvars(str(base_port))),
+                int(from_stage),
+                local_rank=0,
+                replica_id=self.replica_id,
+                purpose_offset=0,
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "[StageEngineCoreClient] stage-%s [rep-%s] could not resolve chunk sender port "
+                "from base_port=%s and from_stage=%s",
+                self.stage_id,
+                self.replica_id,
+                base_port,
+                from_stage,
+            )
+            return None
+        return {"host": str(host), "zmq_port": sender_port}
+
     def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None:
         """Set engine outputs (called by orchestrator)."""
         self.engine_outputs = engine_outputs

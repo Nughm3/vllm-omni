@@ -225,6 +225,7 @@ class OmniSchedulingCoordinator:
                         OmniChunkRecvHandle(
                             request_id=request.request_id,
                             external_req_id=getattr(request, "external_req_id", None),
+                            sender_info=getattr(request, "sender_info", None),
                         )
                     )
                 elif request.status == RequestStatus.WAITING_FOR_INPUT:
@@ -238,6 +239,7 @@ class OmniSchedulingCoordinator:
                             OmniChunkRecvHandle(
                                 request_id=request.request_id,
                                 external_req_id=getattr(request, "external_req_id", None),
+                                sender_info=getattr(request, "sender_info", None),
                             )
                         )
             if to_remove:

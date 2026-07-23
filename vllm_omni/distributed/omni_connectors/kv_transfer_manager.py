@@ -21,8 +21,8 @@ from vllm_omni.platforms import current_omni_platform
 from .factory import OmniConnectorFactory
 from .utils.config import TRANSFER_ENGINE_CONNECTOR_NAMES, ConnectorSpec
 from .utils.env import expand_env_int
-from .utils.initialization import KV_RANK_PORT_STRIDE
 from .utils.kv_utils import (
+    KV_RANK_PORT_STRIDE,
     KVTPTopology,
     build_rank_aware_recv_keys,
     build_rank_aware_send_keys,

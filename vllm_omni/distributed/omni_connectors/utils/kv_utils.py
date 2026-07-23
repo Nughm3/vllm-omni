@@ -16,12 +16,33 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.logger import init_logger
 
-from .initialization import KV_RANK_PORT_STRIDE, KV_REPLICA_PORT_STRIDE, KV_TRANSFER_PORT_OFFSET
 from .local_rank import get_omni_replica_id
 
 logger = init_logger(__name__)
 
 LayerKV = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+
+# Purpose-level offset: OmniKVTransferManager's own connector (actual KV-cache
+# disaggregation, see kv_zmq_port() below) may reuse the same YAML base
+# zmq_port as the stage-transfer connectors in initialization.py (multimodal
+# payload forwarding between pipeline stages). This offset keeps the two
+# namespaces from colliding when they do. Only kv_zmq_port() applies it —
+# stage-transfer ports intentionally use offset 0 for this term.
+KV_TRANSFER_PORT_OFFSET = 100
+
+# Port stride between TP ranks so each worker binds a unique ZMQ port
+# when TP > 1.  Must be larger than the maximum number of pipeline stages.
+# Applied uniformly by both port formulas below:
+#   zmq_port = base + KV_TRANSFER_PORT_OFFSET
+#            + replica * KV_REPLICA_PORT_STRIDE
+#            + rank * KV_RANK_PORT_STRIDE
+#            + stage
+KV_RANK_PORT_STRIDE = 16
+
+# Port stride between Omni replicas of the same stage, so co-located replicas
+# each bind a distinct port range. This reserves a comfortably sized block
+# per replica for TP-rank and stage offsets.
+KV_REPLICA_PORT_STRIDE = 1024
 
 
 # ------------------------------------------------------------------ #
@@ -105,6 +126,7 @@ def kv_zmq_port(
     from_stage: int,
     local_rank: int = 0,
     replica_id: int | None = None,
+    purpose_offset: int = KV_TRANSFER_PORT_OFFSET,
 ) -> int:
     """Compute the ZMQ port for a KV-transfer connector.
 
@@ -113,15 +135,13 @@ def kv_zmq_port(
     workers bind on the same host. The formula is backward-compatible:
     replica 0 / rank 0 produces the previous ``base + OFFSET + stage`` port.
 
+    ``purpose_offset`` defaults to ``KV_TRANSFER_PORT_OFFSET`` for the KV-cache
+    connector (this function's original caller). Other callers that resolve
+    ports for a different namespace (e.g. the omni multimodal stage-transfer
+    connectors) pass their own offset — 0 to share no purpose-level offset.
     """
     replica = get_omni_replica_id() if replica_id is None else max(int(replica_id), 0)
-    return (
-        base_port
-        + KV_TRANSFER_PORT_OFFSET
-        + replica * KV_REPLICA_PORT_STRIDE
-        + local_rank * KV_RANK_PORT_STRIDE
-        + from_stage
-    )
+    return base_port + purpose_offset + replica * KV_REPLICA_PORT_STRIDE + local_rank * KV_RANK_PORT_STRIDE + from_stage
 
 
 # ------------------------------------------------------------------ #

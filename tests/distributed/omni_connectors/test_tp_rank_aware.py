@@ -21,12 +21,10 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVCacheConfig,
     OmniKVTransferManager,
 )
-from vllm_omni.distributed.omni_connectors.utils.initialization import (
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import (
     KV_RANK_PORT_STRIDE,
     KV_REPLICA_PORT_STRIDE,
     KV_TRANSFER_PORT_OFFSET,
-)
-from vllm_omni.distributed.omni_connectors.utils.kv_utils import (
     KVTPTopology,
     build_rank_aware_recv_keys,
     build_rank_aware_send_keys,

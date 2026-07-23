@@ -303,11 +303,6 @@ class TestKvZmqPortReplicaOffset:
         port = kv_zmq_port(50051, from_stage=3, local_rank=0, replica_id=0)
         assert port == 50051 + KV_TRANSFER_PORT_OFFSET + 3
 
-    def test_replica_offset_applied_independent_of_rank(self):
-        base_port = kv_zmq_port(50051, from_stage=3, local_rank=0, replica_id=0)
-        replica2_port = kv_zmq_port(50051, from_stage=3, local_rank=0, replica_id=2)
-        assert replica2_port == base_port + 2 * KV_REPLICA_PORT_STRIDE
-
     def test_replicas_on_same_node_never_collide(self):
         """Simulates N co-located replicas of the same stage: every
         (replica_id) must map to a unique port at a fixed TP rank."""

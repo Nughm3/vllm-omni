@@ -7,7 +7,10 @@ from pytest_mock import MockerFixture
 from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector, try_send_via_connector
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, OmniTransferConfig
-from vllm_omni.distributed.omni_connectors.utils.initialization import get_connectors_config_for_stage
+from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    get_connectors_config_for_stage,
+    resolve_stage_connector_specs,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -221,6 +224,9 @@ def test_get_connectors_for_stage():
     assert "to_stage_1" in stage_0_config
     assert "from_stage_0" not in stage_0_config
 
+    # Empty input remains the baseline no-connector case.
+    assert resolve_stage_connector_specs({}) == (None, None)
+
 
 def test_resolve_stage_connector_specs_same_type_mooncake():
     """A same-type middle stage yields two Mooncake specs (input + output),
@@ -361,15 +367,6 @@ def test_resolve_stage_connector_specs_hybrid_mooncake_shm():
     recv2, send2 = resolve_stage_connector_specs(get_connectors_config_for_stage(config, stage_id=2))
     assert send2 is None
     assert recv2["name"] == "SharedMemoryConnector"
-
-
-def test_resolve_stage_connector_specs_empty():
-    """No transfer config resolves to (None, None)."""
-    from vllm_omni.distributed.omni_connectors.utils.initialization import (
-        resolve_stage_connector_specs,
-    )
-
-    assert resolve_stage_connector_specs({}) == (None, None)
 
 
 def test_recv_with_missing_metadata(mocker: MockerFixture):

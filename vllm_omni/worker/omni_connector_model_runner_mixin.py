@@ -2455,6 +2455,28 @@ class OmniConnectorModelRunnerMixin:
             extra["sender_zmq_port"] = int(extra["sender_zmq_port"]) + offset
         return extra
 
+    # Fields that legitimately differ per edge/direction — excluded when
+    # checking whether two same-type edges describe a compatible backend.
+    _DIRECTIONAL_EXTRA_KEYS = frozenset(
+        {"zmq_port", "sender_host", "sender_zmq_port", "role", "rank_mapping", "from_stage", "to_stage"}
+    )
+
+    @classmethod
+    def _dual_compatible(cls, recv_extra: dict[str, Any], send_extra: dict[str, Any]) -> bool:
+        """Whether the inbound/outbound edges describe the same physical
+        backend, safe to collapse into one shared dual instance.
+
+        Same connector *name* isn't sufficient: two edges can use the same
+        class against different backends (e.g. distinct Mooncake metadata
+        servers, hosts, protocols, or devices). ``_dual_union_extra`` lets
+        the outbound edge's settings win on shared knobs, so sharing an
+        instance across incompatible edges would silently point the inbound
+        side at the wrong backend. Only fields outside
+        ``_DIRECTIONAL_EXTRA_KEYS`` must match.
+        """
+        shared_keys = (set(recv_extra) | set(send_extra)) - cls._DIRECTIONAL_EXTRA_KEYS
+        return all(recv_extra.get(key) == send_extra.get(key) for key in shared_keys)
+
     @staticmethod
     def _dual_union_extra(recv_extra: dict[str, Any], send_extra: dict[str, Any]) -> dict[str, Any]:
         """Merge inbound + outbound extras into one dual connector config.
@@ -2499,7 +2521,7 @@ class OmniConnectorModelRunnerMixin:
         if recv_cfg and send_cfg:
             recv_name, recv_extra = recv_cfg
             send_name, send_extra = send_cfg
-            if recv_name == send_name:
+            if recv_name == send_name and self._dual_compatible(recv_extra, send_extra):
                 return _shared(recv_name, self._dual_union_extra(recv_extra, send_extra))
             return (
                 self._build_connector_from_spec(recv_name, recv_extra),

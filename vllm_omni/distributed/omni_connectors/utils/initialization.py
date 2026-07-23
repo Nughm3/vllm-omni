@@ -153,21 +153,15 @@ def _apply_transfer_engine_ports(
     need KV_TRANSFER_PORT_OFFSET's separation from the KV-cache connector).
     """
     base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
-    local_listen_port = kv_zmq_port(
-        base_port,
-        _stage_port_offset(from_stage),
-        local_rank=get_connector_local_rank(),
-        replica_id=get_omni_replica_id(),
-        purpose_offset=0,
-    )
+    stage_base_port = base_port + _stage_port_offset(from_stage)
 
     if is_put:
-        # Outbound edge: from_stage is this stage — bind base + this_stage (+ replica/rank).
-        extra["zmq_port"] = local_listen_port
+        # Outbound edge: from_stage is this stage — bind base + this_stage.
+        extra["zmq_port"] = stage_base_port
     if is_get:
         # Inbound edge: query the upstream sender's listen port.
         if extra.get("sender_zmq_port") is None:
-            extra["sender_zmq_port"] = local_listen_port
+            extra["sender_zmq_port"] = stage_base_port
         else:
             extra["sender_zmq_port"] = expand_env_int(extra["sender_zmq_port"], "sender_zmq_port")
         extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))

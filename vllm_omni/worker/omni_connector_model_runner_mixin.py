@@ -26,7 +26,8 @@ from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
-from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+from vllm_omni.distributed.omni_connectors.utils.config import TRANSFER_ENGINE_CONNECTOR_NAMES, ConnectorSpec
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import worker_rank_port_offset
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.payload_span import (
     get_tensor_span,
@@ -2431,6 +2432,30 @@ class OmniConnectorModelRunnerMixin:
             raise RuntimeError(f"Failed to create connector {name}") from exc
 
     @staticmethod
+    def _apply_worker_port_offset(name: str, extra: dict[str, Any]) -> dict[str, Any]:
+        """Add this worker's TP-rank/replica port offset, at actual
+        connector-construction time inside this worker process.
+
+        The stage-level config (built once, before per-rank worker processes
+        exist — see ``_apply_transfer_engine_ports`` in initialization.py)
+        only carries the per-stage *base* port. Resolving the per-worker
+        offset here, rather than at config-build time, ensures each TP rank
+        / Omni replica binds a distinct port instead of every rank inheriting
+        the same baked-in value and failing to bind.
+        """
+        if name not in TRANSFER_ENGINE_CONNECTOR_NAMES:
+            return extra
+        offset = worker_rank_port_offset()
+        if offset == 0:
+            return extra
+        extra = dict(extra)
+        if "zmq_port" in extra:
+            extra["zmq_port"] = int(extra["zmq_port"]) + offset
+        if extra.get("sender_zmq_port") is not None:
+            extra["sender_zmq_port"] = int(extra["sender_zmq_port"]) + offset
+        return extra
+
+    @staticmethod
     def _dual_union_extra(recv_extra: dict[str, Any], send_extra: dict[str, Any]) -> dict[str, Any]:
         """Merge inbound + outbound extras into one dual connector config.
 
@@ -2461,6 +2486,10 @@ class OmniConnectorModelRunnerMixin:
         """
         recv_cfg = self._normalize_connector_config(getattr(model_config, "stage_connector_config", None))
         send_cfg = self._normalize_connector_config(getattr(model_config, "stage_output_connector_config", None))
+        if recv_cfg is not None:
+            recv_cfg = (recv_cfg[0], self._apply_worker_port_offset(*recv_cfg))
+        if send_cfg is not None:
+            send_cfg = (send_cfg[0], self._apply_worker_port_offset(*send_cfg))
 
         def _shared(name: str, extra: dict[str, Any]) -> tuple[OmniConnectorBase, OmniConnectorBase]:
             """Build one connector instance and reuse it for both directions."""

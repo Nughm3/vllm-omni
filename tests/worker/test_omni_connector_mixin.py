@@ -1392,6 +1392,91 @@ class TestRankMappingResolutionFromConnectorConfig:
         host.shutdown_omni_connectors()
 
 
+class TestWorkerPortOffset:
+    """The per-worker TP-rank/replica port offset must be applied at actual
+    connector-construction time inside the worker process (mixin), not at
+    config-build time (initialization.py) — see the P1 fix for co-located
+    TP ranks / replicas colliding on the same baked-in port."""
+
+    def test_non_transfer_engine_connector_untouched(self):
+        extra = {"some": "config"}
+        with patch(
+            "vllm_omni.worker.omni_connector_model_runner_mixin.worker_rank_port_offset",
+            return_value=16,
+        ):
+            result = OmniConnectorModelRunnerMixin._apply_worker_port_offset("SharedMemoryConnector", extra)
+        assert result is extra
+
+    def test_zero_offset_returns_same_dict(self):
+        """rank 0 / replica 0 (the common case) must be a no-op, not just a
+        same-valued copy — avoids needless mutation on the hot path."""
+        extra = {"zmq_port": 50052, "sender_zmq_port": 50051}
+        with patch(
+            "vllm_omni.worker.omni_connector_model_runner_mixin.worker_rank_port_offset",
+            return_value=0,
+        ):
+            result = OmniConnectorModelRunnerMixin._apply_worker_port_offset("MooncakeTransferEngineConnector", extra)
+        assert result is extra
+
+    def test_nonzero_offset_shifts_both_ports_without_mutating_input(self):
+        extra = {"zmq_port": 50052, "sender_zmq_port": 50051}
+        with patch(
+            "vllm_omni.worker.omni_connector_model_runner_mixin.worker_rank_port_offset",
+            return_value=1040,  # e.g. replica 1 (1024) + rank 1 (16)
+        ):
+            result = OmniConnectorModelRunnerMixin._apply_worker_port_offset("MooncakeTransferEngineConnector", extra)
+        assert result == {"zmq_port": 51092, "sender_zmq_port": 51091}
+        # Original spec dict (shared across workers) must be left untouched.
+        assert extra == {"zmq_port": 50052, "sender_zmq_port": 50051}
+
+    def test_missing_sender_zmq_port_is_not_added(self):
+        """Stage 0 / sender-only specs have no sender_zmq_port key at all —
+        the offset must not introduce one where there wasn't one."""
+        extra = {"zmq_port": 50052}
+        with patch(
+            "vllm_omni.worker.omni_connector_model_runner_mixin.worker_rank_port_offset",
+            return_value=16,
+        ):
+            result = OmniConnectorModelRunnerMixin._apply_worker_port_offset("MooncakeTransferEngineConnector", extra)
+        assert result == {"zmq_port": 50068}
+
+    def test_distinct_tp_ranks_resolve_to_distinct_listen_ports(self):
+        """End-to-end through init_omni_connectors: two 'workers' (different
+        worker_rank_port_offset values, simulating different TP ranks) must
+        build connectors with different zmq_port — the actual collision this
+        fix prevents."""
+        model_config = _make_model_config(stage_id=0)
+        model_config.stage_connector_config = None
+        model_config.stage_output_connector_config = {
+            "name": "MooncakeTransferEngineConnector",
+            "extra": {"role": "sender", "zmq_port": 50052},
+        }
+
+        seen_ports: list[int] = []
+
+        def _create(spec):
+            seen_ports.append(spec.extra["zmq_port"])
+            return MockConnector()
+
+        for offset in (0, 16):
+            host = MixinHost()
+            with (
+                patch(
+                    "vllm_omni.worker.omni_connector_model_runner_mixin.worker_rank_port_offset",
+                    return_value=offset,
+                ),
+                patch(
+                    "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
+                    side_effect=_create,
+                ),
+            ):
+                host.init_omni_connectors(model_config=model_config)
+            host.shutdown_omni_connectors()
+
+        assert seen_ports == [50052, 50068]
+        assert len(set(seen_ports)) == 2
+
+
 class TestAttachOmniConnectorOutput:
     def test_wraps_empty_model_runner_output_when_signals_exist(self):
         from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT

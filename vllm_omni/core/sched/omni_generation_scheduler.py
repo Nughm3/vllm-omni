@@ -50,9 +50,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.input_coordinator: OmniSchedulingCoordinator | None = None
         if uses_full_payload_input_coordinator(model_config):
             self.input_coordinator = OmniSchedulingCoordinator(
-                scheduler_max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
                 stage_id=getattr(model_config, "stage_id", 0),
-                async_chunk=False,
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
 
@@ -219,7 +217,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             else:
                 res = super().schedule(throttle_prefills)
                 if self.input_coordinator:
-                    self.input_coordinator.restore_queues(self.waiting, self.running)
+                    self.input_coordinator.restore_queues(self.waiting)
                 return self._wrap_omni_scheduler_output(res)
 
         # Compute common prefix blocks (aligned with v1)
@@ -346,7 +344,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     scheduler_requests=self.requests,
                 )
             if self.input_coordinator:
-                self.input_coordinator.restore_queues(self.waiting, self.running)
+                self.input_coordinator.restore_queues(self.waiting)
 
         return self._wrap_omni_scheduler_output(scheduler_output)
 

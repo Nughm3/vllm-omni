@@ -398,7 +398,7 @@ class StageEngineCoreClientBase(StageClientBase):
         # Resolved specs already include the stage offset; flat/raw configs do
         # not. In either case ordinary stage transfer uses purpose offset 0.
         from_stage = 0 if is_resolved_spec else connector_config.get("from_stage", self.stage_id)
-        host = self._resolve_contact_host()
+        host = self._resolve_sender_host_from_config(connector_config)
         if host is None:
             return None
         try:

@@ -36,6 +36,7 @@ class MockConnector:
     def __init__(self, stage_id: int = 0):
         self.stage_id = stage_id
         self._store: dict[str, Any] = {}
+        self.get_calls: list[tuple[str, str, str, dict[str, Any] | None]] = []
 
     def supports_raw_put(self) -> bool:
         return bool(self.supports_raw_data)
@@ -49,6 +50,7 @@ class MockConnector:
         return True, len(str(data)), None
 
     def get(self, from_stage, to_stage, get_key, metadata=None):
+        self.get_calls.append((from_stage, to_stage, get_key, metadata))
         key = f"{from_stage}_{to_stage}_{get_key}"
         data = self._store.pop(key, None)
         if data is None:
@@ -610,10 +612,13 @@ class TestQwen3PacketFullPayload:
         )
         receiver._recv_connector = connector
         receiver._stage_id = 1
-        receiver._request_ids_mapping["req-1"] = "req-1"
-        receiver._pending_load_reqs["req-1"] = _make_request("req-1")
+        sender_info = {"host": "10.0.0.8", "zmq_port": 50251}
+        receiver.register_chunk_recv(_make_request("req-1", sender_info=sender_info))
 
         assert receiver._poll_single_request("req-1")
+        expected_metadata = {"source_host": "10.0.0.8", "source_port": 50251}
+        assert [call[3] for call in connector.get_calls] == [expected_metadata, expected_metadata]
+        assert connector.get_calls[1][2].endswith("@packed")
         results = receiver.recv_full_payload_inputs(scheduler_output=None)
         assert results is not None
         assert "req-1" in results

@@ -902,13 +902,25 @@ class OmniConnectorModelRunnerMixin:
         sidecar: dict[str, Any],
         from_stage: str,
         to_stage: str,
+        sender_info: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         from vllm_omni.distributed.omni_connectors.utils.qwen3_transfer_packet import (
             reconstruct_qwen3_full_payload,
         )
 
         def get_packed(packed_key: str) -> Any:
-            result = connector.get(from_stage, to_stage, packed_key)
+            metadata = None
+            if sender_info is not None:
+                metadata = {
+                    "source_host": sender_info["host"],
+                    "source_port": sender_info["zmq_port"],
+                }
+            result = connector.get(
+                from_stage,
+                to_stage,
+                packed_key,
+                metadata=metadata,
+            )
             if result is None:
                 return None
             data, _size = result
@@ -2055,6 +2067,7 @@ class OmniConnectorModelRunnerMixin:
                         payload_data,
                         str(target_stage_id),
                         str(self._stage_id),
+                        sender_info,
                     )
                 except Exception:
                     logger.warning(

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 from pytest_mock import MockerFixture
 
@@ -60,10 +62,9 @@ def test_ndarray_serialization():
 
 def test_create_shm_connector():
     """Test creating SharedMemoryConnector via Factory."""
-    spec = ConnectorSpec(name="SharedMemoryConnector", extra={"shm_threshold_bytes": 1024})
+    spec = ConnectorSpec(name="SharedMemoryConnector")
     connector = OmniConnectorFactory.create_connector(spec)
     assert isinstance(connector, SharedMemoryConnector)
-    assert connector.threshold == 1024
 
 
 def test_create_unknown_connector():
@@ -75,21 +76,20 @@ def test_create_unknown_connector():
 
 @pytest.fixture
 def shm_connector():
-    config = {"shm_threshold_bytes": 100, "inline_small_payloads": True}
-    return SharedMemoryConnector(config)
+    connector = SharedMemoryConnector({})
+    yield connector
+    connector.close()
 
 
-def test_put_get_inline(shm_connector):
-    """Test inline transfer for small data."""
+def test_put_get_small_payload_uses_shm(shm_connector):
+    """Small payloads use key-addressed SHM; inline metadata is retired."""
     data = {"small": "data"}
 
     success, size, metadata = shm_connector.put("stage_0", "stage_1", "req_1", data)
     assert success is True
-    assert "inline_bytes" in metadata
-    assert "shm" not in metadata
+    assert "shm" in metadata
+    assert "inline_bytes" not in metadata
     assert "size" in metadata
-    assert shm_connector._metrics["inline_writes"] == 1
-    assert shm_connector._metrics["shm_writes"] == 0
 
     # Retrieve
     retrieved_data, ret_size = shm_connector.get("stage_0", "stage_1", "req_1", metadata)
@@ -187,7 +187,6 @@ def test_mooncake_connector_defaults_missing_host_to_detected_ip(monkeypatch: py
         {
             "zmq_port": 50051,
             "memory_pool_size": 4096,
-            "role": "sender",
         }
     )
     try:
@@ -196,6 +195,68 @@ def test_mooncake_connector_defaults_missing_host_to_detected_ip(monkeypatch: py
         assert connector.get_connection_info()["host"] == "10.20.30.40"
     finally:
         connector.close()
+
+
+def test_mooncake_get_counts_zmq_timeout_separately(mocker: MockerFixture):
+    import vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector as mooncake_module
+
+    connector = object.__new__(mooncake_module.MooncakeTransferEngineConnector)
+    connector._closed = False
+    connector._metrics = {"errors": 0, "timeouts": 0}
+    connector._resolve_metadata = mocker.Mock(
+        return_value={"source_host": "127.0.0.1", "source_port": 1234, "data_size": 8}
+    )
+    recv_buffer = mocker.Mock()
+    connector.allocator = mocker.Mock()
+    connector.allocator.alloc.return_value = 0
+    connector.base_ptr = 0
+    connector.host = "127.0.0.1"
+    connector.rpc_port = 1235
+    connector.pool = SimpleNamespace(is_cuda=False)
+    connector._get_req_socket = mocker.Mock()
+    connector._get_req_socket.return_value.recv.side_effect = mooncake_module.zmq.Again()
+    connector._invalidate_req_socket = mocker.Mock()
+    mocker.patch.object(mooncake_module, "ManagedBuffer", return_value=recv_buffer)
+
+    metadata = {"source_host": "127.0.0.1", "source_port": 1234, "data_size": 8}
+    assert connector.get("s0", "s1", "req", metadata=metadata) is None
+    assert connector._metrics == {"errors": 0, "timeouts": 1}
+    recv_buffer.release.assert_called_once()
+    connector._closed = True
+
+
+def test_mooncake_get_counts_cuda_sync_failure_as_error(mocker: MockerFixture):
+    import vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector as mooncake_module
+
+    connector = object.__new__(mooncake_module.MooncakeTransferEngineConnector)
+    connector._closed = False
+    connector._metrics = {"errors": 0, "timeouts": 0}
+    connector._resolve_metadata = mocker.Mock(
+        return_value={"source_host": "127.0.0.1", "source_port": 1234, "data_size": 8}
+    )
+    recv_buffer = mocker.Mock()
+    connector.allocator = mocker.Mock()
+    connector.allocator.alloc.return_value = 0
+    connector.base_ptr = 0
+    connector.host = "127.0.0.1"
+    connector.rpc_port = 1235
+    connector.pool = SimpleNamespace(is_cuda=True, device=0)
+    connector._get_req_socket = mocker.Mock()
+    connector._get_req_socket.return_value.recv.return_value = mooncake_module.TRANS_DONE
+    connector._invalidate_req_socket = mocker.Mock()
+    mocker.patch.object(mooncake_module, "ManagedBuffer", return_value=recv_buffer)
+    mocker.patch.object(mooncake_module.torch.cuda, "device", return_value=mocker.MagicMock())
+    mocker.patch.object(
+        mooncake_module.torch.cuda,
+        "current_stream",
+        return_value=SimpleNamespace(synchronize=mocker.Mock(side_effect=RuntimeError("CUDA sync failed"))),
+    )
+
+    metadata = {"source_host": "127.0.0.1", "source_port": 1234, "data_size": 8}
+    assert connector.get("s0", "s1", "req", metadata=metadata) is None
+    assert connector._metrics == {"errors": 1, "timeouts": 0}
+    recv_buffer.release.assert_called_once()
+    connector._closed = True
 
 
 def _patch_fake_mooncake(monkeypatch: pytest.MonkeyPatch):

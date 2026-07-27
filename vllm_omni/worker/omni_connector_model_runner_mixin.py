@@ -37,6 +37,7 @@ from vllm_omni.worker.payload_span import (
 _EMBED_SPAN_GROUPS: tuple[tuple[str, str, str], ...] = (("decode", "decode_token_start", "decode_token_end"),)
 
 if TYPE_CHECKING:
+    from vllm_omni.config.model import OmniModelConfig
     from vllm_omni.distributed.omni_connectors.connectors.base import (
         OmniConnectorBase,
     )
@@ -88,14 +89,12 @@ class OmniConnectorModelRunnerMixin:
 
     def init_omni_connectors(
         self,
-        vllm_config: Any,
-        model_config: Any,
+        model_config: OmniModelConfig,
         kv_transfer_manager: OmniKVTransferManager | None = None,
     ) -> None:
         """Initialize connectors and background threads.
 
         Args:
-            vllm_config: Full vLLM config object.
             model_config: Stage-level model config with connector settings.
             kv_transfer_manager: Existing KV transfer manager to delegate to.
         """
@@ -1253,31 +1252,6 @@ class OmniConnectorModelRunnerMixin:
             self._work_available.set()
         return sent_ids
 
-    def recv_stage_inputs(self, scheduler_output: Any) -> dict[str, Any] | None:
-        """Compatibility wrapper for ``recv_full_payload_inputs``."""
-        return self.recv_full_payload_inputs(scheduler_output)
-
-    def accumulate_batch_output(
-        self,
-        req_id: str,
-        pooler_output: Any,
-        request: Any,
-    ) -> None:
-        """Compatibility wrapper for ``accumulate_full_payload_output``."""
-        self.accumulate_full_payload_output(req_id, pooler_output, request)
-
-    def flush_batch_outputs(self, finished_req_ids: set[str]) -> None:
-        """Compatibility wrapper for ``flush_full_payload_outputs``."""
-        self.flush_full_payload_outputs(finished_req_ids)
-
-    def send_stage_outputs(
-        self,
-        scheduler_output: Any,
-        outputs: dict[str, tuple[Any, Any] | Any],
-    ) -> list[str]:
-        """Compatibility wrapper for ``send_full_payload_outputs``."""
-        return self.send_full_payload_outputs(scheduler_output, outputs)
-
     # ------------------------------------------------------------------ #
     #  Streaming chunk mode  (recv_chunk / send_chunk)
     # ------------------------------------------------------------------ #
@@ -1769,20 +1743,6 @@ class OmniConnectorModelRunnerMixin:
 
     #  Output aggregation
     # ------------------------------------------------------------------ #
-
-    def _empty_output_with_connector_signals(self) -> Any:
-        """Return a minimal ModelRunnerOutput carrying pending connector signals.
-
-        Used by early-return paths (e.g. ``num_scheduled_tokens == 0``)
-        that still need to deliver ``omni_connector_output`` to the
-        Scheduler so that WAITING_FOR_INPUT / WAITING_FOR_CHUNK
-        transitions are not lost.
-        """
-        from vllm_omni.outputs import OmniModelRunnerOutput
-
-        output = OmniModelRunnerOutput(req_ids=[], req_id_to_index={})
-        output.omni_connector_output = self.get_omni_connector_output()
-        return output
 
     def get_omni_connector_output(self) -> OmniConnectorOutput:
         """Collect and reset transfer results for this execute_model cycle.

@@ -953,10 +953,18 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 logger.error(f"RDMA Get failed: received {resp} instead of TRANS_DONE")
                 recv_buffer.release()
                 return None
-        except Exception as e:
+        except zmq.Again as e:
             # Socket may be stuck after timeout; discard it
             self._invalidate_req_socket(zmq_addr)
             self._metrics["timeouts"] += 1
+            logger.error(f"RDMA Get error: {e}", exc_info=True)
+            recv_buffer.release()
+            return None
+        except Exception as e:
+            # Non-timeout failures (for example CUDA synchronization errors)
+            # are connector errors, not network timeouts.
+            self._invalidate_req_socket(zmq_addr)
+            self._metrics["errors"] += 1
             logger.error(f"RDMA Get error: {e}", exc_info=True)
             recv_buffer.release()
             return None

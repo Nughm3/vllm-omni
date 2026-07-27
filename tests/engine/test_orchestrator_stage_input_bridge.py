@@ -104,12 +104,16 @@ class FakePrewarmPool:
             )
         )
         self.submitted: list[Any] = []
+        self.stage_client = SimpleNamespace(get_chunk_sender_info=lambda: None)
 
     async def submit_initial(self, _request_id, _req_state, request, prompt_text=None):
         self.submitted.append(request)
 
     def get_bound_replica_id(self, _request_id):
         return 0
+
+    def get_bound_client(self, _request_id):
+        return None
 
 
 def _request_output(request_id: str) -> RequestOutput:

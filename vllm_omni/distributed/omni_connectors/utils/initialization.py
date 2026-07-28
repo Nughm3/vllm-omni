@@ -3,128 +3,148 @@
 
 """Utilities for OmniConnector configuration and validation."""
 
+import enum
 import json
-import warnings
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from ..factory import OmniConnectorFactory
 from .config import TRANSFER_ENGINE_CONNECTOR_NAMES, ConnectorSpec, OmniTransferConfig
 from .env import expand_env_int
-from .kv_utils import KV_TRANSFER_PORT_OFFSET, kv_zmq_port
-from .local_rank import get_connector_local_rank, get_omni_replica_id
+from .kv_utils import KVTPTopology
 from .logging import get_connector_logger
-
-if TYPE_CHECKING:
-    from ..connectors.base import OmniConnectorBase
-else:
-    OmniConnectorBase = Any
 
 logger = get_connector_logger(__name__)
 
 
-def initialize_connectors_from_config(
-    config_path: str | Path | None = None,
-    purpose: str = "request_forwarding",
-    caller_stage_id: int | str | None = None,
-    is_sender: bool | None = None,
-) -> tuple[OmniTransferConfig | None, dict[tuple[str, str], OmniConnectorBase]]:
+class ConnectorDirection(enum.Enum):
+    """Direction of a resolved connector relative to the owning stage."""
+
+    SENDER = "sender"
+    RECEIVER = "receiver"
+
+
+class ConnectorOwnerScope(enum.Enum):
+    """Which process owns bind/materialization for an edge.
+
+    ``STAGE_REPLICA`` — scheduler-owned ``OmniChunkTransferAdapter`` (async_chunk).
+    ``TP_WORKER`` — per-TP-rank model-runner mixin.
+
+    Materialization skips edges whose ``owner_scope`` does not match the
+    caller's scope so chunk transfer adapter and the mixin cannot bind the same
+    endpoint.
     """
-    Initialize connectors from configuration file.
 
-    Returns:
-        tuple: (OmniTransferConfig, dict of {(from, to): connector_instance})
+    STAGE_REPLICA = "STAGE_REPLICA"
+    TP_WORKER = "TP_WORKER"
+
+
+@dataclass(frozen=True, slots=True)
+class StageEdge:
+    """Directed pipeline edge between two stage ids."""
+
+    from_stage: int
+    to_stage: int
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedConnectorSpec:
+    """Rank/replica-agnostic connector template for one edge direction.
+
+    Ports in ``spec.extra`` are stage-level *base* ports only. Per-TP-rank /
+    per-replica offsets are applied later by ``materialize_stage_connectors``
+    inside the owning process.
     """
-    transfer_config = load_omni_transfer_config(config_path)
 
-    if not transfer_config:
-        logger.info("No OmniTransferConfig provided")
-        return None, {}
-
-    # create connectors from config
-    connectors = create_connectors_from_config(
-        transfer_config.connectors,
-        purpose=purpose,
-        caller_stage_id=caller_stage_id,
-        is_sender=is_sender,
-    )
-    return transfer_config, connectors
+    edge: StageEdge
+    direction: ConnectorDirection
+    spec: ConnectorSpec
+    owner_scope: ConnectorOwnerScope
+    kv_topology: KVTPTopology | None = None
 
 
-def create_connectors_from_config(
-    connectors_config: dict[tuple[str, str], ConnectorSpec],
-    purpose: str = "request_forwarding",
-    caller_stage_id: int | str | None = None,
-    is_sender: bool | None = None,
-) -> dict[tuple[str, str], OmniConnectorBase]:
+@dataclass(frozen=True, slots=True)
+class StageConnectorPlan:
+    """Typed, edge-preserving connector plan for one stage.
+
+    ``inbound`` / ``outbound`` are tuples so fan-in/fan-out can be represented
+    later; today resolution still rejects more than one edge per direction.
+    ``uses_legacy_default`` is True only when *no* transfer config was provided
+    (legacy single-node SHM fallback). An explicit empty config yields empty
+    tuples with ``uses_legacy_default=False``.
     """
-    Create connectors from config.
 
-    Args:
-        connectors_config: A dictionary of connector configurations.
+    inbound: tuple[ResolvedConnectorSpec, ...] = ()
+    outbound: tuple[ResolvedConnectorSpec, ...] = ()
+    uses_legacy_default: bool = False
 
-    Returns:
-        A dictionary of connectors.
-    """
-    purpose_port_offsets = {
-        "request_forwarding": 0,
-        "kv_transfer": KV_TRANSFER_PORT_OFFSET,
-    }
-    orchestrator_port_offset = 200
+    @property
+    def input_spec(self) -> ResolvedConnectorSpec | None:
+        return self.inbound[0] if self.inbound else None
 
-    connectors = {}
-    for edge_key, connector_spec in connectors_config.items():
-        from_stage, to_stage = edge_key
-        try:
-            if connector_spec.name in TRANSFER_ENGINE_CONNECTOR_NAMES:
-                extra = dict(connector_spec.extra) if connector_spec.extra else {}
-                base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
-                try:
-                    stage_offset = int(from_stage)
-                except (TypeError, ValueError):
-                    stage_offset = 0
+    @property
+    def output_spec(self) -> ResolvedConnectorSpec | None:
+        return self.outbound[0] if self.outbound else None
 
-                is_orchestrator = str(caller_stage_id) == "orchestrator"
-                local_rank = 0 if is_orchestrator else get_connector_local_rank()
-                replica_id = 0 if is_orchestrator else get_omni_replica_id()
-                purpose_offset = orchestrator_port_offset if is_orchestrator else purpose_port_offsets.get(purpose, 0)
-                adjusted_port = kv_zmq_port(
-                    base_port, stage_offset, local_rank=local_rank, replica_id=replica_id, purpose_offset=purpose_offset
-                )
-                extra["zmq_port"] = adjusted_port
+    def as_legacy_specs(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Flat ``(input_spec, output_spec)`` dicts without ``stage_id`` injection."""
 
-                if is_sender is not None:
-                    extra["role"] = "sender" if is_sender else "receiver"
-                    if not is_sender:
-                        extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))
-                        extra.setdefault("sender_zmq_port", adjusted_port)
-                elif caller_stage_id is not None:
-                    caller_str = str(caller_stage_id)
-                    if caller_str == from_stage:
-                        extra["role"] = "sender"
-                    elif caller_str == to_stage:
-                        extra["role"] = "receiver"
-                        extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))
-                        extra.setdefault("sender_zmq_port", adjusted_port)
-                    else:
-                        extra["role"] = "sender"
-                else:
-                    extra["role"] = extra.get("role", "auto")
+        def _flat(resolved: ResolvedConnectorSpec | None) -> dict[str, Any] | None:
+            if resolved is None:
+                return None
+            return {"name": resolved.spec.name, "extra": dict(resolved.spec.extra)}
 
-                connector = OmniConnectorFactory.create_connector(ConnectorSpec(name=connector_spec.name, extra=extra))
-            else:
-                connector = OmniConnectorFactory.create_connector(connector_spec)
-            connectors[edge_key] = connector
-            logger.info(
-                "Created connector for %s -> %s: %s",
-                from_stage,
-                to_stage,
-                type(connector).__name__,
+        return _flat(self.input_spec), _flat(self.output_spec)
+
+    def with_stage_id(self, stage_id: int) -> "StageConnectorPlan":
+        """Return a copy with ``stage_id`` stamped into each edge's ``extra``."""
+        if self.uses_legacy_default or (not self.inbound and not self.outbound):
+            return self
+
+        def _inject(resolved: ResolvedConnectorSpec) -> ResolvedConnectorSpec:
+            extra = dict(resolved.spec.extra)
+            extra["stage_id"] = stage_id
+            return ResolvedConnectorSpec(
+                edge=resolved.edge,
+                direction=resolved.direction,
+                spec=ConnectorSpec(name=resolved.spec.name, extra=extra),
+                owner_scope=resolved.owner_scope,
+                kv_topology=resolved.kv_topology,
             )
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize connector for edge {edge_key}: {e}") from e
 
-    return connectors
+        return StageConnectorPlan(
+            inbound=tuple(_inject(r) for r in self.inbound),
+            outbound=tuple(_inject(r) for r in self.outbound),
+            uses_legacy_default=False,
+        )
+
+    def to_model_connector_configs(self, stage_id: int) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Dict view for model processors / mixin until they read the plan.
+
+        Mirrors ``OmniEngineArgs.create_model_config`` legacy SHM behavior:
+        ``uses_legacy_default`` fabricates an inbound SharedMemoryConnector.
+        """
+        if self.uses_legacy_default:
+            return (
+                {"name": "SharedMemoryConnector", "extra": {"stage_id": stage_id}},
+                None,
+            )
+
+        def _flat(resolved: ResolvedConnectorSpec | None) -> dict[str, Any] | None:
+            if resolved is None:
+                return None
+            extra = dict(resolved.spec.extra)
+            extra["stage_id"] = stage_id
+            return {"name": resolved.spec.name, "extra": extra}
+
+        return _flat(self.input_spec), _flat(self.output_spec)
+
+
+def _parse_stage_id(stage_id: str | int) -> int:
+    try:
+        return int(stage_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Stage id must be an integer, got {stage_id!r}") from exc
 
 
 def _stage_port_offset(stage_id: str | int) -> int:
@@ -259,6 +279,77 @@ def resolve_stage_connector_specs(
             output_spec = flat
 
     return input_spec, output_spec
+
+
+def resolve_stage_connector_plan(
+    transfer_config: OmniTransferConfig | None,
+    stage_id: int | str,
+    *,
+    async_chunk: bool = False,
+) -> StageConnectorPlan:
+    """Resolve a typed, rank/replica-agnostic connector plan for ``stage_id``.
+
+    Reuses :func:`get_connectors_config_for_stage` for edge collection and
+    transfer-engine *base* port math. Does **not** apply TP/replica port
+    offsets — those belong in ``materialize_stage_connectors`` inside the
+    owning process.
+
+    ``async_chunk=True`` marks every edge ``STAGE_REPLICA``-owned (chunk
+    transfer adapter); otherwise edges are ``TP_WORKER``-owned (mixin).
+    """
+    if transfer_config is None:
+        return StageConnectorPlan(inbound=(), outbound=(), uses_legacy_default=True)
+
+    stage_connectors_cfg = get_connectors_config_for_stage(transfer_config, stage_id)
+    owner_scope = ConnectorOwnerScope.STAGE_REPLICA if async_chunk else ConnectorOwnerScope.TP_WORKER
+    this_stage = _parse_stage_id(stage_id)
+
+    inbound: list[ResolvedConnectorSpec] = []
+    outbound: list[ResolvedConnectorSpec] = []
+
+    for edge_key, cfg in stage_connectors_cfg.items():
+        spec_dict = cfg.get("spec") or {}
+        name = spec_dict.get("name")
+        if not name:
+            continue
+        connector_spec = ConnectorSpec(name=name, extra=dict(spec_dict.get("extra") or {}))
+
+        if edge_key.startswith("from_stage_"):
+            if inbound:
+                raise ValueError(
+                    "Fan-in (multiple inbound edges) is not supported: got a second "
+                    f"inbound edge {edge_key!r} in addition to an already-resolved one."
+                )
+            from_stage = _parse_stage_id(edge_key.removeprefix("from_stage_"))
+            inbound.append(
+                ResolvedConnectorSpec(
+                    edge=StageEdge(from_stage=from_stage, to_stage=this_stage),
+                    direction=ConnectorDirection.RECEIVER,
+                    spec=connector_spec,
+                    owner_scope=owner_scope,
+                )
+            )
+        elif edge_key.startswith("to_stage_"):
+            if outbound:
+                raise ValueError(
+                    "Fan-out (multiple outbound edges) is not supported: got a second "
+                    f"outbound edge {edge_key!r} in addition to an already-resolved one."
+                )
+            to_stage = _parse_stage_id(edge_key.removeprefix("to_stage_"))
+            outbound.append(
+                ResolvedConnectorSpec(
+                    edge=StageEdge(from_stage=this_stage, to_stage=to_stage),
+                    direction=ConnectorDirection.SENDER,
+                    spec=connector_spec,
+                    owner_scope=owner_scope,
+                )
+            )
+
+    return StageConnectorPlan(
+        inbound=tuple(inbound),
+        outbound=tuple(outbound),
+        uses_legacy_default=False,
+    )
 
 
 def load_omni_transfer_config(
@@ -436,24 +527,6 @@ def load_omni_transfer_config(
 # High-level management functions
 
 
-def initialize_orchestrator_connectors(
-    config_path: str | None,
-) -> tuple[OmniTransferConfig | None, dict[tuple[str, str], OmniConnectorBase]]:
-    """Initialize connectors shared at orchestrator level.
-    Args:
-        config_path: The path to the configuration file.
-    Returns:
-        A tuple containing the OmniTransferConfig and a dictionary of connectors.
-    """
-    transfer_config, connectors = initialize_connectors_from_config(
-        config_path,
-        purpose="request_forwarding",
-        caller_stage_id="orchestrator",
-        is_sender=True,
-    )
-    return transfer_config, connectors
-
-
 def get_stage_connector_config(
     transfer_config: OmniTransferConfig | None,
     stage_id: int,
@@ -471,69 +544,6 @@ def get_stage_connector_config(
             exc,
         )
         return {}
-
-
-def build_stage_connectors(
-    stage_id: int,
-    connectors_config: dict[str, Any],
-    purpose: str = "request_forwarding",
-) -> dict[tuple[str, str], Any] | None:
-    """Instantiate OmniConnectors for a stage based on config.
-
-    Deprecated: prefer ``get_stage_connector_config`` plus the unified
-    connector factory. Kept as a thin shim so legacy callers keep working.
-    """
-    warnings.warn(
-        "build_stage_connectors is deprecated; use get_stage_connector_config and OmniConnectorFactory instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    if not connectors_config:
-        return {}
-
-    logger.info(
-        "[Stage-%s] Initializing OmniConnectors with config keys: %s",
-        stage_id,
-        list(connectors_config.keys()),
-    )
-
-    from .config import ConnectorSpec
-
-    connectors: dict[tuple[str, str], Any] = {}
-    # Convert dictionary-formatted config to ConnectorSpec objects.
-    # Only instantiate INPUT connectors ("from_stage_X") — the stage worker
-    # only receives via connectors.  Output connectors are handled at the
-    # orchestrator level (try_send_via_connector uses orchestrator connectors).
-    stage_connector_specs = {}
-    for key, config in connectors_config.items():
-        if not key.startswith("from_stage_"):
-            continue
-
-        from_stage = key.replace("from_stage_", "")
-        spec_dict = config.get("spec", {})
-        if not spec_dict:
-            continue
-
-        connector_spec = ConnectorSpec(
-            name=spec_dict.get("name", "SharedMemoryConnector"),
-            extra=spec_dict.get("extra", {}),
-        )
-        stage_connector_specs[(str(from_stage), str(stage_id))] = connector_spec
-
-    try:
-        # Use unified connector creation logic
-        connectors = create_connectors_from_config(
-            stage_connector_specs,
-            purpose=purpose,
-            caller_stage_id=stage_id,
-            is_sender=False,
-        )
-    except Exception as exc:  # pragma: no cover - defensive logging
-        # Fail fast so the stage does not start with missing connectors.
-        logger.exception("[Stage-%s] Failed to initialize connectors: %s", stage_id, exc)
-        raise
-
-    return connectors
 
 
 def resolve_omni_kv_config_for_stage(

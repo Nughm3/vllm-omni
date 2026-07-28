@@ -3,7 +3,7 @@
 
 import os
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .utils.logging import get_connector_logger
 
@@ -17,6 +17,9 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
     from omni_connectors.connectors.base import OmniConnectorBase
     from omni_connectors.utils.config import ConnectorSpec
+
+if TYPE_CHECKING:
+    from .utils.initialization import StageConnectorPlan
 
 logger = get_connector_logger(__name__)
 
@@ -48,6 +51,15 @@ class OmniConnectorFactory:
         except Exception as e:
             logger.error(f"Failed to create connector {spec.name}: {e}")
             raise ValueError(f"Failed to create connector {spec.name}: {e}")
+
+    @classmethod
+    def create_stage_connectors(cls, plan: "StageConnectorPlan") -> Any:
+        """Materialize runtime connectors from a typed stage plan.
+
+        Construction (dual-collapse, port offset, owner_scope filter) lands in
+        a follow-up; the method exists so callers can start threading the plan.
+        """
+        raise NotImplementedError("materialize_stage_connectors / StageConnectorSet not yet implemented")
 
     @classmethod
     def list_registered_connectors(cls) -> list[str]:

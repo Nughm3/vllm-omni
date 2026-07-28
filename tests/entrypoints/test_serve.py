@@ -252,7 +252,13 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
         "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
         return_value=(None, None, None),
     )
-    mocker.patch("vllm_omni.engine.stage_init_utils.get_stage_connector_specs", return_value=({}, None))
+    mocker.patch(
+        "vllm_omni.engine.stage_init_utils.get_stage_connector_plan",
+        return_value=__import__(
+            "vllm_omni.distributed.omni_connectors.utils.initialization",
+            fromlist=["StageConnectorPlan"],
+        ).StageConnectorPlan(uses_legacy_default=True),
+    )
     mocker.patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={})
     mocker.patch(
         "vllm_omni.engine.stage_init_utils.build_vllm_config",
@@ -329,7 +335,13 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: Mo
         "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
         return_value=(None, None, None),
     )
-    mocker.patch("vllm_omni.engine.stage_init_utils.get_stage_connector_specs", return_value=({}, None))
+    mocker.patch(
+        "vllm_omni.engine.stage_init_utils.get_stage_connector_plan",
+        return_value=__import__(
+            "vllm_omni.distributed.omni_connectors.utils.initialization",
+            fromlist=["StageConnectorPlan"],
+        ).StageConnectorPlan(uses_legacy_default=True),
+    )
     mocker.patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={})
     mocker.patch(
         "vllm_omni.engine.stage_init_utils.build_vllm_config",

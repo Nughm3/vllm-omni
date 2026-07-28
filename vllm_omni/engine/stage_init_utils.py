@@ -49,8 +49,7 @@ class ReplicaInitPlan:
     launch_mode: str
     stage_cfg: Any
     metadata: Any
-    stage_connector_spec: dict[str, Any]
-    stage_output_connector_spec: dict[str, Any] | None
+    stage_connector_plan: Any
     omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None]
     stage_vllm_config: Any | None = None
     executor_class: type | None = None
@@ -752,11 +751,12 @@ def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, 
 def build_engine_args_dict(
     stage_config: Any,
     model: str,
-    stage_connector_spec: dict[str, Any] | None = None,
-    stage_output_connector_spec: dict[str, Any] | None = None,
+    stage_connector_plan: Any | None = None,
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
     """Build the normalized engine args dict for one stage."""
+    from vllm_omni.distributed.omni_connectors.utils.initialization import StageConnectorPlan
+
     engine_args = stage_config.engine_args
     # HACK (Alex) Tensor parallel size should not be passed as None;
     # remove it if this is the case so that we fall back to default
@@ -825,12 +825,10 @@ def build_engine_args_dict(
     # Stage id must come from stage config instead of inherited CLI kwargs
     # (e.g. `--stage-id` defaulting to None).
     engine_args_dict["stage_id"] = stage_id
-    # Always attach the connector spec — full-payload Mooncake stages need it
-    # too now, not just async_chunk streaming (see get_stage_connector_specs).
-    engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
-    # Outbound spec is optional (None for the last stage or a single-edge stage).
-    if stage_output_connector_spec is not None:
-        engine_args_dict["stage_output_connector_spec"] = dict(stage_output_connector_spec)
+
+    if stage_connector_plan is None:
+        stage_connector_plan = StageConnectorPlan(uses_legacy_default=True)
+    engine_args_dict["stage_connector_plan"] = stage_connector_plan
 
     if stage_type == "diffusion":
         from vllm_omni.diffusion.data import parse_attention_config
@@ -864,8 +862,7 @@ def build_engine_args_dict(
 def build_vllm_config(
     stage_config: Any,
     model: str,
-    stage_connector_spec: dict[str, Any] | None = None,
-    stage_output_connector_spec: dict[str, Any] | None = None,
+    stage_connector_plan: Any | None = None,
     engine_args_dict: dict[str, Any] | None = None,
     headless: bool = False,
 ) -> tuple[Any, type]:
@@ -878,8 +875,7 @@ def build_vllm_config(
         engine_args_dict = build_engine_args_dict(
             stage_config,
             model,
-            stage_connector_spec=stage_connector_spec,
-            stage_output_connector_spec=stage_output_connector_spec,
+            stage_connector_plan=stage_connector_plan,
         )
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
@@ -1167,25 +1163,47 @@ def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> 
         return None
 
 
+def _stage_async_chunk(stage_cfg: Any) -> bool:
+    engine_args = getattr(stage_cfg, "engine_args", None)
+    if engine_args is None:
+        return False
+    if isinstance(engine_args, dict):
+        return bool(engine_args.get("async_chunk", False))
+    return bool(getattr(engine_args, "async_chunk", False))
+
+
+def get_stage_connector_plan(
+    omni_transfer_config: Any,
+    stage_id: int,
+    *,
+    async_chunk: bool = False,
+) -> Any:
+    """Return the typed :class:`StageConnectorPlan` for a stage worker."""
+    from vllm_omni.distributed.omni_connectors import resolve_stage_connector_plan
+
+    return resolve_stage_connector_plan(
+        omni_transfer_config,
+        stage_id,
+        async_chunk=async_chunk,
+    )
+
+
 def get_stage_connector_specs(
     omni_transfer_config: Any,
     stage_id: int,
+    *,
+    async_chunk: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Return ``(input_spec, output_spec)`` for a stage worker.
+    """Return ``(input_spec, output_spec)`` dicts for a stage worker.
 
-    ``input_spec`` drives the inbound (recv) connector, ``output_spec`` the
-    outbound (send) connector. Either may be ``None`` (stage 0 has no input;
-    the last stage has no output). A middle stage whose two edges use the same
-    connector type is collapsed to one dual instance by the mixin; a hybrid
-    stage (different types) keeps two instances.
+    Deprecated: prefer :func:`get_stage_connector_plan`. Kept for callers that
+    still consume the flat dict shape.
     """
-    from vllm_omni.distributed.omni_connectors import get_stage_connector_config
-    from vllm_omni.distributed.omni_connectors.utils.initialization import (
-        resolve_stage_connector_specs,
-    )
-
-    stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
-    return resolve_stage_connector_specs(stage_connectors_cfg)
+    return get_stage_connector_plan(
+        omni_transfer_config,
+        stage_id,
+        async_chunk=async_chunk,
+    ).as_legacy_specs()
 
 
 def get_stage_connector_spec(

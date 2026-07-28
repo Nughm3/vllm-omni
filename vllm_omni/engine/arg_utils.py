@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 import tempfile
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from typing import Any
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
@@ -128,8 +128,7 @@ class OmniEngineArgs(EngineArgs):
         custom_process_next_stage_input_func: Optional path to a custom function for processing
             inputs from previous stages
             If None, default processing is used.
-        stage_connector_spec: Extra configuration for the inbound (recv) stage connector
-        stage_output_connector_spec: Extra configuration for the outbound (send) stage connector
+        stage_connector_plan: Typed inbound/outbound connector plan for this stage.
         async_chunk: If set to True, perform async chunk
         worker_type: Model Type, e.g., "ar" or "generation"
         task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
@@ -157,8 +156,7 @@ class OmniEngineArgs(EngineArgs):
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
-    stage_connector_spec: dict[str, Any] = field(default_factory=dict)
-    stage_output_connector_spec: dict[str, Any] | None = None
+    stage_connector_plan: Any | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
     async_chunk: bool = False
     retains_state_across_chunks: bool = False
@@ -252,32 +250,13 @@ class OmniEngineArgs(EngineArgs):
         # register omni models to avoid model not found error
         self._ensure_omni_models_registered()
 
-        def _build_connector_config(spec: dict[str, Any]) -> dict[str, Any]:
-            cfg = {
-                "name": spec.get("name", "SharedMemoryConnector"),
-                "extra": spec.get("extra", {}).copy(),
-            }
-            cfg["extra"]["stage_id"] = self.stage_id
-            return cfg
+        from vllm_omni.distributed.omni_connectors.utils.initialization import StageConnectorPlan
 
-        # Inbound (recv) config. When a real resolve produced no input spec but
-        # DID produce an output spec, this stage has no inbound edge (stage 0) —
-        # leave recv config None instead of fabricating a phantom SHM connector.
-        # With no transfer config at all (neither spec set), fall back to the
-        # default SHM connector, which serves both directions.
-        has_input = bool(self.stage_connector_spec)
-        has_output = bool(self.stage_output_connector_spec)
-        if has_input:
-            stage_input_connector_config = _build_connector_config(self.stage_connector_spec)
-        elif has_output:
-            stage_input_connector_config = None
-        else:
-            stage_input_connector_config = _build_connector_config({})
-
-        # Outbound (send) config; None when this stage has no downstream edge.
-        stage_output_connector_config = (
-            _build_connector_config(self.stage_output_connector_spec) if has_output else None
-        )
+        plan = self.stage_connector_plan
+        if plan is None:
+            plan = StageConnectorPlan(uses_legacy_default=True)
+        plan = plan.with_stage_id(self.stage_id)
+        stage_input_connector_config, stage_output_connector_config = plan.to_model_connector_configs(self.stage_id)
 
         # If model_arch is specified, inject it into hf_overrides so vLLM can
         # resolve the architecture even when config.json lacks 'architectures'.
@@ -372,6 +351,7 @@ class OmniEngineArgs(EngineArgs):
             engine_output_type=self.engine_output_type,
             hf_config_name=self.hf_config_name,
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
+            stage_connector_plan=plan,
             stage_input_connector_config=stage_input_connector_config,
             stage_output_connector_config=stage_output_connector_config,
             subtalker_sampling_params=self.subtalker_sampling_params,

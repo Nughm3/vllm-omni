@@ -101,10 +101,13 @@ class OmniModelConfig(ModelConfig):
              "audio", "latents"). If None, output type is inferred.
          stage_input_connector_config: Inbound (recv) stage connector configuration.
              Contains "name" (connector name), "extra" (extra connector config).
+             Derived from stage_connector_plan for model-processor compat.
          stage_output_connector_config: Outbound (send) stage connector
              configuration. Same shape as stage_input_connector_config. When both
              edges of a middle stage use the same connector type the mixin
              collapses them into one dual instance.
+         stage_connector_plan: Typed inbound/outbound connector plan. Source of
+             truth for factory materialization; dict configs above are views.
          task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
              If not specified, will be inferred from model path.
 
@@ -132,6 +135,7 @@ class OmniModelConfig(ModelConfig):
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
+    stage_connector_plan: Any | None = None
     stage_input_connector_config: dict[str, Any] | None = field(
         default_factory=lambda: {
             "name": "SharedMemoryConnector",

@@ -9,6 +9,7 @@ from vllm_omni.distributed.omni_connectors.connectors.shm_connector import Share
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, OmniTransferConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     get_connectors_config_for_stage,
+    resolve_stage_connector_plan,
     resolve_stage_connector_specs,
 )
 from vllm_omni.engine.stage_init_utils import get_stage_connector_spec
@@ -308,20 +309,25 @@ def test_resolve_stage_connector_specs_ignores_rank_and_replica_at_config_build_
         }
     )
 
-    # Even with a non-zero rank/replica in the environment at config-build
-    # time (e.g. leftover from a previous process), the resolved spec must
-    # not vary — this function no longer consults them at all.
+    # Planning no longer imports rank/replica helpers; even if the env would
+    # report non-zero values, resolved specs must stay at stage-level base ports.
     mocker.patch(
-        "vllm_omni.distributed.omni_connectors.utils.initialization.get_connector_local_rank",
+        "vllm_omni.distributed.omni_connectors.utils.local_rank.get_connector_local_rank",
         return_value=3,
     )
     mocker.patch(
-        "vllm_omni.distributed.omni_connectors.utils.initialization.get_omni_replica_id",
+        "vllm_omni.distributed.omni_connectors.utils.local_rank.get_omni_replica_id",
         return_value=2,
     )
     recv, send = resolve_stage_connector_specs(get_connectors_config_for_stage(config, stage_id=1))
     assert send["extra"]["zmq_port"] == 50052
     assert recv["extra"]["sender_zmq_port"] == 50051
+
+    plan = resolve_stage_connector_plan(config, stage_id=1)
+    assert plan.output_spec is not None
+    assert plan.output_spec.spec.extra["zmq_port"] == 50052
+    assert plan.input_spec is not None
+    assert plan.input_spec.spec.extra["sender_zmq_port"] == 50051
 
 
 def test_resolve_stage_connector_specs_hybrid_mooncake_shm():
@@ -399,6 +405,100 @@ def test_full_payload_consumer_uses_receiver_connector_spec():
 
     assert spec["name"] == "SharedMemoryConnector"
     assert spec["extra"] == {"codec_chunk_frames": 25, "role": "receiver"}
+
+
+def test_resolve_stage_connector_plan_preserves_edges_and_owner_scope():
+    """Typed plan keeps from/to stage ids and chunk transfer adapter vs mixin ownership."""
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        ConnectorDirection,
+        ConnectorOwnerScope,
+        resolve_stage_connector_plan,
+    )
+
+    config = OmniTransferConfig(
+        connectors={
+            ("0", "1"): ConnectorSpec(
+                name="MooncakeTransferEngineConnector",
+                extra={
+                    "host": "auto",
+                    "zmq_port": 50051,
+                    "sender_host": "10.248.12.80",
+                    "protocol": "rdma",
+                },
+            ),
+            ("1", "2"): ConnectorSpec(
+                name="SharedMemoryConnector",
+                extra={"codec_chunk_frames": 25},
+            ),
+        }
+    )
+
+    # No transfer config → legacy SHM fallback marker only.
+    legacy = resolve_stage_connector_plan(None, stage_id=1)
+    assert legacy.uses_legacy_default is True
+    assert legacy.inbound == ()
+    assert legacy.outbound == ()
+
+    # Explicit empty config is not the legacy fallback.
+    empty = resolve_stage_connector_plan(OmniTransferConfig(connectors={}), stage_id=1)
+    assert empty.uses_legacy_default is False
+    assert empty.inbound == ()
+    assert empty.outbound == ()
+
+    plan = resolve_stage_connector_plan(config, stage_id=1, async_chunk=False)
+    assert plan.uses_legacy_default is False
+    assert len(plan.inbound) == 1
+    assert len(plan.outbound) == 1
+
+    recv = plan.input_spec
+    send = plan.output_spec
+    assert recv is not None and send is not None
+    assert recv.edge.from_stage == 0 and recv.edge.to_stage == 1
+    assert send.edge.from_stage == 1 and send.edge.to_stage == 2
+    assert recv.direction is ConnectorDirection.RECEIVER
+    assert send.direction is ConnectorDirection.SENDER
+    assert recv.owner_scope is ConnectorOwnerScope.TP_WORKER
+    assert send.owner_scope is ConnectorOwnerScope.TP_WORKER
+    # Stage-level base ports only (no TP/replica offset).
+    assert recv.spec.extra["sender_zmq_port"] == 50051
+    assert send.spec.name == "SharedMemoryConnector"
+
+    cta_plan = resolve_stage_connector_plan(config, stage_id=1, async_chunk=True)
+    assert cta_plan.input_spec is not None
+    assert cta_plan.input_spec.owner_scope is ConnectorOwnerScope.STAGE_REPLICA
+    assert cta_plan.output_spec is not None
+    assert cta_plan.output_spec.owner_scope is ConnectorOwnerScope.STAGE_REPLICA
+
+    # Round-trip to the legacy dict shape used across process spawn.
+    recv_dict, send_dict = plan.as_legacy_specs()
+    assert recv_dict == {"name": recv.spec.name, "extra": dict(recv.spec.extra)}
+    assert send_dict == {"name": send.spec.name, "extra": dict(send.spec.extra)}
+
+    # Stage 0 / last stage: one direction empty.
+    s0 = resolve_stage_connector_plan(config, stage_id=0)
+    assert s0.inbound == ()
+    assert s0.output_spec is not None
+    assert s0.output_spec.edge == s0.outbound[0].edge
+
+    s2 = resolve_stage_connector_plan(config, stage_id=2)
+    assert s2.outbound == ()
+    assert s2.input_spec is not None
+    assert s2.input_spec.edge.from_stage == 1
+
+
+def test_resolve_stage_connector_plan_rejects_fan_in():
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        resolve_stage_connector_plan,
+    )
+
+    config = OmniTransferConfig(
+        connectors={
+            ("0", "2"): ConnectorSpec(name="SharedMemoryConnector"),
+            ("1", "2"): ConnectorSpec(name="SharedMemoryConnector"),
+        }
+    )
+    with pytest.raises(ValueError, match="Fan-in"):
+        resolve_stage_connector_plan(config, stage_id=2)
 
 
 def test_recv_with_missing_metadata(mocker: MockerFixture):

@@ -25,12 +25,15 @@ except ImportError:
 from .factory import OmniConnectorFactory
 from .utils.config import ConnectorSpec, OmniTransferConfig
 from .utils.initialization import (
-    build_stage_connectors,
+    ConnectorDirection,
+    ConnectorOwnerScope,
+    ResolvedConnectorSpec,
+    StageConnectorPlan,
+    StageEdge,
     get_connectors_config_for_stage,
     get_stage_connector_config,
-    initialize_connectors_from_config,
-    initialize_orchestrator_connectors,
     load_omni_transfer_config,
+    resolve_stage_connector_plan,
 )
 
 # Backward-compatible alias: MooncakeConnector was renamed to MooncakeStoreConnector.
@@ -41,6 +44,13 @@ __all__ = [
     # Config
     "ConnectorSpec",
     "OmniTransferConfig",
+    # Planning
+    "ConnectorDirection",
+    "ConnectorOwnerScope",
+    "StageEdge",
+    "ResolvedConnectorSpec",
+    "StageConnectorPlan",
+    "resolve_stage_connector_plan",
     # Base classes and implementations
     "OmniConnectorBase",
     # Factory
@@ -55,10 +65,7 @@ __all__ = [
     "YuanrongTransferEngineConnector",
     # Utilities
     "load_omni_transfer_config",
-    "initialize_connectors_from_config",
     "get_connectors_config_for_stage",
     # Manager helpers
-    "initialize_orchestrator_connectors",
     "get_stage_connector_config",
-    "build_stage_connectors",
 ]

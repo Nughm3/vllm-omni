@@ -19,7 +19,7 @@ TRANSFER_ENGINE_CONNECTOR_NAMES = frozenset(
 
 def get_stage_connector_role(model_config: Any) -> str | None:
     """Return the configured stage connector direction, if explicit."""
-    connector_config = getattr(model_config, "stage_connector_config", None)
+    connector_config = getattr(model_config, "stage_input_connector_config", None)
     if isinstance(connector_config, dict):
         extra = connector_config.get("extra")
     else:

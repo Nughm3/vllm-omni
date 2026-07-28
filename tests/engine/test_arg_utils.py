@@ -89,7 +89,7 @@ def test_default_all_values_are_initialized():
     # Test a primitive
     assert cfg.model_stage == "thinker"
     # Test a field initialized with a default factory
-    assert cfg.stage_connector_config == {
+    assert cfg.stage_input_connector_config == {
         "name": "SharedMemoryConnector",
         "extra": {},
     }

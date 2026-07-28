@@ -109,7 +109,7 @@ class FakePrewarmPool:
         self.stage_vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(
                 max_model_len=64,
-                stage_connector_config={"extra": {"role": role}},
+                stage_input_connector_config={"extra": {"role": role}},
             )
         )
         self.submitted: list[Any] = []

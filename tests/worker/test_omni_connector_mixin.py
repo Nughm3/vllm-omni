@@ -58,7 +58,7 @@ def _make_model_config(
     custom_func: str | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        stage_connector_config=None,
+        stage_input_connector_config=None,
         async_chunk=async_chunk,
         worker_type=worker_type,
         custom_process_next_stage_input_func=custom_func,
@@ -1285,7 +1285,7 @@ class TestRankAwareKVRouting:
 class TestRankMappingResolutionFromConnectorConfig:
     """A stage's recv (inbound) and send (outbound) edges may have different
     TP ratios. init_omni_connectors must resolve each independently from the
-    inbound stage_connector_config and outbound stage_output_connector_config,
+    inbound stage_input_connector_config and outbound stage_output_connector_config,
     and must still support the single-edge case (stage 0 / last stage) applying
     one mapping to both."""
 
@@ -1293,7 +1293,7 @@ class TestRankMappingResolutionFromConnectorConfig:
         # Middle stage with different TP ratios on each edge (heterogeneous TP):
         # thinker TP=4 -> talker TP=2 -> code2wav TP=1.
         model_config = _make_model_config(stage_id=1)
-        model_config.stage_connector_config = {
+        model_config.stage_input_connector_config = {
             "name": "MooncakeTransferEngineConnector",
             "extra": {"role": "receiver", "rank_mapping": {"from_tp": 4, "to_tp": 2}},
         }
@@ -1319,7 +1319,7 @@ class TestRankMappingResolutionFromConnectorConfig:
     def test_same_type_two_edges_collapse_to_one_dual_instance(self):
         # Both edges use the same connector type -> one shared dual instance.
         model_config = _make_model_config(stage_id=1)
-        model_config.stage_connector_config = {
+        model_config.stage_input_connector_config = {
             "name": "MooncakeTransferEngineConnector",
             "extra": {"role": "receiver"},
         }
@@ -1353,7 +1353,7 @@ class TestRankMappingResolutionFromConnectorConfig:
     def test_hybrid_two_edges_build_two_instances(self):
         # Different connector types (Mooncake in / SHM out) -> two instances.
         model_config = _make_model_config(stage_id=1)
-        model_config.stage_connector_config = {
+        model_config.stage_input_connector_config = {
             "name": "MooncakeTransferEngineConnector",
             "extra": {"role": "receiver"},
         }
@@ -1383,7 +1383,7 @@ class TestRankMappingResolutionFromConnectorConfig:
         the flat spec's rank_mapping must still resolve for both recv and
         send (there's no ambiguity with a single edge)."""
         model_config = _make_model_config(stage_id=0)
-        model_config.stage_connector_config = {
+        model_config.stage_input_connector_config = {
             "name": "MooncakeTransferEngineConnector",
             "extra": {"role": "sender", "rank_mapping": {"from_tp": 2, "to_tp": 1}},
         }
@@ -1446,7 +1446,7 @@ class TestWorkerPortOffset:
         build connectors with different zmq_port — the actual collision this
         fix prevents."""
         model_config = _make_model_config(stage_id=0)
-        model_config.stage_connector_config = None
+        model_config.stage_input_connector_config = None
         model_config.stage_output_connector_config = {
             "name": "MooncakeTransferEngineConnector",
             "extra": {"role": "sender", "zmq_port": 50052},
@@ -1529,7 +1529,7 @@ class TestWorkerPortOffset:
                     return MockConnector()
 
                 model_config = _make_model_config(stage_id=stage_id)
-                model_config.stage_connector_config = recv_spec
+                model_config.stage_input_connector_config = recv_spec
                 model_config.stage_output_connector_config = send_spec
 
                 host = MixinHost()

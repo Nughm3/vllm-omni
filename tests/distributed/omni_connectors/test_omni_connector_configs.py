@@ -56,7 +56,7 @@ def test_stage_chunk_direction_helpers(role, stage_id, receives, sends):
     extra = {} if role is None else {"role": role}
     model_config = SimpleNamespace(
         stage_id=stage_id,
-        stage_connector_config={"extra": extra},
+        stage_input_connector_config={"extra": extra},
     )
 
     assert stage_receives_chunks(model_config) is receives

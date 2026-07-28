@@ -111,7 +111,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     @classmethod
     def create_connector(cls, model_config: Any):
-        connector_config = getattr(model_config, "stage_connector_config", None)
+        connector_config = getattr(model_config, "stage_input_connector_config", None)
         if connector_config is None:
             connector_config = {}
         elif not isinstance(connector_config, dict):

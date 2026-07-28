@@ -2260,7 +2260,7 @@ class OmniConnectorModelRunnerMixin:
           also the no-transfer-config default where SHM serves both directions)
         - outbound only        → send instance, no recv (stage 0)
         """
-        recv_cfg = self._normalize_connector_config(getattr(model_config, "stage_connector_config", None))
+        recv_cfg = self._normalize_connector_config(getattr(model_config, "stage_input_connector_config", None))
         send_cfg = self._normalize_connector_config(getattr(model_config, "stage_output_connector_config", None))
         if recv_cfg is not None:
             recv_cfg = (recv_cfg[0], self._apply_worker_port_offset(*recv_cfg))
@@ -2394,7 +2394,7 @@ class OmniConnectorModelRunnerMixin:
         connector config; fall back to the (single) input config, then to
         ``stage_id + 1``.
         """
-        for attr in ("stage_output_connector_config", "stage_connector_config"):
+        for attr in ("stage_output_connector_config", "stage_input_connector_config"):
             connector_config = getattr(model_config, attr, None)
             if connector_config is None:
                 continue
@@ -2415,7 +2415,7 @@ class OmniConnectorModelRunnerMixin:
 
         Returns ``{"recv": {"from_tp", "to_tp"}, "send": {"from_tp", "to_tp"},
         "local_rank"}``. ``recv`` comes from the inbound
-        ``stage_connector_config``'s ``rank_mapping`` and ``send`` from the
+        ``stage_input_connector_config``'s ``rank_mapping`` and ``send`` from the
         outbound ``stage_output_connector_config``'s — independent TP
         topologies for a stage's two edges (heterogeneous TP). When the stage
         has no distinct outbound spec, the inbound spec's mapping is reused for
@@ -2435,7 +2435,7 @@ class OmniConnectorModelRunnerMixin:
                 "to_tp": int(rank_mapping.get("to_tp", 1)),
             }
 
-        recv_extra = _extra("stage_connector_config")
+        recv_extra = _extra("stage_input_connector_config")
         send_extra = _extra("stage_output_connector_config")
         # No distinct outbound spec → the inbound connector serves both
         # directions, so reuse its mapping for send.

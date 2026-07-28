@@ -133,7 +133,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             worker_type=model_mode,
             max_num_seqs=max_num_seqs,
             active_stream_window=active_stream_window,
-            stage_connector_config={
+            stage_input_connector_config={
                 "name": "SharedMemoryConnector",
                 "extra": connector_extra or {},
             },
@@ -167,7 +167,7 @@ def test_create_connector_config_parsing(monkeypatch, raw_cfg, expected_name, ex
         _fake_create,
     )
 
-    model_config = SimpleNamespace(stage_connector_config=raw_cfg) if raw_cfg is not None else SimpleNamespace()
+    model_config = SimpleNamespace(stage_input_connector_config=raw_cfg) if raw_cfg is not None else SimpleNamespace()
     connector = OmniChunkTransferAdapter.create_connector(model_config)
 
     assert connector == "ok"

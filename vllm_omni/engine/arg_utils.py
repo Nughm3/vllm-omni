@@ -268,11 +268,11 @@ class OmniEngineArgs(EngineArgs):
         has_input = bool(self.stage_connector_spec)
         has_output = bool(self.stage_output_connector_spec)
         if has_input:
-            stage_connector_config = _build_connector_config(self.stage_connector_spec)
+            stage_input_connector_config = _build_connector_config(self.stage_connector_spec)
         elif has_output:
-            stage_connector_config = None
+            stage_input_connector_config = None
         else:
-            stage_connector_config = _build_connector_config({})
+            stage_input_connector_config = _build_connector_config({})
 
         # Outbound (send) config; None when this stage has no downstream edge.
         stage_output_connector_config = (
@@ -372,7 +372,7 @@ class OmniEngineArgs(EngineArgs):
             engine_output_type=self.engine_output_type,
             hf_config_name=self.hf_config_name,
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
-            stage_connector_config=stage_connector_config,
+            stage_input_connector_config=stage_input_connector_config,
             stage_output_connector_config=stage_output_connector_config,
             subtalker_sampling_params=self.subtalker_sampling_params,
             omni_kv_config=self.omni_kv_config,

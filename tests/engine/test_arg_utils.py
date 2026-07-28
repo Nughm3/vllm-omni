@@ -106,6 +106,19 @@ def test_default_all_values_are_initialized():
     str(cfg)
 
 
+def test_stage_connector_config_deprecated_alias():
+    model_config = EngineArgs().create_model_config()
+    cfg = OmniModelConfig.from_vllm_model_config(model_config)
+
+    with pytest.warns(DeprecationWarning, match="stage_input_connector_config"):
+        assert cfg.stage_connector_config is cfg.stage_input_connector_config
+
+    replacement = {"name": "SharedMemoryConnector", "extra": {"role": "receiver"}}
+    with pytest.warns(DeprecationWarning, match="stage_input_connector_config"):
+        cfg.stage_connector_config = replacement
+    assert cfg.stage_input_connector_config == replacement
+
+
 def test_qwen3_tts_codec_frame_rate_patching():
     """Ensure the patch for qwen3 tts is applied correctly when creating the omni config."""
     # Create a vLLM ModelConfig

@@ -19,14 +19,20 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+from vllm_omni.distributed.omni_connectors.stage_connector import ConnectorRuntimeContext
 from vllm_omni.distributed.omni_connectors.utils.config import (
     TRANSFER_ENGINE_CONNECTOR_NAMES,
+)
+from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    ConnectorOwnerScope,
+    stage_connector_plan_from_model_config,
 )
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import (
     KV_TRANSFER_PORT_OFFSET,
     kv_zmq_port,
 )
-from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
+from vllm_omni.engine import ConnectorEndpoint, OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 
@@ -378,48 +384,41 @@ class StageEngineCoreClientBase(StageClientBase):
             ),
         }
 
-    def get_chunk_sender_info(self) -> dict[str, Any] | None:
+    def get_chunk_sender_info(self) -> ConnectorEndpoint | None:
         """Build this replica's ordinary stage-transfer sender endpoint."""
         model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
-        connector_config = getattr(model_config, "stage_output_connector_config", None)
-        if not isinstance(connector_config, dict):
+        if model_config is None:
             return None
-
-        # Engine args wrap resolved connector settings in ``extra``. Keep
-        # accepting a flat dict for lightweight clients/tests as well.
-        resolved_config = connector_config.get("extra")
-        is_resolved_spec = isinstance(resolved_config, dict)
-        if is_resolved_spec:
-            connector_config = resolved_config
-
-        base_port = connector_config.get("zmq_port")
-        if base_port is None:
+        plan = stage_connector_plan_from_model_config(model_config)
+        output = plan.output_spec
+        if output is None:
             return None
-        # Resolved specs already include the stage offset; flat/raw configs do
-        # not. In either case ordinary stage transfer uses purpose offset 0.
-        from_stage = 0 if is_resolved_spec else connector_config.get("from_stage", self.stage_id)
-        host = self._resolve_sender_host_from_config(connector_config)
+        context = ConnectorRuntimeContext(
+            stage_id=int(self.stage_id),
+            owner_scope=output.owner_scope,
+            replica_id=int(self.replica_id),
+            tp_rank=0 if output.owner_scope == ConnectorOwnerScope.TP_WORKER else None,
+            tp_size=1 if output.owner_scope == ConnectorOwnerScope.TP_WORKER else None,
+        )
+        connector_spec = OmniConnectorFactory.resolve_connector_spec(output, context)
+        if connector_spec is None:
+            return None
+        host = self._resolve_sender_host_from_config(connector_spec.extra)
         if host is None:
             return None
         try:
-            sender_port = kv_zmq_port(
-                int(os.path.expandvars(str(base_port))),
-                int(from_stage),
-                local_rank=0,
-                replica_id=self.replica_id,
-                purpose_offset=0,
-            )
+            sender_port = int(connector_spec.extra["zmq_port"])
         except (TypeError, ValueError):
             logger.warning(
                 "[StageEngineCoreClient] stage-%s [rep-%s] could not resolve chunk sender port "
-                "from base_port=%s and from_stage=%s",
+                "from materialized connector config",
                 self.stage_id,
                 self.replica_id,
-                base_port,
-                from_stage,
             )
             return None
-        return {"host": str(host), "zmq_port": sender_port}
+        except KeyError:
+            return None
+        return ConnectorEndpoint(host=str(host), zmq_port=sender_port)
 
     def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None:
         """Set engine outputs (called by orchestrator)."""

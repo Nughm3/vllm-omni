@@ -11,7 +11,7 @@ from typing import Any
 
 from .config import TRANSFER_ENGINE_CONNECTOR_NAMES, ConnectorSpec, OmniTransferConfig
 from .env import expand_env_int
-from .kv_utils import KVTPTopology
+from .kv_utils import KVTPTopology, validate_kv_tp_topology
 from .logging import get_connector_logger
 
 logger = get_connector_logger(__name__)
@@ -86,38 +86,6 @@ class StageConnectorPlan:
     def output_spec(self) -> ResolvedConnectorSpec | None:
         return self.outbound[0] if self.outbound else None
 
-    def as_legacy_specs(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        """Flat ``(input_spec, output_spec)`` dicts without ``stage_id`` injection."""
-
-        def _flat(resolved: ResolvedConnectorSpec | None) -> dict[str, Any] | None:
-            if resolved is None:
-                return None
-            return {"name": resolved.spec.name, "extra": dict(resolved.spec.extra)}
-
-        return _flat(self.input_spec), _flat(self.output_spec)
-
-    def with_stage_id(self, stage_id: int) -> "StageConnectorPlan":
-        """Return a copy with ``stage_id`` stamped into each edge's ``extra``."""
-        if self.uses_legacy_default or (not self.inbound and not self.outbound):
-            return self
-
-        def _inject(resolved: ResolvedConnectorSpec) -> ResolvedConnectorSpec:
-            extra = dict(resolved.spec.extra)
-            extra["stage_id"] = stage_id
-            return ResolvedConnectorSpec(
-                edge=resolved.edge,
-                direction=resolved.direction,
-                spec=ConnectorSpec(name=resolved.spec.name, extra=extra),
-                owner_scope=resolved.owner_scope,
-                kv_topology=resolved.kv_topology,
-            )
-
-        return StageConnectorPlan(
-            inbound=tuple(_inject(r) for r in self.inbound),
-            outbound=tuple(_inject(r) for r in self.outbound),
-            uses_legacy_default=False,
-        )
-
     def to_model_connector_configs(self, stage_id: int) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """Dict view for model processors / mixin until they read the plan.
 
@@ -147,6 +115,90 @@ def _parse_stage_id(stage_id: str | int) -> int:
         raise ValueError(f"Stage id must be an integer, got {stage_id!r}") from exc
 
 
+def _kv_topology_from_spec(spec: ConnectorSpec) -> KVTPTopology | None:
+    rank_mapping = spec.extra.get("rank_mapping")
+    if not isinstance(rank_mapping, dict):
+        return None
+    topology = KVTPTopology(
+        source_tp_size=int(rank_mapping.get("from_tp", 1)),
+        target_tp_size=int(rank_mapping.get("to_tp", 1)),
+        # Planning runs before a worker-local TP rank exists. Materialization
+        # replaces this template rank inside the owning worker process.
+        local_rank=0,
+    )
+    validate_kv_tp_topology(topology)
+    return topology
+
+
+def stage_connector_plan_from_model_config(
+    model_config: Any,
+    *,
+    owner_scope: ConnectorOwnerScope | None = None,
+) -> StageConnectorPlan:
+    """Return the typed plan carried by ``model_config`` or derive a legacy one."""
+    plan = getattr(model_config, "stage_connector_plan", None)
+    if isinstance(plan, StageConnectorPlan):
+        return plan
+
+    stage_id = _parse_stage_id(getattr(model_config, "stage_id", 0))
+    if owner_scope is None:
+        owner_scope = (
+            ConnectorOwnerScope.STAGE_REPLICA
+            if bool(getattr(model_config, "async_chunk", False))
+            else ConnectorOwnerScope.TP_WORKER
+        )
+
+    def _config(attr: str) -> ConnectorSpec | None:
+        raw = getattr(model_config, attr, None)
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            name = raw.get("name")
+            extra = raw.get("extra") or {}
+        else:
+            name = getattr(raw, "name", None)
+            extra = getattr(raw, "extra", {}) or {}
+        if not isinstance(name, str) or not name:
+            return None
+        return ConnectorSpec(name=name, extra=dict(extra))
+
+    input_connector = _config("stage_input_connector_config")
+    output_connector = _config("stage_output_connector_config")
+    if input_connector is None and output_connector is None:
+        has_explicit_directional_config = hasattr(model_config, "stage_input_connector_config") or hasattr(
+            model_config, "stage_output_connector_config"
+        )
+        return StageConnectorPlan(uses_legacy_default=not has_explicit_directional_config)
+
+    inbound: tuple[ResolvedConnectorSpec, ...] = ()
+    if input_connector is not None:
+        from_stage = int(input_connector.extra.get("from_stage", max(0, stage_id - 1)))
+        inbound = (
+            ResolvedConnectorSpec(
+                edge=StageEdge(from_stage=from_stage, to_stage=stage_id),
+                direction=ConnectorDirection.RECEIVER,
+                spec=input_connector,
+                owner_scope=owner_scope,
+                kv_topology=_kv_topology_from_spec(input_connector),
+            ),
+        )
+
+    outbound: tuple[ResolvedConnectorSpec, ...] = ()
+    if output_connector is not None:
+        to_stage = int(output_connector.extra.get("to_stage", stage_id + 1))
+        outbound = (
+            ResolvedConnectorSpec(
+                edge=StageEdge(from_stage=stage_id, to_stage=to_stage),
+                direction=ConnectorDirection.SENDER,
+                spec=output_connector,
+                owner_scope=owner_scope,
+                kv_topology=_kv_topology_from_spec(output_connector),
+            ),
+        )
+
+    return StageConnectorPlan(inbound=inbound, outbound=outbound)
+
+
 def _stage_port_offset(stage_id: str | int) -> int:
     try:
         return int(stage_id)
@@ -167,8 +219,7 @@ def _apply_transfer_engine_ports(
     from_stage``. This deliberately excludes the per-TP-rank / per-replica
     offset — this runs once per stage before per-rank worker processes
     exist, so baking a rank-resolved port in here would copy the same port
-    to every rank. The mixin adds that offset itself at actual
-    connector-construction time (``_apply_worker_port_offset``).
+    to every rank. The factory adds that offset inside the owning process.
     """
     base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
     stage_base_port = base_port + _stage_port_offset(from_stage)
@@ -199,9 +250,8 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
     - inbound  → role=receiver
     - outbound → role=sender
 
-    Middle stages receive both keys; ``resolve_stage_connector_specs`` splits
-    them into ``(input_spec, output_spec)``, which the mixin builds as one
-    dual instance (same type) or two instances (hybrid).
+    Middle stages receive both keys; ``resolve_stage_connector_plan`` preserves
+    them as typed inbound/outbound edge specifications.
     """
     if not transfer_config:
         return {}
@@ -239,46 +289,6 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
             stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": dict(extra)}}
 
     return stage_connectors_config
-
-
-def resolve_stage_connector_specs(
-    stage_connectors_cfg: dict[str, Any],
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Split per-edge stage connector entries into ``(input_spec, output_spec)``.
-
-    ``input_spec`` drives the inbound (recv) connector, ``output_spec`` the
-    outbound (send) connector. Each is a flat single-direction spec
-    (``{"name", "extra"}``) carrying its own ``role`` / ports / ``rank_mapping``.
-    Either may be ``None`` — stage 0 has no input, the last stage no output.
-
-    The mixin decides whether both specs collapse to one dual instance
-    (same connector type) or stay as two (hybrid, e.g. Mooncake in / SHM out).
-    """
-    input_spec: dict[str, Any] | None = None
-    output_spec: dict[str, Any] | None = None
-
-    for edge_key, cfg in stage_connectors_cfg.items():
-        spec = cfg.get("spec") or {}
-        name = spec.get("name")
-        if not name:
-            continue
-        flat = {"name": name, "extra": dict(spec.get("extra") or {})}
-        if edge_key.startswith("from_stage_"):
-            if input_spec is not None:
-                raise ValueError(
-                    "Fan-in (multiple inbound edges) is not supported: got a second "
-                    f"inbound edge {edge_key!r} in addition to an already-resolved one."
-                )
-            input_spec = flat
-        elif edge_key.startswith("to_stage_"):
-            if output_spec is not None:
-                raise ValueError(
-                    "Fan-out (multiple outbound edges) is not supported: got a second "
-                    f"outbound edge {edge_key!r} in addition to an already-resolved one."
-                )
-            output_spec = flat
-
-    return input_spec, output_spec
 
 
 def resolve_stage_connector_plan(
@@ -327,6 +337,7 @@ def resolve_stage_connector_plan(
                     direction=ConnectorDirection.RECEIVER,
                     spec=connector_spec,
                     owner_scope=owner_scope,
+                    kv_topology=_kv_topology_from_spec(connector_spec),
                 )
             )
         elif edge_key.startswith("to_stage_"):
@@ -342,6 +353,7 @@ def resolve_stage_connector_plan(
                     direction=ConnectorDirection.SENDER,
                     spec=connector_spec,
                     owner_scope=owner_scope,
+                    kv_topology=_kv_topology_from_spec(connector_spec),
                 )
             )
 

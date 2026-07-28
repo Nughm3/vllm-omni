@@ -16,7 +16,7 @@ import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
@@ -35,6 +35,9 @@ from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_c
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.platforms import current_omni_platform
+
+if TYPE_CHECKING:
+    from vllm_omni.distributed.omni_connectors.utils.initialization import StageConnectorPlan
 from vllm_omni.quantization.inc_config import OmniINCConfig
 
 logger = init_logger(__name__)
@@ -49,7 +52,7 @@ class ReplicaInitPlan:
     launch_mode: str
     stage_cfg: Any
     metadata: Any
-    stage_connector_plan: Any
+    stage_connector_plan: StageConnectorPlan
     omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None]
     stage_vllm_config: Any | None = None
     executor_class: type | None = None
@@ -751,7 +754,8 @@ def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, 
 def build_engine_args_dict(
     stage_config: Any,
     model: str,
-    stage_connector_plan: Any | None = None,
+    stage_connector_plan: StageConnectorPlan | None = None,
+    stage_input_num_replicas: int = 1,
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
     """Build the normalized engine args dict for one stage."""
@@ -829,6 +833,7 @@ def build_engine_args_dict(
     if stage_connector_plan is None:
         stage_connector_plan = StageConnectorPlan(uses_legacy_default=True)
     engine_args_dict["stage_connector_plan"] = stage_connector_plan
+    engine_args_dict["stage_input_num_replicas"] = max(1, int(stage_input_num_replicas))
 
     if stage_type == "diffusion":
         from vllm_omni.diffusion.data import parse_attention_config
@@ -862,7 +867,8 @@ def build_engine_args_dict(
 def build_vllm_config(
     stage_config: Any,
     model: str,
-    stage_connector_plan: Any | None = None,
+    stage_connector_plan: StageConnectorPlan | None = None,
+    stage_input_num_replicas: int = 1,
     engine_args_dict: dict[str, Any] | None = None,
     headless: bool = False,
 ) -> tuple[Any, type]:
@@ -876,6 +882,7 @@ def build_vllm_config(
             stage_config,
             model,
             stage_connector_plan=stage_connector_plan,
+            stage_input_num_replicas=stage_input_num_replicas,
         )
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
@@ -1177,7 +1184,7 @@ def get_stage_connector_plan(
     stage_id: int,
     *,
     async_chunk: bool = False,
-) -> Any:
+) -> StageConnectorPlan:
     """Return the typed :class:`StageConnectorPlan` for a stage worker."""
     from vllm_omni.distributed.omni_connectors import resolve_stage_connector_plan
 
@@ -1186,48 +1193,6 @@ def get_stage_connector_plan(
         stage_id,
         async_chunk=async_chunk,
     )
-
-
-def get_stage_connector_specs(
-    omni_transfer_config: Any,
-    stage_id: int,
-    *,
-    async_chunk: bool = False,
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Return ``(input_spec, output_spec)`` dicts for a stage worker.
-
-    Deprecated: prefer :func:`get_stage_connector_plan`. Kept for callers that
-    still consume the flat dict shape.
-    """
-    return get_stage_connector_plan(
-        omni_transfer_config,
-        stage_id,
-        async_chunk=async_chunk,
-    ).as_legacy_specs()
-
-
-def get_stage_connector_spec(
-    omni_transfer_config: Any,
-    stage_id: int,
-    async_chunk: bool,
-) -> dict[str, Any]:
-    """Return the legacy single connector spec for async-chunk callers."""
-    from vllm_omni.distributed.omni_connectors import get_stage_connector_config
-
-    stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
-    for cfg in stage_connectors_cfg.values():
-        return dict(cfg.get("spec", {}))
-
-    # An async producer may have no inbound edge. Keep its connector for
-    # save_async(), but mark it sender-only so the scheduler does not wait for
-    # a chunk from the orchestrator.
-    target_stage = str(stage_id)
-    for (from_stage, _to_stage), spec in getattr(omni_transfer_config, "connectors", {}).items():
-        if from_stage == target_stage:
-            extra = dict(spec.extra or {})
-            extra.setdefault("role", "sender")
-            return {"name": spec.name, "extra": extra}
-    return {}
 
 
 def build_diffusion_config(

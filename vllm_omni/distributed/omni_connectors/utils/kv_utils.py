@@ -146,8 +146,7 @@ def kv_zmq_port(
 
 def worker_rank_port_offset(local_rank: int | None = None, replica_id: int | None = None) -> int:
     """This worker's TP-rank + replica port delta, in isolation — for adding
-    to a stage-resolved base port at actual connector-construction time
-    (see ``OmniConnectorModelRunnerMixin._apply_worker_port_offset``)."""
+    to a stage-resolved base port during factory materialization."""
     rank = get_connector_local_rank() if local_rank is None else local_rank
     replica = get_omni_replica_id() if replica_id is None else max(int(replica_id), 0)
     return replica * KV_REPLICA_PORT_STRIDE + rank * KV_RANK_PORT_STRIDE

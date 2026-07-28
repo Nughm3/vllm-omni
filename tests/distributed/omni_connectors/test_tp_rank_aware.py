@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm_omni.distributed.omni_connectors.connectors.base import ConnectorCapabilities
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     KVCacheTransferData,
     OmniKVCacheConfig,
@@ -557,7 +558,7 @@ class TestSenderSideSlicing:
         sent_payloads = []
 
         class _Connector:
-            supports_raw_data = False
+            capabilities = ConnectorCapabilities()
 
             def put(self, from_stage, to_stage, put_key, data):
                 sent_payloads.append((put_key, KVCacheTransferData.from_bytes(data)))

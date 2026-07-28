@@ -84,23 +84,20 @@ def _make_request(
 class MixinHost(OmniConnectorModelRunnerMixin):
     """Minimal class that mixes in the mixin for testing.
 
-    Exposes a back-compat ``_omni_connector`` property: the mixin now holds
-    separate ``_recv_connector`` / ``_send_connector`` (one dual instance
-    for same-type stages, two for hybrid). Tests that inject a single mock via
-    ``host._omni_connector = mock`` still work — the setter points both
-    directions at it, and the getter returns the send connector (falling back
-    to recv), matching the old single-connector semantics.
+    Exposes a back-compat ``_omni_connector`` property for tests that inject a
+    single mock connector into the canonical ``StageConnectorSet``.
     """
 
     @property
     def _omni_connector(self):
-        send = getattr(self, "_send_connector", None)
-        return send if send is not None else getattr(self, "_recv_connector", None)
+        connectors = getattr(self, "_connectors", None)
+        return connectors.connector if connectors is not None else None
 
     @_omni_connector.setter
     def _omni_connector(self, connector):
-        self._recv_connector = connector
-        self._send_connector = connector
+        from vllm_omni.distributed.omni_connectors.stage_connector import StageConnectorSet
+
+        self._connectors = StageConnectorSet(receive=connector, send=connector)
 
 
 class _FakeTPGroup:
@@ -139,7 +136,7 @@ class TestMixinAsyncChunkSendRecv:
         seen = {}
 
         def mock_process(transfer_manager, pooling_output, request, is_finished=False):
-            seen["connector"] = transfer_manager.send_connector
+            seen["connector"] = transfer_manager.connector
             seen["is_finished"] = is_finished
             return {"data": pooling_output, "finished": is_finished}
 
@@ -395,7 +392,7 @@ class TestFullPayloadSendWithCustomFunc:
         seen = {}
 
         def full_payload_func(transfer_manager, pooling_output, request, is_finished=False):
-            seen["connector"] = transfer_manager.send_connector
+            seen["connector"] = transfer_manager.connector
             seen["is_finished"] = is_finished
             seen["data"] = pooling_output
             seen["rid"] = request.request_id if request else None
@@ -538,8 +535,24 @@ class TestChunkStreamCompletedGuard:
 
         host.register_chunk_recv(_make_request("req-1", sender_info=sender_info))
 
-        assert host._sender_info["req-1"] == sender_info
+        endpoint = host._sender_info["req-1"]
+        assert endpoint.host == sender_info["host"]
+        assert endpoint.zmq_port == sender_info["zmq_port"]
         host.shutdown_omni_connectors()
+
+    def test_multi_replica_missing_sender_info_fails_fast(self):
+        host = MixinHost()
+        host._stage_input_num_replicas = 2
+        connector = MockConnector()
+
+        with pytest.raises(RuntimeError, match="Missing request-specific sender endpoint"):
+            host._recv_ordinary_stage_result(
+                connector,
+                from_stage="0",
+                to_stage="1",
+                connector_get_key="req-1_0_0",
+                sender_info=None,
+            )
 
     @pytest.mark.parametrize(
         ("sender_info", "expected_metadata"),
@@ -1221,10 +1234,15 @@ class TestAsyncPayloadLifecycle:
 
 class TestRankAwareKVRouting:
     def _make_host(self, *, from_tp: int, to_tp: int, local_rank: int) -> MixinHost:
+        from vllm_omni.distributed.omni_connectors.utils.kv_utils import KVTPTopology
+
         host = MixinHost()
         host.init_omni_connectors(model_config=_make_model_config(stage_id=1))
         # Both directions share the same topology here; these tests exercise
         # recv-side and send-side routing independently, not asymmetric TP.
+        topology = KVTPTopology(source_tp_size=from_tp, target_tp_size=to_tp, local_rank=local_rank)
+        host._recv_topology = topology
+        host._send_topology = topology
         host._recv_from_tp = from_tp
         host._recv_to_tp = to_tp
         host._send_from_tp = from_tp
@@ -1345,8 +1363,8 @@ class TestRankMappingResolutionFromConnectorConfig:
         # One instance built, shared by both directions, with role="dual".
         assert len(built) == 1
         assert built[0].extra.get("role") == "dual"
-        assert host._recv_connector is host._send_connector
-        assert host._recv_connector is not None
+        assert host._connectors.receive is host._connectors.send
+        assert host._connectors.receive is not None
 
         host.shutdown_omni_connectors()
 
@@ -1372,9 +1390,9 @@ class TestRankMappingResolutionFromConnectorConfig:
         ):
             host.init_omni_connectors(model_config=model_config)
 
-        assert host._recv_connector is not None
-        assert host._send_connector is not None
-        assert host._recv_connector is not host._send_connector
+        assert host._connectors.receive is not None
+        assert host._connectors.send is not None
+        assert host._connectors.receive is not host._connectors.send
 
         host.shutdown_omni_connectors()
 
@@ -1404,45 +1422,11 @@ class TestRankMappingResolutionFromConnectorConfig:
 
 
 class TestWorkerPortOffset:
-    """The per-worker TP-rank/replica port offset must be applied at actual
-    connector-construction time inside the worker process (mixin), not at
-    config-build time (initialization.py) — see the P1 fix for co-located
-    TP ranks / replicas colliding on the same baked-in port."""
-
-    def test_non_transfer_engine_connector_untouched(self):
-        extra = {"some": "config"}
-        with patch(
-            "vllm_omni.worker.omni_connector_model_runner_mixin.worker_rank_port_offset",
-            return_value=16,
-        ):
-            result = OmniConnectorModelRunnerMixin._apply_worker_port_offset("SharedMemoryConnector", extra)
-        assert result is extra
-
-    def test_nonzero_offset_shifts_both_ports_without_mutating_input(self):
-        extra = {"zmq_port": 50052, "sender_zmq_port": 50051}
-        with patch(
-            "vllm_omni.worker.omni_connector_model_runner_mixin.worker_rank_port_offset",
-            return_value=1040,  # e.g. replica 1 (1024) + rank 1 (16)
-        ):
-            result = OmniConnectorModelRunnerMixin._apply_worker_port_offset("MooncakeTransferEngineConnector", extra)
-        assert result == {"zmq_port": 51092, "sender_zmq_port": 51091}
-        # Original spec dict (shared across workers) must be left untouched.
-        assert extra == {"zmq_port": 50052, "sender_zmq_port": 50051}
-
-    def test_missing_sender_zmq_port_is_not_added(self):
-        """Stage 0 / sender-only specs have no sender_zmq_port key at all —
-        the offset must not introduce one where there wasn't one."""
-        extra = {"zmq_port": 50052}
-        with patch(
-            "vllm_omni.worker.omni_connector_model_runner_mixin.worker_rank_port_offset",
-            return_value=16,
-        ):
-            result = OmniConnectorModelRunnerMixin._apply_worker_port_offset("MooncakeTransferEngineConnector", extra)
-        assert result == {"zmq_port": 50068}
+    """The mixin supplies process-local rank/replica context to the factory."""
 
     def test_distinct_tp_ranks_resolve_to_distinct_listen_ports(self):
         """End-to-end through init_omni_connectors: two 'workers' (different
-        worker_rank_port_offset values, simulating different TP ranks) must
+        TP rank values) must
         build connectors with different zmq_port — the actual collision this
         fix prevents."""
         model_config = _make_model_config(stage_id=0)
@@ -1458,12 +1442,21 @@ class TestWorkerPortOffset:
             seen_ports.append(spec.extra["zmq_port"])
             return MockConnector()
 
-        for offset in (0, 16):
+        for rank in (0, 1):
             host = MixinHost()
             with (
+                patch.object(
+                    host,
+                    "_get_local_tp_group",
+                    return_value=SimpleNamespace(world_size=2),
+                ),
                 patch(
-                    "vllm_omni.worker.omni_connector_model_runner_mixin.worker_rank_port_offset",
-                    return_value=offset,
+                    "vllm_omni.worker.omni_connector_model_runner_mixin.get_local_tp_rank",
+                    return_value=rank,
+                ),
+                patch(
+                    "vllm_omni.worker.omni_connector_model_runner_mixin.get_omni_replica_id",
+                    return_value=0,
                 ),
                 patch(
                     "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
@@ -1490,10 +1483,8 @@ class TestWorkerPortOffset:
         """
         from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, OmniTransferConfig
         from vllm_omni.distributed.omni_connectors.utils.initialization import (
-            get_connectors_config_for_stage,
-            resolve_stage_connector_specs,
+            resolve_stage_connector_plan,
         )
-        from vllm_omni.distributed.omni_connectors.utils.kv_utils import KV_REPLICA_PORT_STRIDE
 
         transfer_config = OmniTransferConfig(
             connectors={
@@ -1512,15 +1503,13 @@ class TestWorkerPortOffset:
         # Config-build time: resolved once per stage, replica/rank-agnostic —
         # exactly what the orchestrator computes before any replica or TP
         # worker process exists (see initialization.py's port-timing fix).
-        stage_specs = {
-            stage_id: resolve_stage_connector_specs(get_connectors_config_for_stage(transfer_config, stage_id))
-            for stage_id in replicas_per_stage
+        stage_plans = {
+            stage_id: resolve_stage_connector_plan(transfer_config, stage_id) for stage_id in replicas_per_stage
         }
 
         listen_ports: list[tuple[int, int, int]] = []  # (stage_id, replica_id, zmq_port)
 
         for stage_id, num_replicas in replicas_per_stage.items():
-            recv_spec, send_spec = stage_specs[stage_id]
             for replica_id in range(num_replicas):
                 captured: list[Any] = []
 
@@ -1529,14 +1518,17 @@ class TestWorkerPortOffset:
                     return MockConnector()
 
                 model_config = _make_model_config(stage_id=stage_id)
-                model_config.stage_input_connector_config = recv_spec
-                model_config.stage_output_connector_config = send_spec
+                model_config.stage_connector_plan = stage_plans[stage_id]
 
                 host = MixinHost()
                 with (
                     patch(
-                        "vllm_omni.worker.omni_connector_model_runner_mixin.worker_rank_port_offset",
-                        return_value=replica_id * KV_REPLICA_PORT_STRIDE,  # local_rank=0 (TP=1)
+                        "vllm_omni.worker.omni_connector_model_runner_mixin.get_local_tp_rank",
+                        return_value=0,
+                    ),
+                    patch(
+                        "vllm_omni.worker.omni_connector_model_runner_mixin.get_omni_replica_id",
+                        return_value=replica_id,
                     ),
                     patch(
                         "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",

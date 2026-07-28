@@ -532,7 +532,9 @@ def _make_full_payload_accumulation_runner(
     runner._custom_process_func = object()
     runner._pending_full_payload_send = {}
     runner._stage_id = 1
-    runner._send_connector = object()
+    from vllm_omni.distributed.omni_connectors.stage_connector import StageConnectorSet
+
+    runner._connectors = StageConnectorSet(receive=None, send=object())
     return runner
 
 

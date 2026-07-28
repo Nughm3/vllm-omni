@@ -716,7 +716,7 @@ class OmniKVTransferManager:
 
     def _serialize_transfer_payload(self, kv_data: KVCacheTransferData) -> torch.Tensor | bytes | dict[str, Any]:
         """Serialize KV transfer data using the connector's fastest supported path."""
-        if getattr(self.connector, "supports_raw_data", False):
+        if self.connector.capabilities.supports_raw_data:
             try:
                 return kv_data.to_gpu_tensor()
             except Exception:

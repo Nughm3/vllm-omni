@@ -19,27 +19,50 @@ TRANSFER_ENGINE_CONNECTOR_NAMES = frozenset(
 
 def get_stage_connector_role(model_config: Any) -> str | None:
     """Return the configured stage connector direction, if explicit."""
-    connector_config = getattr(model_config, "stage_input_connector_config", None)
-    if isinstance(connector_config, dict):
-        extra = connector_config.get("extra")
-    else:
-        extra = getattr(connector_config, "extra", None)
-    if isinstance(extra, dict):
-        role = extra.get("role")
-        return role if isinstance(role, str) else None
+    plan = getattr(model_config, "stage_connector_plan", None)
+    inbound = bool(getattr(plan, "inbound", ()))
+    outbound = bool(getattr(plan, "outbound", ()))
+    if getattr(plan, "uses_legacy_default", False) or (inbound and outbound):
+        return "dual"
+    if inbound:
+        return "receiver"
+    if outbound:
+        return "sender"
+
+    def _role(attr: str) -> str | None:
+        connector_config = getattr(model_config, attr, None)
+        if connector_config is None:
+            return None
+        if isinstance(connector_config, dict):
+            extra = connector_config.get("extra")
+        else:
+            extra = getattr(connector_config, "extra", None)
+        if isinstance(extra, dict):
+            role = extra.get("role")
+            return role if isinstance(role, str) else None
+        return None
+
+    input_role = _role("stage_input_connector_config")
+    output_role = _role("stage_output_connector_config")
+    if input_role is not None and output_role is not None:
+        return "dual"
+    if output_role is not None:
+        return output_role
+    if input_role is not None:
+        return input_role
     return None
 
 
 def stage_receives_chunks(model_config: Any) -> bool:
     """Whether connector chunks, rather than the orchestrator, feed a stage."""
-    return get_stage_connector_role(model_config) != "sender"
+    return get_stage_connector_role(model_config) in {None, "receiver", "dual"}
 
 
 def stage_sends_async_output(model_config: Any) -> bool:
     """Whether async output should be partitioned for connector transport."""
     role = get_stage_connector_role(model_config)
     if role is not None:
-        return role == "sender"
+        return role in {"sender", "dual"}
     # Preserve legacy partitioning while keeping stage-0 orchestrator bridges
     # on the normal RequestOutput path.
     return getattr(model_config, "stage_id", None) != 0

@@ -18,7 +18,7 @@ import zmq
 from ..utils.logging import get_connector_logger
 from ..utils.memory_pool import BufferAllocator, ManagedBuffer
 from ..utils.serialization import OmniSerializer
-from .base import OmniConnectorBase
+from .base import ConnectorCapabilities, OmniConnectorBase
 
 logger = get_connector_logger(__name__)
 
@@ -98,7 +98,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
     # RDMA connector copies raw bytes/tensor directly to the memory pool
     # without going through OmniSerializer, so the sender can use
     # to_gpu_tensor() / to_bytes() fast-paths.
-    supports_raw_data: bool = True
+    # Its backend pool supports one dual instance, and its synchronization
+    # permits concurrent receive/send worker threads.
+    capabilities = ConnectorCapabilities(supports_raw_data=True, supports_shared_dual=True, thread_safe_dual=True)
 
     def __init__(self, config: dict[str, Any]):
         if TransferEngine is None:

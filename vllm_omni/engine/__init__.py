@@ -2,6 +2,9 @@
 Engine components for vLLM-Omni.
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from typing import Any
 
 import msgspec
@@ -11,6 +14,21 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreRequest,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectorEndpoint:
+    host: str
+    zmq_port: int
+
+    def __post_init__(self) -> None:
+        if not self.host:
+            raise ValueError("Connector endpoint host must not be empty")
+        if not 0 < self.zmq_port <= 65535:
+            raise ValueError(f"Connector endpoint port must be in 1..65535, got {self.zmq_port}")
+
+    def as_metadata(self) -> dict[str, str | int]:
+        return {"source_host": self.host, "source_port": self.zmq_port}
 
 
 class PromptEmbedsPayload(msgspec.Struct):
@@ -81,7 +99,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     model_intermediate_buffer: dict[str, Any] | None = None
 
     # Per-request endpoint for the upstream stage-transfer producer.
-    sender_info: dict[str, Any] | None = None
+    sender_info: ConnectorEndpoint | None = None
 
     @classmethod
     def from_request(
@@ -91,8 +109,8 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         prompt_embeds: torch.Tensor | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict[str, Any] | None = None,
-        sender_info: dict[str, Any] | None = None,
-    ) -> "OmniEngineCoreRequest":
+        sender_info: ConnectorEndpoint | None = None,
+    ) -> OmniEngineCoreRequest:
         """Clone an EngineCoreRequest into an OmniEngineCoreRequest with optional payload overrides."""
 
         if prompt_embeds is None:

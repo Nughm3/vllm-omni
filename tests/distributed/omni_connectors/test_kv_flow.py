@@ -6,6 +6,7 @@ import torch
 
 import vllm_omni.distributed.omni_connectors.kv_transfer_manager as kv_transfer_manager_module
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.distributed.omni_connectors.connectors.base import ConnectorCapabilities
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     KVCacheTransferData,
     OmniKVCacheConfig,
@@ -18,6 +19,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.cache]
 
 
 class MockConnector:
+    capabilities = ConnectorCapabilities()
+
     def __init__(self):
         self.store = {}
 

@@ -19,8 +19,6 @@ class OmniTransferAdapterBase:
 
     def __init__(self, config: Any):
         self.config = config
-        if not hasattr(self, "connector"):
-            self.connector = None
         # Requests that are waiting to be polled
         self._pending_load_reqs = deque()
         # Requests that have successfully retrieved data
@@ -41,10 +39,6 @@ class OmniTransferAdapterBase:
 
         self.save_thread = threading.Thread(target=self.save_loop, daemon=True)
         self.save_thread.start()
-
-    @classmethod
-    def create_connector(cls, model_config: Any):
-        raise NotImplementedError
 
     def recv_loop(self):
         """Loop to poll for incoming data.
@@ -133,8 +127,6 @@ class OmniTransferAdapterBase:
             self._recv_cond.notify_all()
         with self._save_cond:
             self._save_cond.notify_all()
-        if self.connector is not None:
-            try:
-                self.connector.close()
-            except Exception:
-                pass
+        connectors = getattr(self, "_connectors", None)
+        if connectors is not None:
+            connectors.close()

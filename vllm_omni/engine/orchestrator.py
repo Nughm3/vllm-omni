@@ -30,7 +30,7 @@ from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
-from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine import ConnectorEndpoint, OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
@@ -2205,7 +2205,7 @@ class Orchestrator:
         self,
         sender_stage_id: int,
         request_id: str,
-    ) -> dict[str, Any] | None:
+    ) -> ConnectorEndpoint | None:
         """Resolve the stage-transfer endpoint of the request's bound producer."""
         if sender_stage_id < 0 or sender_stage_id >= len(self.stage_pools):
             return None
@@ -2218,9 +2218,17 @@ class Orchestrator:
         if not callable(get_sender_info):
             return None
         sender_info = get_sender_info()
-        if not sender_info:
+        if isinstance(sender_info, dict):
+            try:
+                sender_info = ConnectorEndpoint(
+                    host=str(sender_info["host"]),
+                    zmq_port=int(sender_info["zmq_port"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                sender_info = None
+        if not isinstance(sender_info, ConnectorEndpoint):
             logger.warning(
-                "[Orchestrator] Stage-%s has no chunk sender info available",
+                "[Orchestrator] Stage-%s has no valid chunk sender endpoint available",
                 sender_stage_id,
             )
             return None

@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.distributed.omni_connectors.connectors.base import ConnectorCapabilities
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVCacheConfig,
     OmniKVTransferManager,
@@ -25,6 +26,8 @@ _SENDER_INFO = {"host": "127.0.0.1", "zmq_port": 50051}
 
 
 class MockConnector:
+    capabilities = ConnectorCapabilities()
+
     def __init__(self):
         self.store = {}
         self.get_calls = []

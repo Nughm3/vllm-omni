@@ -40,7 +40,7 @@ import zmq
 from ..utils.logging import get_connector_logger
 from ..utils.memory_pool import BufferAllocator, ManagedBuffer
 from ..utils.serialization import OmniSerializer
-from .base import OmniConnectorBase
+from .base import ConnectorCapabilities, OmniConnectorBase
 
 logger = get_connector_logger(__name__)
 
@@ -114,7 +114,9 @@ class MoriTransferEngineConnector(OmniConnectorBase):
     ``MooncakeTransferEngineConnector``).
     """
 
-    supports_raw_data: bool = True
+    # Mori transfers raw tensor storage through its RDMA engine. Its shared
+    # backend state supports dual-role reuse and concurrent get/put threads.
+    capabilities = ConnectorCapabilities(supports_raw_data=True, supports_shared_dual=True, thread_safe_dual=True)
 
     # ------------------------------------------------------------------ init
     def __init__(self, config: dict[str, Any]):
@@ -154,12 +156,8 @@ class MoriTransferEngineConnector(OmniConnectorBase):
 
         self.config = config
 
-        # Stage id is read by OmniChunkTransferAdapter (process_pending_chunks /
-        # _send_single_request / _poll_single_request / ...) to decide whether
-        # this connector sits at the sender or receiver end of a stage pair.
-        # Kept parallel to ``SharedMemoryConnector`` and other OmniConnector
-        # implementations. Populated by ``build_stage_connectors`` via the
-        # ``stage_id`` key that ``get_connectors_config_for_stage`` injects.
+        # Kept parallel to other connectors for diagnostics and connector-local
+        # key construction. The factory injects the owning stage id.
         self.stage_id = config.get("stage_id", -1)
 
         # ---- Host / ZMQ ----

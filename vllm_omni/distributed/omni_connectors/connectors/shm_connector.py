@@ -9,7 +9,7 @@ from typing import Any
 from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
 
 from ..utils.logging import get_connector_logger
-from .base import OmniConnectorBase
+from .base import ConnectorCapabilities, OmniConnectorBase
 
 logger = get_connector_logger(__name__)
 
@@ -23,6 +23,11 @@ class SharedMemoryConnector(OmniConnectorBase):
     (that is the RDMA connector's job).  When such metadata is passed in,
     the connector silently falls back to key-based lookup.
     """
+
+    # POSIX shared-memory keys are direction-neutral, and the connector's
+    # bookkeeping is safe for concurrent receive/send adapter threads.
+    # Payloads still use OmniSerializer, so supports_raw_data remains false.
+    capabilities = ConnectorCapabilities(supports_shared_dual=True, thread_safe_dual=True)
 
     def __init__(self, config: dict[str, Any]):
         self.config = config

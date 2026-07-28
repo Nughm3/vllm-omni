@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from .connectors.base import OmniConnectorBase
+from vllm_omni.engine import ConnectorEndpoint
+
+from .connectors.base import ConnectorCapabilities, OmniConnectorBase
 from .connectors.mooncake_store_connector import MooncakeStoreConnector
 from .connectors.shm_connector import SharedMemoryConnector
 from .connectors.yuanrong_connector import YuanrongConnector
+from .stage_connector import ConnectorRuntimeContext, StageConnectorSet
 
 try:
     from vllm_omni.platforms.npu.omni_connectors.yuanrong_transfer_engine_connector import (
@@ -51,6 +54,11 @@ __all__ = [
     "ResolvedConnectorSpec",
     "StageConnectorPlan",
     "resolve_stage_connector_plan",
+    "ConnectorEndpoint",
+    # Construction / runtime
+    "ConnectorCapabilities",
+    "ConnectorRuntimeContext",
+    "StageConnectorSet",
     # Base classes and implementations
     "OmniConnectorBase",
     # Factory

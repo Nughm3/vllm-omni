@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 from vllm import SamplingParams
 
+from vllm_omni.engine import ConnectorEndpoint
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
@@ -69,7 +70,7 @@ def test_build_chunk_sender_info_uses_bound_replica():
 
     sender_info = orchestrator._build_chunk_sender_info(0, "req-on-replica-1")
 
-    assert sender_info == {"host": "10.0.0.2", "zmq_port": 50251}
+    assert sender_info == ConnectorEndpoint(host="10.0.0.2", zmq_port=50251)
 
 
 def test_stage_engine_core_client_builds_kv_sender_info_from_tcp_address():
@@ -103,10 +104,7 @@ def test_stage_engine_core_client_builds_chunk_sender_info_for_actual_replica():
         )
     )
 
-    assert client.get_chunk_sender_info() == {
-        "host": "10.20.30.40",
-        "zmq_port": 51076,
-    }
+    assert client.get_chunk_sender_info() == ConnectorEndpoint(host="10.20.30.40", zmq_port=51076)
 
 
 def test_stage_engine_core_client_falls_back_to_detected_ip_for_loopback(monkeypatch):

@@ -13,7 +13,7 @@ import msgspec
 import torch
 import zmq
 
-from vllm_omni.distributed.omni_connectors.connectors.base import OmniConnectorBase
+from vllm_omni.distributed.omni_connectors.connectors.base import ConnectorCapabilities, OmniConnectorBase
 from vllm_omni.distributed.omni_connectors.utils.env import (
     AUTO_DEVICE_VALUES,
     AUTO_HOST_VALUES,
@@ -88,7 +88,9 @@ def _resolve_pool_device(configured_device: Any) -> str:
 class YuanrongTransferEngineConnector(OmniConnectorBase):
     """Pull-based connector backed by Yuanrong transfer_engine."""
 
-    supports_raw_data: bool = True
+    # Yuanrong moves raw tensor storage through its transfer engine. Its
+    # synchronized backend state supports dual-role reuse across I/O threads.
+    capabilities = ConnectorCapabilities(supports_raw_data=True, supports_shared_dual=True, thread_safe_dual=True)
 
     def __init__(self, config: dict[str, Any]):
         if TransferEngine is None:

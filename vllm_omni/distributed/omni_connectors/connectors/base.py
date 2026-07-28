@@ -2,20 +2,83 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, ClassVar
 
 from ..utils.logging import get_connector_logger
 
 logger = get_connector_logger(__name__)
 
 
-class OmniConnectorBase(ABC):
-    """Base class for all OmniConnectors."""
+@dataclass(frozen=True, slots=True)
+class ConnectorCapabilities:
+    """Capability flags consulted by dual-collapse / materialization."""
 
     # Whether the connector can handle raw bytes/torch.Tensor natively
     # without going through OmniSerializer.  Connectors that copy raw
     # payloads directly (e.g. RDMA) should override this to True.
     supports_raw_data: bool = False
+
+    # Whether one physical connector instance can safely serve the inbound
+    # receiver edge and outbound sender edge of a middle stage.
+    supports_shared_dual: bool = False
+
+    # Whether concurrent get/put calls from independent receive/send threads
+    # are safe when the connector is materialized as one shared dual instance.
+    thread_safe_dual: bool = False
+
+
+class OmniConnectorBase(ABC):
+    """Base class for all OmniConnectors."""
+
+    # Conservative defaults: serialized payloads, separate directional
+    # instances, and no assumption that concurrent get/put is safe.
+    capabilities: ClassVar[ConnectorCapabilities] = ConnectorCapabilities()
+
+    # Fields that legitimately differ per edge/direction — excluded when
+    # checking whether two same-type edges describe a compatible backend.
+    _DIRECTIONAL_EXTRA_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "zmq_port",
+            "sender_host",
+            "sender_zmq_port",
+            "role",
+            "rank_mapping",
+            "from_stage",
+            "to_stage",
+            "stage_id",
+        }
+    )
+
+    @classmethod
+    def can_share(cls, recv_extra: dict[str, Any], send_extra: dict[str, Any]) -> bool:
+        """Whether inbound/outbound extras describe one shareable backend.
+
+        Same connector name is not enough: two edges can use the same class
+        against different backends (distinct metadata servers, hosts,
+        protocols, devices). Only non-directional keys must match.
+        """
+        shared_keys = (set(recv_extra) | set(send_extra)) - cls._DIRECTIONAL_EXTRA_KEYS
+        return all(recv_extra.get(key) == send_extra.get(key) for key in shared_keys)
+
+    @classmethod
+    def merge_duplex_specs(cls, recv_extra: dict[str, Any], send_extra: dict[str, Any]) -> dict[str, Any]:
+        """Merge inbound + outbound extras into one ``role="dual"`` config.
+
+        Shared backend knobs come from the outbound extra; direction-specific
+        fields are taken from the edge that owns them: the outbound listen
+        ``zmq_port`` and the inbound upstream ``sender_host`` /
+        ``sender_zmq_port``.
+        """
+        merged = dict(recv_extra)
+        merged.update(send_extra)  # outbound wins on shared knobs
+        merged["role"] = "dual"
+        if "zmq_port" in send_extra:
+            merged["zmq_port"] = send_extra["zmq_port"]
+        for key in ("sender_host", "sender_zmq_port"):
+            if recv_extra.get(key) is not None:
+                merged[key] = recv_extra[key]
+        return merged
 
     @abstractmethod
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:

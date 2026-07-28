@@ -1,5 +1,8 @@
+from __future__ import annotations
+
+import warnings
 from dataclasses import MISSING, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ConfigDict, TypeAdapter
 from vllm.config import ModelConfig
@@ -14,6 +17,11 @@ from vllm.transformers_utils.model_arch_config_convertor import (
 )
 
 import vllm_omni.model_executor.models as me_models
+
+if TYPE_CHECKING:
+    from vllm_omni.distributed.omni_connectors.utils.initialization import StageConnectorPlan
+else:
+    StageConnectorPlan = Any
 
 logger = init_logger(__name__)
 
@@ -135,7 +143,8 @@ class OmniModelConfig(ModelConfig):
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
-    stage_connector_plan: Any | None = None
+    stage_connector_plan: StageConnectorPlan | None = None
+    stage_input_num_replicas: int = 1
     stage_input_connector_config: dict[str, Any] | None = field(
         default_factory=lambda: {
             "name": "SharedMemoryConnector",
@@ -153,6 +162,24 @@ class OmniModelConfig(ModelConfig):
     @property
     def registry(self):
         return me_models.OmniModelRegistry
+
+    @property
+    def stage_connector_config(self) -> dict[str, Any] | None:
+        warnings.warn(
+            "stage_connector_config is deprecated; use stage_input_connector_config",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.stage_input_connector_config
+
+    @stage_connector_config.setter
+    def stage_connector_config(self, value: dict[str, Any] | None) -> None:
+        warnings.warn(
+            "stage_connector_config is deprecated; use stage_input_connector_config",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.stage_input_connector_config = value
 
     @property
     def architectures(self) -> list[str]:

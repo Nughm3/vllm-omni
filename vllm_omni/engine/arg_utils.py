@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import tempfile
 from dataclasses import dataclass, fields
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
@@ -12,6 +14,9 @@ from vllm_omni.config import OmniModelConfig
 from vllm_omni.outputs.output_modality import OutputModality
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.plugins import load_omni_general_plugins
+
+if TYPE_CHECKING:
+    from vllm_omni.distributed.omni_connectors.utils.initialization import StageConnectorPlan
 
 logger = init_logger(__name__)
 
@@ -156,7 +161,8 @@ class OmniEngineArgs(EngineArgs):
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
-    stage_connector_plan: Any | None = None
+    stage_connector_plan: StageConnectorPlan | None = None
+    stage_input_num_replicas: int = 1
     subtalker_sampling_params: dict[str, Any] | None = None
     async_chunk: bool = False
     retains_state_across_chunks: bool = False
@@ -255,7 +261,6 @@ class OmniEngineArgs(EngineArgs):
         plan = self.stage_connector_plan
         if plan is None:
             plan = StageConnectorPlan(uses_legacy_default=True)
-        plan = plan.with_stage_id(self.stage_id)
         stage_input_connector_config, stage_output_connector_config = plan.to_model_connector_configs(self.stage_id)
 
         # If model_arch is specified, inject it into hf_overrides so vLLM can
@@ -352,6 +357,7 @@ class OmniEngineArgs(EngineArgs):
             hf_config_name=self.hf_config_name,
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
             stage_connector_plan=plan,
+            stage_input_num_replicas=self.stage_input_num_replicas,
             stage_input_connector_config=stage_input_connector_config,
             stage_output_connector_config=stage_output_connector_config,
             subtalker_sampling_params=self.subtalker_sampling_params,

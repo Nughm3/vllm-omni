@@ -1,6 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -11,7 +11,12 @@ from vllm.v1.request import Request
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
-from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
+from vllm_omni.engine import (
+    AdditionalInformationPayload,
+    ConnectorEndpoint,
+    OmniEngineCoreRequest,
+    PromptEmbedsPayload,
+)
 
 
 class OmniRequest(Request):
@@ -34,7 +39,7 @@ class OmniRequest(Request):
         prompt_embeds: PromptEmbedsPayload | torch.Tensor | None = None,
         # Optional external request ID for tracking
         external_req_id: str | None = None,
-        sender_info: dict[str, Any] | None = None,
+        sender_info: ConnectorEndpoint | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict | None = None,
         **kwargs,
@@ -48,7 +53,7 @@ class OmniRequest(Request):
         )
         # Optional external request ID for tracking
         self.external_req_id: str | None = external_req_id
-        self.sender_info: dict[str, Any] | None = sender_info
+        self.sender_info: ConnectorEndpoint | None = sender_info
         # Serialized additional information payload (optional)
         self.additional_information: AdditionalInformationPayload | None = additional_information
         # Runner-owned runtime payload.

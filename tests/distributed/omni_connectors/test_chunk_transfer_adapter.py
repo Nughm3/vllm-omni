@@ -20,6 +20,8 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTran
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
+from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, OmniTransferConfig
+from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_stage_connector_plan
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -130,9 +132,26 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             lambda _plan, _context: StageConnectorSet(receive=connector, send=connector),
         )
 
+        role = (connector_extra or {}).get("role")
+        edges = {}
+        if role != "receiver":
+            edges[(str(stage_id), str(stage_id + 1))] = ConnectorSpec(
+                name="SharedMemoryConnector",
+                extra=connector_extra or {},
+            )
+        if stage_id > 0 and role != "sender":
+            edges[(str(stage_id - 1), str(stage_id))] = ConnectorSpec(
+                name="SharedMemoryConnector",
+                extra=connector_extra or {},
+            )
         model_config = SimpleNamespace(
             stage_id=stage_id,
             async_chunk=True,
+            stage_connector_plan=resolve_stage_connector_plan(
+                OmniTransferConfig(connectors=edges),
+                stage_id,
+                async_chunk=True,
+            ),
             worker_type=model_mode,
             max_num_seqs=max_num_seqs,
             active_stream_window=active_stream_window,
@@ -151,8 +170,6 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
 
 
 def test_typed_plan_materializes_directional_connector_set(monkeypatch):
-    from vllm_omni.distributed.omni_connectors.utils.initialization import StageConnectorPlan
-
     receive = mocker_receive = SimpleNamespace(stage_id=1, close=lambda: None)
     send = mocker_send = SimpleNamespace(stage_id=1, close=lambda: None)
     connector_set = StageConnectorSet(receive=receive, send=send)
@@ -165,9 +182,18 @@ def test_typed_plan_materializes_directional_connector_set(monkeypatch):
 
     monkeypatch.setattr(OmniConnectorFactory, "create_stage_connectors", _materialize)
     monkeypatch.setattr(OmniTransferAdapterBase, "__init__", lambda self, config: setattr(self, "config", config))
-    plan = StageConnectorPlan()
+    plan = resolve_stage_connector_plan(
+        OmniTransferConfig(
+            connectors={
+                ("3", "7"): ConnectorSpec(name="SharedMemoryConnector"),
+                ("7", "11"): ConnectorSpec(name="SharedMemoryConnector"),
+            }
+        ),
+        stage_id=7,
+        async_chunk=True,
+    )
     model_config = SimpleNamespace(
-        stage_id=1,
+        stage_id=7,
         stage_connector_plan=plan,
         worker_type="ar",
         max_num_seqs=2,
@@ -182,6 +208,25 @@ def test_typed_plan_materializes_directional_connector_set(monkeypatch):
     assert adapter.connector is mocker_send
     assert captured["plan"] is plan
     assert captured["context"].tp_rank is None
+    assert adapter._previous_stage_id == 3
+    assert adapter._next_stage_id == 11
+
+
+@pytest.mark.parametrize(
+    ("has_receive", "has_send"),
+    [(True, False), (False, True)],
+)
+def test_adapter_base_starts_only_owned_direction_thread(mocker, has_receive, has_send):
+    receive = mocker.MagicMock() if has_receive else None
+    send = mocker.MagicMock() if has_send else None
+
+    adapter = object.__new__(OmniTransferAdapterBase)
+    adapter._connectors = StageConnectorSet(receive=receive, send=send)
+    OmniTransferAdapterBase.__init__(adapter, config={})
+
+    assert (adapter.recv_thread is not None) is has_receive
+    assert (adapter.save_thread is not None) is has_send
+    adapter.shutdown()
 
 
 def test_load_poll(build_adapter):

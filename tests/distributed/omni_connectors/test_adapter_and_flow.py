@@ -296,6 +296,11 @@ def test_resolve_stage_connector_plan_preserves_edges_and_owner_scope():
     # Stage-level base ports only (no TP/replica offset).
     assert recv.spec.extra["sender_zmq_port"] == 50051
     assert send.spec.name == "SharedMemoryConnector"
+    input_config, output_config = plan.to_model_connector_configs(stage_id=1)
+    assert input_config["extra"]["from_stage"] == 0
+    assert input_config["extra"]["to_stage"] == 1
+    assert output_config["extra"]["from_stage"] == 1
+    assert output_config["extra"]["to_stage"] == 2
 
     cta_plan = resolve_stage_connector_plan(config, stage_id=1, async_chunk=True)
     assert cta_plan.input_spec is not None
@@ -351,6 +356,25 @@ def test_resolve_stage_connector_plan_preserves_tp_topology_template():
     assert topology.source_tp_size == 4
     assert topology.target_tp_size == 2
     assert topology.local_rank == 0
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"extra": {}},
+        {"name": "SharedMemoryConnector", "extra": []},
+    ],
+)
+def test_legacy_model_connector_config_validation(config):
+    from types import SimpleNamespace
+
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        stage_connector_plan_from_model_config,
+    )
+
+    model_config = SimpleNamespace(stage_id=1, stage_input_connector_config=config)
+    with pytest.raises((TypeError, ValueError), match="Invalid"):
+        stage_connector_plan_from_model_config(model_config)
 
 
 def test_recv_with_missing_metadata(mocker: MockerFixture):

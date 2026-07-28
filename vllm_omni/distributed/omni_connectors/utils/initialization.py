@@ -103,6 +103,8 @@ class StageConnectorPlan:
                 return None
             extra = dict(resolved.spec.extra)
             extra["stage_id"] = stage_id
+            extra["from_stage"] = resolved.edge.from_stage
+            extra["to_stage"] = resolved.edge.to_stage
             return {"name": resolved.spec.name, "extra": extra}
 
         return _flat(self.input_spec), _flat(self.output_spec)
@@ -154,12 +156,16 @@ def stage_connector_plan_from_model_config(
             return None
         if isinstance(raw, dict):
             name = raw.get("name")
-            extra = raw.get("extra") or {}
+            extra = raw.get("extra")
         else:
             name = getattr(raw, "name", None)
-            extra = getattr(raw, "extra", {}) or {}
+            extra = getattr(raw, "extra", None)
+        if extra is None:
+            extra = {}
         if not isinstance(name, str) or not name:
-            return None
+            raise ValueError(f"Invalid {attr}: missing connector name")
+        if not isinstance(extra, dict):
+            raise TypeError(f"Invalid extra config for connector {name}: expected dict, got {type(extra).__name__}")
         return ConnectorSpec(name=name, extra=dict(extra))
 
     input_connector = _config("stage_input_connector_config")

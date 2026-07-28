@@ -7,6 +7,9 @@ from dataclasses import dataclass
 
 from .connectors.base import OmniConnectorBase
 from .utils.initialization import ConnectorOwnerScope
+from .utils.logging import get_connector_logger
+
+logger = get_connector_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,4 +65,4 @@ class StageConnectorSet:
             try:
                 conn.close()
             except Exception:
-                pass
+                logger.warning("Failed to close connector %s", type(conn).__name__, exc_info=True)

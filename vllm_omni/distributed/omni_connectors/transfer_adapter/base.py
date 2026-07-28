@@ -34,11 +34,16 @@ class OmniTransferAdapterBase:
         self._recv_cond = threading.Condition()
         self._save_cond = threading.Condition()
 
-        self.recv_thread = threading.Thread(target=self.recv_loop, daemon=True)
-        self.recv_thread.start()
+        connectors = getattr(self, "_connectors", None)
+        self.recv_thread: threading.Thread | None = None
+        if connectors is not None and connectors.receive is not None:
+            self.recv_thread = threading.Thread(target=self.recv_loop, daemon=True)
+            self.recv_thread.start()
 
-        self.save_thread = threading.Thread(target=self.save_loop, daemon=True)
-        self.save_thread.start()
+        self.save_thread: threading.Thread | None = None
+        if connectors is not None and connectors.send is not None:
+            self.save_thread = threading.Thread(target=self.save_loop, daemon=True)
+            self.save_thread.start()
 
     def recv_loop(self):
         """Loop to poll for incoming data.
@@ -127,6 +132,10 @@ class OmniTransferAdapterBase:
             self._recv_cond.notify_all()
         with self._save_cond:
             self._save_cond.notify_all()
+        if self.recv_thread is not None:
+            self.recv_thread.join(timeout=5)
+        if self.save_thread is not None:
+            self.save_thread.join(timeout=5)
         connectors = getattr(self, "_connectors", None)
         if connectors is not None:
             connectors.close()

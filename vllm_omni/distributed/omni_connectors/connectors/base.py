@@ -78,6 +78,17 @@ class OmniConnectorBase(ABC):
         for key in ("sender_host", "sender_zmq_port"):
             if recv_extra.get(key) is not None:
                 merged[key] = recv_extra[key]
+        recv_rank_mapping = recv_extra.get("rank_mapping")
+        send_rank_mapping = send_extra.get("rank_mapping")
+        if recv_rank_mapping != send_rank_mapping:
+            # A dual connector has one shared config dict, but TP topology is
+            # directional. Avoid presenting the outbound mapping as if it
+            # described both edges.
+            merged.pop("rank_mapping", None)
+            if recv_rank_mapping is not None:
+                merged["recv_rank_mapping"] = recv_rank_mapping
+            if send_rank_mapping is not None:
+                merged["send_rank_mapping"] = send_rank_mapping
         return merged
 
     @abstractmethod

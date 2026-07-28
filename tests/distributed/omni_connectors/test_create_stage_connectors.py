@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import pytest
 
+from vllm_omni.distributed.omni_connectors.connectors.base import OmniConnectorBase
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.stage_connector import (
     ConnectorRuntimeContext,
@@ -287,3 +288,14 @@ def test_stage_connector_set_close_dedupes_dual():
     a, b = _Conn(), _Conn()
     StageConnectorSet(receive=a, send=b).close()
     assert closes == [id(conn), id(a), id(b)]
+
+
+def test_dual_merge_preserves_distinct_directional_rank_mappings():
+    merged = OmniConnectorBase.merge_duplex_specs(
+        {"role": "receiver", "rank_mapping": {"from_tp": 4, "to_tp": 2}},
+        {"role": "sender", "rank_mapping": {"from_tp": 2, "to_tp": 1}},
+    )
+
+    assert "rank_mapping" not in merged
+    assert merged["recv_rank_mapping"] == {"from_tp": 4, "to_tp": 2}
+    assert merged["send_rank_mapping"] == {"from_tp": 2, "to_tp": 1}

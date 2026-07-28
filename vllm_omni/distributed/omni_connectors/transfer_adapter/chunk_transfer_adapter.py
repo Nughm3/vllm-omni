@@ -59,11 +59,26 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 self._active_window,
             )
         self._stage_id = int(getattr(model_config, "stage_id", 0))
+        connector_plan = stage_connector_plan_from_model_config(
+            model_config,
+            owner_scope=ConnectorOwnerScope.STAGE_REPLICA,
+        )
+        self._previous_stage_id = (
+            connector_plan.input_spec.edge.from_stage
+            if connector_plan.input_spec is not None
+            else self._stage_id - 1
+            if connector_plan.uses_legacy_default
+            else None
+        )
+        self._next_stage_id = (
+            connector_plan.output_spec.edge.to_stage
+            if connector_plan.output_spec is not None
+            else self._stage_id + 1
+            if connector_plan.uses_legacy_default
+            else None
+        )
         self._connectors = OmniConnectorFactory.create_stage_connectors(
-            stage_connector_plan_from_model_config(
-                model_config,
-                owner_scope=ConnectorOwnerScope.STAGE_REPLICA,
-            ),
+            connector_plan,
             ConnectorRuntimeContext(
                 stage_id=self._stage_id,
                 owner_scope=ConnectorOwnerScope.STAGE_REPLICA,
@@ -174,6 +189,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             request: Request object
             is_segment_finished: whether the segment of request is finished
         """
+        if self._connectors.send is None:
+            raise RuntimeError(f"Stage {self._stage_id} has no outbound connector")
         is_finished = request.is_finished() and not request.resumable
 
         confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
@@ -204,7 +221,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         connector = self._connectors.receive
         if connector is None:
             return False
-        target_stage_id = stage_id - 1
+        target_stage_id = self._previous_stage_id
+        if target_stage_id is None:
+            raise RuntimeError(f"Stage {stage_id} has a receive connector without an inbound edge")
         req_id = request.request_id
         chunk_id = self.get_req_chunk[req_id]
         external_req_id = self.request_ids_mapping.get(req_id, req_id)
@@ -316,7 +335,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         connector = self._connectors.send
         if connector is None:
             raise RuntimeError(f"Stage {stage_id} has no outbound connector")
-        next_stage_id = stage_id + 1
+        next_stage_id = self._next_stage_id
+        if next_stage_id is None:
+            raise RuntimeError(f"Stage {stage_id} has a send connector without an outbound edge")
         external_req_id = request.external_req_id
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"

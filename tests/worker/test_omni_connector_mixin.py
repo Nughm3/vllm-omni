@@ -58,6 +58,7 @@ def _make_model_config(
     custom_func: str | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        stage_id=stage_id,
         stage_input_connector_config=None,
         async_chunk=async_chunk,
         worker_type=worker_type,
@@ -98,6 +99,9 @@ class MixinHost(OmniConnectorModelRunnerMixin):
         from vllm_omni.distributed.omni_connectors.stage_connector import StageConnectorSet
 
         self._connectors = StageConnectorSet(receive=connector, send=connector)
+        if connector is not None:
+            self._previous_stage_id = self._stage_id - 1
+            self._next_stage_id = self._stage_id + 1
 
 
 class _FakeTPGroup:
@@ -554,6 +558,31 @@ class TestChunkStreamCompletedGuard:
                 sender_info=None,
             )
 
+    def test_malformed_sender_info_degrades_for_single_replica_and_fails_for_multiple(self):
+        host = MixinHost()
+        connector = MagicMock()
+        connector.get.return_value = None
+
+        host._stage_input_num_replicas = 1
+        host._recv_ordinary_stage_result(
+            connector,
+            from_stage="0",
+            to_stage="1",
+            connector_get_key="req-1_0_0",
+            sender_info={"source_host": "legacy-shape"},
+        )
+        connector.get.assert_called_once_with("0", "1", "req-1_0_0", metadata=None)
+
+        host._stage_input_num_replicas = 2
+        with pytest.raises(RuntimeError, match="Missing request-specific sender endpoint"):
+            host._recv_ordinary_stage_result(
+                connector,
+                from_stage="0",
+                to_stage="1",
+                connector_get_key="req-2_0_0",
+                sender_info={"source_host": "legacy-shape"},
+            )
+
     @pytest.mark.parametrize(
         ("sender_info", "expected_metadata"),
         [
@@ -874,8 +903,8 @@ class TestLocalPayloadCacheLifecycle:
 
     def test_rank0_only_polls_connector_for_tp_full_payload(self):
         host = self._make_host()
-        host._omni_connector = MagicMock()
         host._stage_id = 2
+        host._omni_connector = MagicMock()
         host._local_rank = 0
         host._request_ids_mapping["r1"] = "ext-r1"
         host._get_req_chunk["r1"] = 0
@@ -1300,258 +1329,6 @@ class TestRankAwareKVRouting:
         host.shutdown_omni_connectors()
 
 
-class TestRankMappingResolutionFromConnectorConfig:
-    """A stage's recv (inbound) and send (outbound) edges may have different
-    TP ratios. init_omni_connectors must resolve each independently from the
-    inbound stage_input_connector_config and outbound stage_output_connector_config,
-    and must still support the single-edge case (stage 0 / last stage) applying
-    one mapping to both."""
-
-    def test_distinct_recv_and_send_tp_from_two_specs(self):
-        # Middle stage with different TP ratios on each edge (heterogeneous TP):
-        # thinker TP=4 -> talker TP=2 -> code2wav TP=1.
-        model_config = _make_model_config(stage_id=1)
-        model_config.stage_input_connector_config = {
-            "name": "MooncakeTransferEngineConnector",
-            "extra": {"role": "receiver", "rank_mapping": {"from_tp": 4, "to_tp": 2}},
-        }
-        model_config.stage_output_connector_config = {
-            "name": "MooncakeTransferEngineConnector",
-            "extra": {"role": "sender", "rank_mapping": {"from_tp": 2, "to_tp": 1}},
-        }
-
-        host = MixinHost()
-        with patch(
-            "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
-            side_effect=lambda spec: MockConnector(),
-        ):
-            host.init_omni_connectors(model_config=model_config)
-
-        assert host._recv_from_tp == 4
-        assert host._recv_to_tp == 2
-        assert host._send_from_tp == 2
-        assert host._send_to_tp == 1
-
-        host.shutdown_omni_connectors()
-
-    def test_same_type_two_edges_collapse_to_one_dual_instance(self):
-        # Both edges use the same connector type -> one shared dual instance.
-        model_config = _make_model_config(stage_id=1)
-        model_config.stage_input_connector_config = {
-            "name": "MooncakeTransferEngineConnector",
-            "extra": {"role": "receiver"},
-        }
-        model_config.stage_output_connector_config = {
-            "name": "MooncakeTransferEngineConnector",
-            "extra": {"role": "sender"},
-        }
-
-        built: list[Any] = []
-
-        def _create(spec):
-            conn = MockConnector()
-            built.append(spec)
-            return conn
-
-        host = MixinHost()
-        with patch(
-            "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
-            side_effect=_create,
-        ):
-            host.init_omni_connectors(model_config=model_config)
-
-        # One instance built, shared by both directions, with role="dual".
-        assert len(built) == 1
-        assert built[0].extra.get("role") == "dual"
-        assert host._connectors.receive is host._connectors.send
-        assert host._connectors.receive is not None
-
-        host.shutdown_omni_connectors()
-
-    def test_hybrid_two_edges_build_two_instances(self):
-        # Different connector types (Mooncake in / SHM out) -> two instances.
-        model_config = _make_model_config(stage_id=1)
-        model_config.stage_input_connector_config = {
-            "name": "MooncakeTransferEngineConnector",
-            "extra": {"role": "receiver"},
-        }
-        model_config.stage_output_connector_config = {
-            "name": "SharedMemoryConnector",
-            "extra": {},
-        }
-
-        def _create(spec):
-            return MockConnector()
-
-        host = MixinHost()
-        with patch(
-            "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
-            side_effect=_create,
-        ):
-            host.init_omni_connectors(model_config=model_config)
-
-        assert host._connectors.receive is not None
-        assert host._connectors.send is not None
-        assert host._connectors.receive is not host._connectors.send
-
-        host.shutdown_omni_connectors()
-
-    def test_flat_single_edge_spec_applies_same_mapping_to_both(self):
-        """Regression guard: stage 0 / the last stage only has one edge, so
-        the flat spec's rank_mapping must still resolve for both recv and
-        send (there's no ambiguity with a single edge)."""
-        model_config = _make_model_config(stage_id=0)
-        model_config.stage_input_connector_config = {
-            "name": "MooncakeTransferEngineConnector",
-            "extra": {"role": "sender", "rank_mapping": {"from_tp": 2, "to_tp": 1}},
-        }
-
-        host = MixinHost()
-        with patch(
-            "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
-            return_value=MockConnector(),
-        ):
-            host.init_omni_connectors(model_config=model_config)
-
-        assert host._recv_from_tp == 2
-        assert host._recv_to_tp == 1
-        assert host._send_from_tp == 2
-        assert host._send_to_tp == 1
-
-        host.shutdown_omni_connectors()
-
-
-class TestWorkerPortOffset:
-    """The mixin supplies process-local rank/replica context to the factory."""
-
-    def test_distinct_tp_ranks_resolve_to_distinct_listen_ports(self):
-        """End-to-end through init_omni_connectors: two 'workers' (different
-        TP rank values) must
-        build connectors with different zmq_port — the actual collision this
-        fix prevents."""
-        model_config = _make_model_config(stage_id=0)
-        model_config.stage_input_connector_config = None
-        model_config.stage_output_connector_config = {
-            "name": "MooncakeTransferEngineConnector",
-            "extra": {"role": "sender", "zmq_port": 50052},
-        }
-
-        seen_ports: list[int] = []
-
-        def _create(spec):
-            seen_ports.append(spec.extra["zmq_port"])
-            return MockConnector()
-
-        for rank in (0, 1):
-            host = MixinHost()
-            with (
-                patch.object(
-                    host,
-                    "_get_local_tp_group",
-                    return_value=SimpleNamespace(world_size=2),
-                ),
-                patch(
-                    "vllm_omni.worker.omni_connector_model_runner_mixin.get_local_tp_rank",
-                    return_value=rank,
-                ),
-                patch(
-                    "vllm_omni.worker.omni_connector_model_runner_mixin.get_omni_replica_id",
-                    return_value=0,
-                ),
-                patch(
-                    "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
-                    side_effect=_create,
-                ),
-            ):
-                host.init_omni_connectors(model_config=model_config)
-            host.shutdown_omni_connectors()
-
-        assert seen_ports == [50052, 50068]
-        assert len(set(seen_ports)) == 2
-
-    def test_asymmetric_1x_2x_2x_replica_topology_no_port_collisions(self):
-        """Realistic 3-stage pipeline mirroring the multi-replica e2e deploy
-        shape (tests/.ci_generated/qwen3_omni_moe_multi_replicas_4gpu.yaml),
-        scaled down: 1 replica of stage 0, 2 replicas each of stages 1 and 2,
-        all co-located (TP=1 each). Every listener-binding connector instance
-        (role in {"sender", "dual"}; "receiver"-only never binds) across all
-        (stage, replica) pairs must resolve to a distinct zmq_port — this is
-        exactly the collision the port-timing fix prevents: stage 0 has one
-        replica (sender only), stage 1's two replicas are "dual" (same
-        Mooncake type on both edges -> collapsed to one shared instance per
-        replica), stage 2 is receive-only (last stage) and never binds.
-        """
-        from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, OmniTransferConfig
-        from vllm_omni.distributed.omni_connectors.utils.initialization import (
-            resolve_stage_connector_plan,
-        )
-
-        transfer_config = OmniTransferConfig(
-            connectors={
-                ("0", "1"): ConnectorSpec(
-                    name="MooncakeTransferEngineConnector",
-                    extra={"host": "auto", "zmq_port": 50051, "protocol": "rdma"},
-                ),
-                ("1", "2"): ConnectorSpec(
-                    name="MooncakeTransferEngineConnector",
-                    extra={"host": "auto", "zmq_port": 50051, "protocol": "rdma"},
-                ),
-            }
-        )
-        replicas_per_stage = {0: 1, 1: 2, 2: 2}
-
-        # Config-build time: resolved once per stage, replica/rank-agnostic —
-        # exactly what the orchestrator computes before any replica or TP
-        # worker process exists (see initialization.py's port-timing fix).
-        stage_plans = {
-            stage_id: resolve_stage_connector_plan(transfer_config, stage_id) for stage_id in replicas_per_stage
-        }
-
-        listen_ports: list[tuple[int, int, int]] = []  # (stage_id, replica_id, zmq_port)
-
-        for stage_id, num_replicas in replicas_per_stage.items():
-            for replica_id in range(num_replicas):
-                captured: list[Any] = []
-
-                def _create(spec, _captured=captured):
-                    _captured.append(spec)
-                    return MockConnector()
-
-                model_config = _make_model_config(stage_id=stage_id)
-                model_config.stage_connector_plan = stage_plans[stage_id]
-
-                host = MixinHost()
-                with (
-                    patch(
-                        "vllm_omni.worker.omni_connector_model_runner_mixin.get_local_tp_rank",
-                        return_value=0,
-                    ),
-                    patch(
-                        "vllm_omni.worker.omni_connector_model_runner_mixin.get_omni_replica_id",
-                        return_value=replica_id,
-                    ),
-                    patch(
-                        "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
-                        side_effect=_create,
-                    ),
-                ):
-                    host.init_omni_connectors(model_config=model_config)
-                host.shutdown_omni_connectors()
-
-                for spec in captured:
-                    if spec.extra.get("role") in {"sender", "dual"}:
-                        listen_ports.append((stage_id, replica_id, spec.extra["zmq_port"]))
-
-        # This pipeline shape has listener-binding instances only at stage 0
-        # (sender, 1 replica) and stage 1 (dual, 2 replicas) — 3 total. Stage
-        # 2 is receive-only (last stage) and never binds a listener.
-        assert len(listen_ports) == 3
-        assert {stage_id for stage_id, _, _ in listen_ports} == {0, 1}
-
-        ports_only = [port for *_, port in listen_ports]
-        assert len(ports_only) == len(set(ports_only)), f"port collision across replicas: {listen_ports}"
-
-
 class TestAttachOmniConnectorOutput:
     def test_wraps_empty_model_runner_output_when_signals_exist(self):
         from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
@@ -1563,3 +1340,29 @@ class TestAttachOmniConnectorOutput:
 
         assert wrapped is not EMPTY_MODEL_RUNNER_OUTPUT
         assert wrapped.omni_connector_output.chunk_ready_req_ids == {"req-1"}
+
+
+def test_plan_edges_drive_non_adjacent_stage_routing():
+    from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, OmniTransferConfig
+    from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_stage_connector_plan
+
+    model_config = _make_model_config(stage_id=7)
+    model_config.stage_connector_plan = resolve_stage_connector_plan(
+        OmniTransferConfig(
+            connectors={
+                ("3", "7"): ConnectorSpec(name="SharedMemoryConnector"),
+                ("7", "11"): ConnectorSpec(name="SharedMemoryConnector"),
+            }
+        ),
+        stage_id=7,
+    )
+    host = MixinHost()
+    with patch(
+        "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
+        side_effect=lambda spec: MockConnector(),
+    ):
+        host.init_omni_connectors(model_config=model_config)
+
+    assert host._previous_stage_id == 3
+    assert host._next_stage_id == 11
+    host.shutdown_omni_connectors()

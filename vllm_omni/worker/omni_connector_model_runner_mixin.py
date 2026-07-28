@@ -126,6 +126,20 @@ class OmniConnectorModelRunnerMixin:
             model_config,
             owner_scope=ConnectorOwnerScope.TP_WORKER,
         )
+        self._previous_stage_id = (
+            connector_plan.input_spec.edge.from_stage
+            if connector_plan.input_spec is not None
+            else self._stage_id - 1
+            if connector_plan.uses_legacy_default
+            else None
+        )
+        self._next_stage_id = (
+            connector_plan.output_spec.edge.to_stage
+            if connector_plan.output_spec is not None
+            else self._stage_id + 1
+            if connector_plan.uses_legacy_default
+            else None
+        )
         runtime_context = ConnectorRuntimeContext(
             stage_id=self._stage_id,
             owner_scope=ConnectorOwnerScope.TP_WORKER,
@@ -151,9 +165,6 @@ class OmniConnectorModelRunnerMixin:
             self._connectors.receive is not None and self._connectors.receive is self._connectors.send,
             self._custom_process_func_path,
         )
-
-        # -- next stage ID (from connector config or default stage_id + 1) --
-        self._next_stage_id: int = self._resolve_next_stage_id(model_config)
 
         # -- heterogeneous TP rank support (independent per direction) --
         self._recv_topology, self._send_topology = self._resolve_kv_topologies(
@@ -596,6 +607,22 @@ class OmniConnectorModelRunnerMixin:
         except Exception:
             return None
 
+    @staticmethod
+    def _normalize_sender_endpoint(sender_info: Any) -> ConnectorEndpoint | None:
+        if sender_info is None or isinstance(sender_info, ConnectorEndpoint):
+            return sender_info
+        if isinstance(sender_info, dict):
+            try:
+                return ConnectorEndpoint(
+                    host=str(sender_info["host"]),
+                    zmq_port=int(sender_info["zmq_port"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                logger.warning("Ignoring malformed stage-transfer sender_info: %r", sender_info)
+                return None
+        logger.warning("Ignoring unsupported stage-transfer sender_info type: %s", type(sender_info).__name__)
+        return None
+
     def _recv_ordinary_stage_result(
         self,
         connector: OmniConnectorBase,
@@ -605,14 +632,13 @@ class OmniConnectorModelRunnerMixin:
         sender_info: ConnectorEndpoint | None = None,
     ) -> Any:
         """Receive one ordinary non-KV stage payload on the local leader rank only."""
+        sender_info = self._normalize_sender_endpoint(sender_info)
         if self._stage_input_num_replicas > 1 and sender_info is None:
             raise RuntimeError(
                 "Missing request-specific sender endpoint for multi-replica upstream "
                 f"(from_stage={from_stage}, replicas={self._stage_input_num_replicas})"
             )
         metadata = None
-        if isinstance(sender_info, dict):
-            sender_info = ConnectorEndpoint(host=str(sender_info["host"]), zmq_port=int(sender_info["zmq_port"]))
         if sender_info is not None:
             metadata = sender_info.as_metadata()
         tp_group = self._get_local_tp_group()
@@ -1022,6 +1048,8 @@ class OmniConnectorModelRunnerMixin:
             return list(outputs.keys())
         sent_ids: list[str] = []
         next_stage_id = self._next_stage_id
+        if next_stage_id is None:
+            raise RuntimeError(f"Stage {self._stage_id} has a send connector without an outbound edge")
         for req_id, value in outputs.items():
             if isinstance(value, tuple) and len(value) == 2:
                 raw_output, request = value
@@ -1105,9 +1133,7 @@ class OmniConnectorModelRunnerMixin:
         # across requests.
         ext = getattr(request, "external_req_id", None)
         self._request_ids_mapping[request_id] = ext if ext is not None else request_id
-        sender_info = getattr(request, "sender_info", None)
-        if isinstance(sender_info, dict):
-            sender_info = ConnectorEndpoint(host=str(sender_info["host"]), zmq_port=int(sender_info["zmq_port"]))
+        sender_info = self._normalize_sender_endpoint(getattr(request, "sender_info", None))
         if sender_info is not None:
             self._sender_info[request_id] = sender_info
         with self._lock:
@@ -1194,6 +1220,8 @@ class OmniConnectorModelRunnerMixin:
         self._put_req_chunk[request_id] += 1
         self._ramp_chunk_count[request_id] += 1
         next_stage_id = self._next_stage_id
+        if next_stage_id is None:
+            raise RuntimeError(f"Stage {self._stage_id} has a send connector without an outbound edge")
         connector_put_key = f"{request_id}_{self._stage_id}_{chunk_id}"
 
         if chunk_id == 0:
@@ -1794,7 +1822,9 @@ class OmniConnectorModelRunnerMixin:
                 )
                 return False
 
-        target_stage_id = self._stage_id - 1
+        target_stage_id = self._previous_stage_id
+        if target_stage_id is None:
+            raise RuntimeError(f"Stage {self._stage_id} has a receive connector without an inbound edge")
         chunk_id = self._get_req_chunk[req_id]
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
         sender_info = self._sender_info.get(req_id)
@@ -2265,28 +2295,6 @@ class OmniConnectorModelRunnerMixin:
             if ext is not None:
                 return ext
         return fallback_req_id
-
-    def _resolve_next_stage_id(self, model_config: Any) -> int:
-        """Determine the downstream stage ID from connector config.
-
-        ``to_stage`` describes the outbound edge, so read it from the output
-        connector config; fall back to the (single) input config, then to
-        ``stage_id + 1``.
-        """
-        for attr in ("stage_output_connector_config", "stage_input_connector_config"):
-            connector_config = getattr(model_config, attr, None)
-            if connector_config is None:
-                continue
-            if not isinstance(connector_config, dict):
-                connector_config = getattr(connector_config, "__dict__", {})
-            to_stage = connector_config.get("to_stage")
-            if to_stage is None:
-                to_stage = (connector_config.get("extra") or {}).get("to_stage")
-            if isinstance(to_stage, int):
-                return to_stage
-            if isinstance(to_stage, str) and to_stage.strip():
-                return int(to_stage)
-        return self._stage_id + 1
 
     @staticmethod
     def _resolve_kv_topologies(

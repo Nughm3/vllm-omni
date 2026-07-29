@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from dataclasses import MISSING, field
+from dataclasses import MISSING
 from typing import TYPE_CHECKING, Any
 
 from pydantic import ConfigDict, TypeAdapter
@@ -144,14 +144,6 @@ class OmniModelConfig(ModelConfig):
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_plan: StageConnectorPlan | None = None
-    stage_input_num_replicas: int = 1
-    stage_input_connector_config: dict[str, Any] | None = field(
-        default_factory=lambda: {
-            "name": "SharedMemoryConnector",
-            "extra": {},
-        }
-    )
-    stage_output_connector_config: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
     omni_kv_config: dict | None = None
     codec_frame_rate_hz: float | None = None
@@ -172,14 +164,27 @@ class OmniModelConfig(ModelConfig):
         )
         return self.stage_input_connector_config
 
-    @stage_connector_config.setter
-    def stage_connector_config(self, value: dict[str, Any] | None) -> None:
-        warnings.warn(
-            "stage_connector_config is deprecated; use stage_input_connector_config",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self.stage_input_connector_config = value
+    @property
+    def stage_input_connector_config(self) -> dict[str, Any] | None:
+        """Inbound (recv) stage connector configuration, derived from
+        ``stage_connector_plan`` — the single source of truth that crosses
+        process boundaries. Contains "name" (connector name), "extra" (extra
+        connector config)."""
+        plan = self.stage_connector_plan
+        if plan is None:
+            return {"name": "SharedMemoryConnector", "extra": {}}
+        return plan.to_model_connector_configs(self.stage_id)[0]
+
+    @property
+    def stage_output_connector_config(self) -> dict[str, Any] | None:
+        """Outbound (send) stage connector configuration, derived from
+        ``stage_connector_plan``. Same shape as ``stage_input_connector_config``.
+        When both edges of a middle stage use the same connector type the
+        mixin collapses them into one dual instance."""
+        plan = self.stage_connector_plan
+        if plan is None:
+            return None
+        return plan.to_model_connector_configs(self.stage_id)[1]
 
     @property
     def architectures(self) -> list[str]:

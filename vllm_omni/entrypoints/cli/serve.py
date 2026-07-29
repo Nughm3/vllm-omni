@@ -823,7 +823,6 @@ def run_headless(args: TrackingNamespace) -> None:
         _stage_async_chunk,
         build_engine_args_dict,
         build_vllm_config,
-        compute_replica_layout,
         get_stage_connector_plan,
         inject_omni_kv_connector_config,
         load_omni_transfer_config_for_model,
@@ -921,9 +920,6 @@ def run_headless(args: TrackingNamespace) -> None:
         stage_id=stage_id,
         async_chunk=_stage_async_chunk(stage_cfg),
     )
-    replicas_per_stage, _ = compute_replica_layout(stage_configs)
-    input_spec = stage_connector_plan.input_spec
-    stage_input_num_replicas = replicas_per_stage[input_spec.edge.from_stage] if input_spec is not None else 1
 
     # ``runtime_cfg`` is mostly inherited from the parent's
     # CUDA_VISIBLE_DEVICES; when ``--omni-dp-size-local > 1`` we additionally
@@ -933,7 +929,6 @@ def run_headless(args: TrackingNamespace) -> None:
         stage_cfg,
         model,
         stage_connector_plan=stage_connector_plan,
-        stage_input_num_replicas=stage_input_num_replicas,
         cli_tokenizer=getattr(args, "tokenizer", None),
     )
 
@@ -943,7 +938,6 @@ def run_headless(args: TrackingNamespace) -> None:
         stage_cfg,
         model,
         stage_connector_plan=stage_connector_plan,
-        stage_input_num_replicas=stage_input_num_replicas,
         engine_args_dict=engine_args_dict,
         headless=True,
     )

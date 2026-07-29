@@ -24,7 +24,7 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import OmniPayload
-from vllm_omni.distributed.omni_connectors import ConnectorOwnerScope
+from vllm_omni.distributed.omni_connectors import ConnectorOwner
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.stage_connector import ConnectorRuntimeContext
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
@@ -117,14 +117,13 @@ class OmniConnectorModelRunnerMixin:
         if isinstance(stage_id, str):
             stage_id = int(stage_id)
         self._stage_id: int = stage_id if isinstance(stage_id, int) else 0
-        self._stage_input_num_replicas = max(1, int(getattr(model_config, "stage_input_num_replicas", 1)))
 
         tp_group = self._get_local_tp_group()
         tp_size = int(getattr(tp_group, "world_size", 1) or 1)
         local_tp_rank = get_local_tp_rank()
         connector_plan = stage_connector_plan_from_model_config(
             model_config,
-            owner_scope=ConnectorOwnerScope.TP_WORKER,
+            owner_scope=ConnectorOwner.CONNECTOR_MIXIN,
         )
         self._previous_stage_id = (
             connector_plan.input_spec.edge.from_stage
@@ -142,7 +141,7 @@ class OmniConnectorModelRunnerMixin:
         )
         runtime_context = ConnectorRuntimeContext(
             stage_id=self._stage_id,
-            owner_scope=ConnectorOwnerScope.TP_WORKER,
+            owner_scope=ConnectorOwner.CONNECTOR_MIXIN,
             replica_id=get_omni_replica_id(),
             tp_rank=local_tp_rank,
             tp_size=tp_size,
@@ -633,11 +632,6 @@ class OmniConnectorModelRunnerMixin:
     ) -> Any:
         """Receive one ordinary non-KV stage payload on the local leader rank only."""
         sender_info = self._normalize_sender_endpoint(sender_info)
-        if self._stage_input_num_replicas > 1 and sender_info is None:
-            raise RuntimeError(
-                "Missing request-specific sender endpoint for multi-replica upstream "
-                f"(from_stage={from_stage}, replicas={self._stage_input_num_replicas})"
-            )
         metadata = None
         if sender_info is not None:
             metadata = sender_info.as_metadata()

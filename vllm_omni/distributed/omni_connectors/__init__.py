@@ -28,13 +28,11 @@ except ImportError:
 from .factory import OmniConnectorFactory
 from .utils.config import ConnectorSpec, OmniTransferConfig
 from .utils.initialization import (
-    ConnectorDirection,
-    ConnectorOwnerScope,
+    ConnectorOwner,
     ResolvedConnectorSpec,
     StageConnectorPlan,
     StageEdge,
     get_connectors_config_for_stage,
-    get_stage_connector_config,
     load_omni_transfer_config,
     resolve_stage_connector_plan,
 )
@@ -48,8 +46,7 @@ __all__ = [
     "ConnectorSpec",
     "OmniTransferConfig",
     # Planning
-    "ConnectorDirection",
-    "ConnectorOwnerScope",
+    "ConnectorOwner",
     "StageEdge",
     "ResolvedConnectorSpec",
     "StageConnectorPlan",
@@ -74,6 +71,4 @@ __all__ = [
     # Utilities
     "load_omni_transfer_config",
     "get_connectors_config_for_stage",
-    # Manager helpers
-    "get_stage_connector_config",
 ]

@@ -17,26 +17,16 @@ from .logging import get_connector_logger
 logger = get_connector_logger(__name__)
 
 
-class ConnectorDirection(enum.Enum):
-    """Direction of a resolved connector relative to the owning stage."""
-
-    SENDER = "sender"
-    RECEIVER = "receiver"
-
-
-class ConnectorOwnerScope(enum.Enum):
+class ConnectorOwner(enum.Enum):
     """Which process owns bind/materialization for an edge.
-
-    ``STAGE_REPLICA`` — scheduler-owned ``OmniChunkTransferAdapter`` (async_chunk).
-    ``TP_WORKER`` — per-TP-rank model-runner mixin.
 
     Materialization skips edges whose ``owner_scope`` does not match the
     caller's scope so chunk transfer adapter and the mixin cannot bind the same
     endpoint.
     """
 
-    STAGE_REPLICA = "STAGE_REPLICA"
-    TP_WORKER = "TP_WORKER"
+    CHUNK_TRANSFER_ADAPTER = "CHUNK_TRANSFER_ADAPTER"
+    CONNECTOR_MIXIN = "CONNECTOR_MIXIN"
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,9 +47,8 @@ class ResolvedConnectorSpec:
     """
 
     edge: StageEdge
-    direction: ConnectorDirection
     spec: ConnectorSpec
-    owner_scope: ConnectorOwnerScope
+    owner: ConnectorOwner
     kv_topology: KVTPTopology | None = None
 
 
@@ -135,7 +124,7 @@ def _kv_topology_from_spec(spec: ConnectorSpec) -> KVTPTopology | None:
 def stage_connector_plan_from_model_config(
     model_config: Any,
     *,
-    owner_scope: ConnectorOwnerScope | None = None,
+    owner_scope: ConnectorOwner | None = None,
 ) -> StageConnectorPlan:
     """Return the typed plan carried by ``model_config`` or derive a legacy one."""
     plan = getattr(model_config, "stage_connector_plan", None)
@@ -145,9 +134,9 @@ def stage_connector_plan_from_model_config(
     stage_id = _parse_stage_id(getattr(model_config, "stage_id", 0))
     if owner_scope is None:
         owner_scope = (
-            ConnectorOwnerScope.STAGE_REPLICA
+            ConnectorOwner.CHUNK_TRANSFER_ADAPTER
             if bool(getattr(model_config, "async_chunk", False))
-            else ConnectorOwnerScope.TP_WORKER
+            else ConnectorOwner.CONNECTOR_MIXIN
         )
 
     def _config(attr: str) -> ConnectorSpec | None:
@@ -182,9 +171,8 @@ def stage_connector_plan_from_model_config(
         inbound = (
             ResolvedConnectorSpec(
                 edge=StageEdge(from_stage=from_stage, to_stage=stage_id),
-                direction=ConnectorDirection.RECEIVER,
                 spec=input_connector,
-                owner_scope=owner_scope,
+                owner=owner_scope,
                 kv_topology=_kv_topology_from_spec(input_connector),
             ),
         )
@@ -195,9 +183,8 @@ def stage_connector_plan_from_model_config(
         outbound = (
             ResolvedConnectorSpec(
                 edge=StageEdge(from_stage=stage_id, to_stage=to_stage),
-                direction=ConnectorDirection.SENDER,
                 spec=output_connector,
-                owner_scope=owner_scope,
+                owner=owner_scope,
                 kv_topology=_kv_topology_from_spec(output_connector),
             ),
         )
@@ -317,7 +304,7 @@ def resolve_stage_connector_plan(
         return StageConnectorPlan(inbound=(), outbound=(), uses_legacy_default=True)
 
     stage_connectors_cfg = get_connectors_config_for_stage(transfer_config, stage_id)
-    owner_scope = ConnectorOwnerScope.STAGE_REPLICA if async_chunk else ConnectorOwnerScope.TP_WORKER
+    owner_scope = ConnectorOwner.CHUNK_TRANSFER_ADAPTER if async_chunk else ConnectorOwner.CONNECTOR_MIXIN
     this_stage = _parse_stage_id(stage_id)
 
     inbound: list[ResolvedConnectorSpec] = []
@@ -340,9 +327,8 @@ def resolve_stage_connector_plan(
             inbound.append(
                 ResolvedConnectorSpec(
                     edge=StageEdge(from_stage=from_stage, to_stage=this_stage),
-                    direction=ConnectorDirection.RECEIVER,
                     spec=connector_spec,
-                    owner_scope=owner_scope,
+                    owner=owner_scope,
                     kv_topology=_kv_topology_from_spec(connector_spec),
                 )
             )
@@ -356,9 +342,8 @@ def resolve_stage_connector_plan(
             outbound.append(
                 ResolvedConnectorSpec(
                     edge=StageEdge(from_stage=this_stage, to_stage=to_stage),
-                    direction=ConnectorDirection.SENDER,
                     spec=connector_spec,
-                    owner_scope=owner_scope,
+                    owner=owner_scope,
                     kv_topology=_kv_topology_from_spec(connector_spec),
                 )
             )
@@ -543,25 +528,6 @@ def load_omni_transfer_config(
 
 
 # High-level management functions
-
-
-def get_stage_connector_config(
-    transfer_config: OmniTransferConfig | None,
-    stage_id: int,
-) -> dict[str, Any]:
-    """Return the serialized connector config payload for a specific stage."""
-    if transfer_config is None:
-        return {}
-
-    try:
-        return get_connectors_config_for_stage(transfer_config, stage_id)
-    except Exception as exc:  # pragma: no cover - defensive logging
-        logger.warning(
-            "Failed to build connector config for stage %s: %s. Using IPC fallback.",
-            stage_id,
-            exc,
-        )
-        return {}
 
 
 def resolve_omni_kv_config_for_stage(

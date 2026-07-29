@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .connectors.base import OmniConnectorBase
-from .utils.initialization import ConnectorOwnerScope
+from .utils.initialization import ConnectorOwner
 from .utils.logging import get_connector_logger
 
 logger = get_connector_logger(__name__)
@@ -23,7 +23,7 @@ class ConnectorRuntimeContext:
     """
 
     stage_id: int
-    owner_scope: ConnectorOwnerScope
+    owner_scope: ConnectorOwner
     replica_id: int = 0
     tp_rank: int | None = None
     tp_size: int | None = None

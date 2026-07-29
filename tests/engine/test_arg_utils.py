@@ -107,16 +107,14 @@ def test_default_all_values_are_initialized():
 
 
 def test_stage_connector_config_deprecated_alias():
+    """``stage_connector_config`` is a read-only deprecated alias for
+    ``stage_input_connector_config``, which is itself derived fresh from
+    ``stage_connector_plan`` on every access (no stored/settable dict)."""
     model_config = EngineArgs().create_model_config()
     cfg = OmniModelConfig.from_vllm_model_config(model_config)
 
     with pytest.warns(DeprecationWarning, match="stage_input_connector_config"):
-        assert cfg.stage_connector_config is cfg.stage_input_connector_config
-
-    replacement = {"name": "SharedMemoryConnector", "extra": {"role": "receiver"}}
-    with pytest.warns(DeprecationWarning, match="stage_input_connector_config"):
-        cfg.stage_connector_config = replacement
-    assert cfg.stage_input_connector_config == replacement
+        assert cfg.stage_connector_config == cfg.stage_input_connector_config
 
 
 def test_qwen3_tts_codec_frame_rate_patching():

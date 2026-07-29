@@ -15,7 +15,7 @@ from vllm_omni.distributed.omni_connectors.stage_connector import (
 )
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, OmniTransferConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
-    ConnectorOwnerScope,
+    ConnectorOwner,
     StageConnectorPlan,
     resolve_stage_connector_plan,
 )
@@ -30,7 +30,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def _tp_worker_ctx(stage_id: int = 1, *, tp_rank: int = 0, replica_id: int = 0) -> ConnectorRuntimeContext:
     return ConnectorRuntimeContext(
         stage_id=stage_id,
-        owner_scope=ConnectorOwnerScope.TP_WORKER,
+        owner_scope=ConnectorOwner.CONNECTOR_MIXIN,
         tp_rank=tp_rank,
         replica_id=replica_id,
     )
@@ -39,7 +39,7 @@ def _tp_worker_ctx(stage_id: int = 1, *, tp_rank: int = 0, replica_id: int = 0) 
 def _cta_ctx(stage_id: int = 1, *, replica_id: int = 0) -> ConnectorRuntimeContext:
     return ConnectorRuntimeContext(
         stage_id=stage_id,
-        owner_scope=ConnectorOwnerScope.STAGE_REPLICA,
+        owner_scope=ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
         replica_id=replica_id,
     )
 
@@ -264,7 +264,7 @@ def test_stage_replica_never_uses_tp_rank_for_ports(mocker):
     # Even if a bogus tp_rank sneaks in, STAGE_REPLICA must force local_rank=0.
     ctx = ConnectorRuntimeContext(
         stage_id=1,
-        owner_scope=ConnectorOwnerScope.STAGE_REPLICA,
+        owner_scope=ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
         replica_id=3,
         tp_rank=7,
     )

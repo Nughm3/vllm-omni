@@ -41,8 +41,7 @@ from vllm_omni.config.stage_config import (
 )
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
-    ConnectorDirection,
-    ConnectorOwnerScope,
+    ConnectorOwner,
     ResolvedConnectorSpec,
     StageConnectorPlan,
     StageEdge,
@@ -824,9 +823,8 @@ def test_from_pipeline_config_matches_build_engine_args_dict_behavior_for_repres
             inbound=(
                 ResolvedConnectorSpec(
                     edge=StageEdge(from_stage=0, to_stage=0),
-                    direction=ConnectorDirection.RECEIVER,
                     spec=ConnectorSpec(name="SharedMemoryConnector", extra={}),
-                    owner_scope=ConnectorOwnerScope.TP_WORKER,
+                    owner=ConnectorOwner.CONNECTOR_MIXIN,
                 ),
             ),
         ),

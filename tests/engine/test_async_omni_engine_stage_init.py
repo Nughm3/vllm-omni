@@ -645,8 +645,7 @@ def test_build_engine_args_stage_model_overrides_parent_model():
 def test_build_engine_args_keeps_full_payload_connector_spec():
     from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
     from vllm_omni.distributed.omni_connectors.utils.initialization import (
-        ConnectorDirection,
-        ConnectorOwnerScope,
+        ConnectorOwner,
         ResolvedConnectorSpec,
         StageConnectorPlan,
         StageEdge,
@@ -663,9 +662,8 @@ def test_build_engine_args_keeps_full_payload_connector_spec():
         outbound=(
             ResolvedConnectorSpec(
                 edge=StageEdge(from_stage=1, to_stage=2),
-                direction=ConnectorDirection.SENDER,
                 spec=ConnectorSpec(name="SharedMemoryConnector", extra={"role": "sender"}),
-                owner_scope=ConnectorOwnerScope.TP_WORKER,
+                owner=ConnectorOwner.CONNECTOR_MIXIN,
             ),
         ),
     )

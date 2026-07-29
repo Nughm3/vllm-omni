@@ -755,7 +755,6 @@ def build_engine_args_dict(
     stage_config: Any,
     model: str,
     stage_connector_plan: StageConnectorPlan | None = None,
-    stage_input_num_replicas: int = 1,
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
     """Build the normalized engine args dict for one stage."""
@@ -833,7 +832,6 @@ def build_engine_args_dict(
     if stage_connector_plan is None:
         stage_connector_plan = StageConnectorPlan(uses_legacy_default=True)
     engine_args_dict["stage_connector_plan"] = stage_connector_plan
-    engine_args_dict["stage_input_num_replicas"] = max(1, int(stage_input_num_replicas))
 
     if stage_type == "diffusion":
         from vllm_omni.diffusion.data import parse_attention_config
@@ -868,7 +866,6 @@ def build_vllm_config(
     stage_config: Any,
     model: str,
     stage_connector_plan: StageConnectorPlan | None = None,
-    stage_input_num_replicas: int = 1,
     engine_args_dict: dict[str, Any] | None = None,
     headless: bool = False,
 ) -> tuple[Any, type]:
@@ -882,7 +879,6 @@ def build_vllm_config(
             stage_config,
             model,
             stage_connector_plan=stage_connector_plan,
-            stage_input_num_replicas=stage_input_num_replicas,
         )
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)

@@ -122,21 +122,20 @@ class OmniConnectorFactory:
     ) -> ConnectorSpec | None:
         if resolved is None:
             return None
-        if resolved.owner_scope != runtime_context.owner_scope:
+        if resolved.owner != runtime_context.owner_scope:
             logger.debug(
-                "Skipping %s edge %s->%s: owner_scope=%s != caller=%s",
-                resolved.direction.value,
+                "Skipping edge %s->%s: owner_scope=%s != caller=%s",
                 resolved.edge.from_stage,
                 resolved.edge.to_stage,
-                resolved.owner_scope.value,
+                resolved.owner.value,
                 runtime_context.owner_scope.value,
             )
             return None
 
-        from .utils.initialization import ConnectorOwnerScope
+        from .utils.initialization import ConnectorOwner
         from .utils.kv_utils import worker_rank_port_offset
 
-        if runtime_context.owner_scope == ConnectorOwnerScope.STAGE_REPLICA:
+        if runtime_context.owner_scope == ConnectorOwner.CHUNK_TRANSFER_ADAPTER:
             port_offset = worker_rank_port_offset(local_rank=0, replica_id=runtime_context.replica_id)
         else:
             if runtime_context.tp_rank is None:

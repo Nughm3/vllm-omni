@@ -15,7 +15,7 @@ from ..adapter import construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
 from ..stage_connector import ConnectorRuntimeContext
 from ..utils.config import stage_receives_chunks
-from ..utils.initialization import ConnectorOwnerScope, stage_connector_plan_from_model_config
+from ..utils.initialization import ConnectorOwner, stage_connector_plan_from_model_config
 from ..utils.local_rank import get_omni_replica_id
 from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
@@ -61,7 +61,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._stage_id = int(getattr(model_config, "stage_id", 0))
         connector_plan = stage_connector_plan_from_model_config(
             model_config,
-            owner_scope=ConnectorOwnerScope.STAGE_REPLICA,
+            owner_scope=ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
         )
         self._previous_stage_id = (
             connector_plan.input_spec.edge.from_stage
@@ -81,7 +81,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             connector_plan,
             ConnectorRuntimeContext(
                 stage_id=self._stage_id,
-                owner_scope=ConnectorOwnerScope.STAGE_REPLICA,
+                owner_scope=ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
                 replica_id=get_omni_replica_id(),
             ),
         )

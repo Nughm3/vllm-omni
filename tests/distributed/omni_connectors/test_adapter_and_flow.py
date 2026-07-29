@@ -244,8 +244,7 @@ def test_full_payload_consumer_uses_receiver_connector_spec():
 def test_resolve_stage_connector_plan_preserves_edges_and_owner_scope():
     """Typed plan keeps from/to stage ids and chunk transfer adapter vs mixin ownership."""
     from vllm_omni.distributed.omni_connectors.utils.initialization import (
-        ConnectorDirection,
-        ConnectorOwnerScope,
+        ConnectorOwner,
         resolve_stage_connector_plan,
     )
 
@@ -289,10 +288,8 @@ def test_resolve_stage_connector_plan_preserves_edges_and_owner_scope():
     assert recv is not None and send is not None
     assert recv.edge.from_stage == 0 and recv.edge.to_stage == 1
     assert send.edge.from_stage == 1 and send.edge.to_stage == 2
-    assert recv.direction is ConnectorDirection.RECEIVER
-    assert send.direction is ConnectorDirection.SENDER
-    assert recv.owner_scope is ConnectorOwnerScope.TP_WORKER
-    assert send.owner_scope is ConnectorOwnerScope.TP_WORKER
+    assert recv.owner is ConnectorOwner.CONNECTOR_MIXIN
+    assert send.owner is ConnectorOwner.CONNECTOR_MIXIN
     # Stage-level base ports only (no TP/replica offset).
     assert recv.spec.extra["sender_zmq_port"] == 50051
     assert send.spec.name == "SharedMemoryConnector"
@@ -304,9 +301,9 @@ def test_resolve_stage_connector_plan_preserves_edges_and_owner_scope():
 
     cta_plan = resolve_stage_connector_plan(config, stage_id=1, async_chunk=True)
     assert cta_plan.input_spec is not None
-    assert cta_plan.input_spec.owner_scope is ConnectorOwnerScope.STAGE_REPLICA
+    assert cta_plan.input_spec.owner is ConnectorOwner.CHUNK_TRANSFER_ADAPTER
     assert cta_plan.output_spec is not None
-    assert cta_plan.output_spec.owner_scope is ConnectorOwnerScope.STAGE_REPLICA
+    assert cta_plan.output_spec.owner is ConnectorOwner.CHUNK_TRANSFER_ADAPTER
 
     # Stage 0 / last stage: one direction empty.
     s0 = resolve_stage_connector_plan(config, stage_id=0)

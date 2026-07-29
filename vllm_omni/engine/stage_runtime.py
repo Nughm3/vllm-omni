@@ -360,8 +360,6 @@ class StageRuntime:
                 stage_id=stage_id,
                 async_chunk=_stage_async_chunk(stage_cfg),
             )
-            input_spec = stage_connector_plan.input_spec
-            stage_input_num_replicas = replicas_per_stage[input_spec.edge.from_stage] if input_spec is not None else 1
             omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
             num_replicas = replicas_per_stage[stage_idx]
             launch_mode = self._get_launch_mode(stage_id)
@@ -375,7 +373,6 @@ class StageRuntime:
                     stage_cfg,
                     self._model,
                     stage_connector_plan=stage_connector_plan,
-                    stage_input_num_replicas=stage_input_num_replicas,
                     cli_tokenizer=self._tokenizer,
                 )
                 inject_omni_kv_connector_config(
@@ -392,7 +389,6 @@ class StageRuntime:
                     stage_cfg,
                     self._model,
                     stage_connector_plan=stage_connector_plan,
-                    stage_input_num_replicas=stage_input_num_replicas,
                     engine_args_dict=engine_args_dict,
                 )
 

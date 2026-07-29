@@ -25,7 +25,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     TRANSFER_ENGINE_CONNECTOR_NAMES,
 )
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
-    ConnectorOwnerScope,
+    ConnectorOwner,
     stage_connector_plan_from_model_config,
 )
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import (
@@ -395,10 +395,10 @@ class StageEngineCoreClientBase(StageClientBase):
             return None
         context = ConnectorRuntimeContext(
             stage_id=int(self.stage_id),
-            owner_scope=output.owner_scope,
+            owner_scope=output.owner,
             replica_id=int(self.replica_id),
-            tp_rank=0 if output.owner_scope == ConnectorOwnerScope.TP_WORKER else None,
-            tp_size=1 if output.owner_scope == ConnectorOwnerScope.TP_WORKER else None,
+            tp_rank=0 if output.owner == ConnectorOwner.CONNECTOR_MIXIN else None,
+            tp_size=1 if output.owner == ConnectorOwner.CONNECTOR_MIXIN else None,
         )
         connector_spec = OmniConnectorFactory.resolve_connector_spec(output, context)
         if connector_spec is None:

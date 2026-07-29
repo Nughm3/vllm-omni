@@ -544,26 +544,29 @@ class TestChunkStreamCompletedGuard:
         assert endpoint.zmq_port == sender_info["zmq_port"]
         host.shutdown_omni_connectors()
 
-    def test_multi_replica_missing_sender_info_fails_fast(self):
+    def test_missing_sender_info_degrades_to_static_endpoint(self):
+        """No per-request sender info (e.g. stage 0 / no upstream) falls back
+        to the connector's own static sender_host/sender_zmq_port, regardless
+        of upstream replica count."""
         host = MixinHost()
-        host._stage_input_num_replicas = 2
         connector = MockConnector()
 
-        with pytest.raises(RuntimeError, match="Missing request-specific sender endpoint"):
-            host._recv_ordinary_stage_result(
-                connector,
-                from_stage="0",
-                to_stage="1",
-                connector_get_key="req-1_0_0",
-                sender_info=None,
-            )
+        host._recv_ordinary_stage_result(
+            connector,
+            from_stage="0",
+            to_stage="1",
+            connector_get_key="req-1_0_0",
+            sender_info=None,
+        )
 
-    def test_malformed_sender_info_degrades_for_single_replica_and_fails_for_multiple(self):
+    def test_malformed_sender_info_always_degrades_gracefully(self):
+        """A sender_info dict in the wrong shape (missing host/zmq_port) is
+        logged and ignored — falls back to metadata=None rather than
+        raising, regardless of how many upstream replicas exist."""
         host = MixinHost()
         connector = MagicMock()
         connector.get.return_value = None
 
-        host._stage_input_num_replicas = 1
         host._recv_ordinary_stage_result(
             connector,
             from_stage="0",
@@ -572,16 +575,6 @@ class TestChunkStreamCompletedGuard:
             sender_info={"source_host": "legacy-shape"},
         )
         connector.get.assert_called_once_with("0", "1", "req-1_0_0", metadata=None)
-
-        host._stage_input_num_replicas = 2
-        with pytest.raises(RuntimeError, match="Missing request-specific sender endpoint"):
-            host._recv_ordinary_stage_result(
-                connector,
-                from_stage="0",
-                to_stage="1",
-                connector_get_key="req-2_0_0",
-                sender_info={"source_host": "legacy-shape"},
-            )
 
     @pytest.mark.parametrize(
         ("sender_info", "expected_metadata"),

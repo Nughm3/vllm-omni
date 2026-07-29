@@ -61,7 +61,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._stage_id = int(getattr(model_config, "stage_id", 0))
         connector_plan = stage_connector_plan_from_model_config(
             model_config,
-            owner_scope=ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
+            owner=ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
         )
         self._previous_stage_id = (
             connector_plan.input_spec.edge.from_stage
@@ -81,7 +81,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             connector_plan,
             ConnectorRuntimeContext(
                 stage_id=self._stage_id,
-                owner_scope=ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
+                owner=ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
                 replica_id=get_omni_replica_id(),
             ),
         )
@@ -332,12 +332,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
         stage_id = self._stage_id
+        # save_async() already validated connector/next_stage_id before this
+        # task was enqueued; both are set once at __init__ and never change.
         connector = self._connectors.send
-        if connector is None:
-            raise RuntimeError(f"Stage {stage_id} has no outbound connector")
         next_stage_id = self._next_stage_id
-        if next_stage_id is None:
-            raise RuntimeError(f"Stage {stage_id} has a send connector without an outbound edge")
         external_req_id = request.external_req_id
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"

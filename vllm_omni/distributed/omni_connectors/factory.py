@@ -66,10 +66,10 @@ class OmniConnectorFactory:
         Called only inside the owning process after that process's distributed
         context (if any) exists:
 
-        1. Skip edges whose ``owner_scope`` does not match ``runtime_context``
+        1. Skip edges whose ``owner`` does not match ``runtime_context``
            (chunk transfer adapter vs mixin collision guard).
         2. Apply TP/replica port offset for transfer-engine connectors
-           (``STAGE_REPLICA`` forces local_rank=0 — never queries the TP group).
+           (``CHUNK_TRANSFER_ADAPTER`` forces local_rank=0 and never queries the TP group).
         3. Dual-collapse same-type compatible edges via ``can_share`` /
            ``merge_duplex_specs`` when shared, thread-safe dual operation is
            supported.
@@ -120,26 +120,26 @@ class OmniConnectorFactory:
         resolved: ResolvedConnectorSpec | None,
         runtime_context: ConnectorRuntimeContext,
     ) -> ConnectorSpec | None:
-        if resolved is None:
-            return None
-        if resolved.owner != runtime_context.owner_scope:
-            logger.debug(
-                "Skipping edge %s->%s: owner_scope=%s != caller=%s",
-                resolved.edge.from_stage,
-                resolved.edge.to_stage,
-                resolved.owner.value,
-                runtime_context.owner_scope.value,
-            )
-            return None
-
         from .utils.initialization import ConnectorOwner
         from .utils.kv_utils import worker_rank_port_offset
 
-        if runtime_context.owner_scope == ConnectorOwner.CHUNK_TRANSFER_ADAPTER:
+        if resolved is None:
+            return None
+        if resolved.owner != runtime_context.owner:
+            logger.debug(
+                "Skipping edge %s->%s: owner=%s != caller=%s",
+                resolved.edge.from_stage,
+                resolved.edge.to_stage,
+                resolved.owner.value,
+                runtime_context.owner.value,
+            )
+            return None
+
+        if runtime_context.owner == ConnectorOwner.CHUNK_TRANSFER_ADAPTER:
             port_offset = worker_rank_port_offset(local_rank=0, replica_id=runtime_context.replica_id)
         else:
             if runtime_context.tp_rank is None:
-                raise ValueError("TP_WORKER connector resolution requires an explicit tp_rank")
+                raise ValueError("CONNECTOR_MIXIN connector resolution requires an explicit tp_rank")
             port_offset = worker_rank_port_offset(
                 local_rank=runtime_context.tp_rank,
                 replica_id=runtime_context.replica_id,

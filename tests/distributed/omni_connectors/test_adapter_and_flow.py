@@ -241,7 +241,7 @@ def test_full_payload_consumer_uses_receiver_connector_spec():
     assert plan.input_spec.spec.extra == {"codec_chunk_frames": 25, "role": "receiver"}
 
 
-def test_resolve_stage_connector_plan_preserves_edges_and_owner_scope():
+def test_resolve_stage_connector_plan_preserves_edges_and_owner():
     """Typed plan keeps from/to stage ids and chunk transfer adapter vs mixin ownership."""
     from vllm_omni.distributed.omni_connectors.utils.initialization import (
         ConnectorOwner,

@@ -20,7 +20,7 @@ logger = get_connector_logger(__name__)
 class ConnectorOwner(enum.Enum):
     """Which process owns bind/materialization for an edge.
 
-    Materialization skips edges whose ``owner_scope`` does not match the
+    Materialization skips edges whose ``owner`` does not match the
     caller's scope so chunk transfer adapter and the mixin cannot bind the same
     endpoint.
     """
@@ -124,7 +124,7 @@ def _kv_topology_from_spec(spec: ConnectorSpec) -> KVTPTopology | None:
 def stage_connector_plan_from_model_config(
     model_config: Any,
     *,
-    owner_scope: ConnectorOwner | None = None,
+    owner: ConnectorOwner | None = None,
 ) -> StageConnectorPlan:
     """Return the typed plan carried by ``model_config`` or derive a legacy one."""
     plan = getattr(model_config, "stage_connector_plan", None)
@@ -132,8 +132,8 @@ def stage_connector_plan_from_model_config(
         return plan
 
     stage_id = _parse_stage_id(getattr(model_config, "stage_id", 0))
-    if owner_scope is None:
-        owner_scope = (
+    if owner is None:
+        owner = (
             ConnectorOwner.CHUNK_TRANSFER_ADAPTER
             if bool(getattr(model_config, "async_chunk", False))
             else ConnectorOwner.CONNECTOR_MIXIN
@@ -172,7 +172,7 @@ def stage_connector_plan_from_model_config(
             ResolvedConnectorSpec(
                 edge=StageEdge(from_stage=from_stage, to_stage=stage_id),
                 spec=input_connector,
-                owner=owner_scope,
+                owner=owner,
                 kv_topology=_kv_topology_from_spec(input_connector),
             ),
         )
@@ -184,7 +184,7 @@ def stage_connector_plan_from_model_config(
             ResolvedConnectorSpec(
                 edge=StageEdge(from_stage=stage_id, to_stage=to_stage),
                 spec=output_connector,
-                owner=owner_scope,
+                owner=owner,
                 kv_topology=_kv_topology_from_spec(output_connector),
             ),
         )
@@ -292,19 +292,14 @@ def resolve_stage_connector_plan(
 ) -> StageConnectorPlan:
     """Resolve a typed, rank/replica-agnostic connector plan for ``stage_id``.
 
-    Reuses :func:`get_connectors_config_for_stage` for edge collection and
-    transfer-engine *base* port math. Does **not** apply TP/replica port
-    offsets — those belong in ``materialize_stage_connectors`` inside the
-    owning process.
-
-    ``async_chunk=True`` marks every edge ``STAGE_REPLICA``-owned (chunk
-    transfer adapter); otherwise edges are ``TP_WORKER``-owned (mixin).
+    ``async_chunk=True`` marks every edge ``CHUNK_TRANSFER_ADAPTER``-owned (chunk
+    transfer adapter); otherwise edges are ``CONNECTOR_MIXIN``-owned (mixin).
     """
     if transfer_config is None:
         return StageConnectorPlan(inbound=(), outbound=(), uses_legacy_default=True)
 
     stage_connectors_cfg = get_connectors_config_for_stage(transfer_config, stage_id)
-    owner_scope = ConnectorOwner.CHUNK_TRANSFER_ADAPTER if async_chunk else ConnectorOwner.CONNECTOR_MIXIN
+    owner = ConnectorOwner.CHUNK_TRANSFER_ADAPTER if async_chunk else ConnectorOwner.CONNECTOR_MIXIN
     this_stage = _parse_stage_id(stage_id)
 
     inbound: list[ResolvedConnectorSpec] = []
@@ -328,7 +323,7 @@ def resolve_stage_connector_plan(
                 ResolvedConnectorSpec(
                     edge=StageEdge(from_stage=from_stage, to_stage=this_stage),
                     spec=connector_spec,
-                    owner=owner_scope,
+                    owner=owner,
                     kv_topology=_kv_topology_from_spec(connector_spec),
                 )
             )
@@ -343,7 +338,7 @@ def resolve_stage_connector_plan(
                 ResolvedConnectorSpec(
                     edge=StageEdge(from_stage=this_stage, to_stage=to_stage),
                     spec=connector_spec,
-                    owner=owner_scope,
+                    owner=owner,
                     kv_topology=_kv_topology_from_spec(connector_spec),
                 )
             )

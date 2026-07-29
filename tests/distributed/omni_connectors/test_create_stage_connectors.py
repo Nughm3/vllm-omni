@@ -30,7 +30,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def _tp_worker_ctx(stage_id: int = 1, *, tp_rank: int = 0, replica_id: int = 0) -> ConnectorRuntimeContext:
     return ConnectorRuntimeContext(
         stage_id=stage_id,
-        owner_scope=ConnectorOwner.CONNECTOR_MIXIN,
+        owner=ConnectorOwner.CONNECTOR_MIXIN,
         tp_rank=tp_rank,
         replica_id=replica_id,
     )
@@ -39,7 +39,7 @@ def _tp_worker_ctx(stage_id: int = 1, *, tp_rank: int = 0, replica_id: int = 0) 
 def _cta_ctx(stage_id: int = 1, *, replica_id: int = 0) -> ConnectorRuntimeContext:
     return ConnectorRuntimeContext(
         stage_id=stage_id,
-        owner_scope=ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
+        owner=ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
         replica_id=replica_id,
     )
 
@@ -170,20 +170,20 @@ def test_outbound_only_receive_is_none():
     connectors.close()
 
 
-def test_owner_scope_filters_cta_vs_mixin():
+def test_owner_filters_cta_vs_mixin():
     config = OmniTransferConfig(
         connectors={
             ("0", "1"): ConnectorSpec(name="SharedMemoryConnector"),
             ("1", "2"): ConnectorSpec(name="SharedMemoryConnector"),
         }
     )
-    # Plan owned by TP_WORKER (async_chunk=False).
+    # Plan owned by CONNECTOR_MIXIN (async_chunk=False).
     plan = resolve_stage_connector_plan(config, stage_id=1, async_chunk=False)
 
     mixin_set = OmniConnectorFactory.create_stage_connectors(plan, _tp_worker_ctx(1))
     assert mixin_set.receive is not None and mixin_set.send is not None
 
-    # Chunk transfer adapter calling with STAGE_REPLICA must skip every edge → empty set.
+    # Chunk transfer adapter calling with CHUNK_TRANSFER_ADAPTER must skip every edge → empty set.
     cta_set = OmniConnectorFactory.create_stage_connectors(plan, _cta_ctx(1))
     assert cta_set.receive is None and cta_set.send is None
 
@@ -261,10 +261,10 @@ def test_stage_replica_never_uses_tp_rank_for_ports(mocker):
         return _Stub()
 
     mocker.patch.object(OmniConnectorFactory, "create_connector", side_effect=_fake_create)
-    # Even if a bogus tp_rank sneaks in, STAGE_REPLICA must force local_rank=0.
+    # Even if a bogus tp_rank sneaks in, CHUNK_TRANSFER_ADAPTER must force local_rank=0.
     ctx = ConnectorRuntimeContext(
         stage_id=1,
-        owner_scope=ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
+        owner=ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
         replica_id=3,
         tp_rank=7,
     )

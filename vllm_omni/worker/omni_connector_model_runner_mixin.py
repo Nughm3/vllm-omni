@@ -123,7 +123,7 @@ class OmniConnectorModelRunnerMixin:
         local_tp_rank = get_local_tp_rank()
         connector_plan = stage_connector_plan_from_model_config(
             model_config,
-            owner_scope=ConnectorOwner.CONNECTOR_MIXIN,
+            owner=ConnectorOwner.CONNECTOR_MIXIN,
         )
         self._previous_stage_id = (
             connector_plan.input_spec.edge.from_stage
@@ -139,16 +139,15 @@ class OmniConnectorModelRunnerMixin:
             if connector_plan.uses_legacy_default
             else None
         )
-        runtime_context = ConnectorRuntimeContext(
-            stage_id=self._stage_id,
-            owner_scope=ConnectorOwner.CONNECTOR_MIXIN,
-            replica_id=get_omni_replica_id(),
-            tp_rank=local_tp_rank,
-            tp_size=tp_size,
-        )
         self._connectors = OmniConnectorFactory.create_stage_connectors(
             connector_plan,
-            runtime_context,
+            ConnectorRuntimeContext(
+                stage_id=self._stage_id,
+                owner=ConnectorOwner.CONNECTOR_MIXIN,
+                replica_id=get_omni_replica_id(),
+                tp_rank=local_tp_rank,
+                tp_size=tp_size,
+            ),
         )
 
         self._custom_process_func_path, self._custom_process_func = self._load_custom_func(model_config)
@@ -1041,9 +1040,9 @@ class OmniConnectorModelRunnerMixin:
             )
             return list(outputs.keys())
         sent_ids: list[str] = []
+        # next_stage_id is guaranteed set whenever connector.send is not None
+        # (both derive from the same output_spec at init time, above).
         next_stage_id = self._next_stage_id
-        if next_stage_id is None:
-            raise RuntimeError(f"Stage {self._stage_id} has a send connector without an outbound edge")
         for req_id, value in outputs.items():
             if isinstance(value, tuple) and len(value) == 2:
                 raw_output, request = value
@@ -1213,9 +1212,9 @@ class OmniConnectorModelRunnerMixin:
 
         self._put_req_chunk[request_id] += 1
         self._ramp_chunk_count[request_id] += 1
+        # next_stage_id is guaranteed set whenever connector.send is not None
+        # (both derive from the same output_spec at init time, above).
         next_stage_id = self._next_stage_id
-        if next_stage_id is None:
-            raise RuntimeError(f"Stage {self._stage_id} has a send connector without an outbound edge")
         connector_put_key = f"{request_id}_{self._stage_id}_{chunk_id}"
 
         if chunk_id == 0:

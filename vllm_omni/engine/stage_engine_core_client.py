@@ -395,7 +395,7 @@ class StageEngineCoreClientBase(StageClientBase):
             return None
         context = ConnectorRuntimeContext(
             stage_id=int(self.stage_id),
-            owner_scope=output.owner,
+            owner=output.owner,
             replica_id=int(self.replica_id),
             tp_rank=0 if output.owner == ConnectorOwner.CONNECTOR_MIXIN else None,
             tp_size=1 if output.owner == ConnectorOwner.CONNECTOR_MIXIN else None,

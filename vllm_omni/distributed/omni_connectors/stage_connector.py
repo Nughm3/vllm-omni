@@ -17,13 +17,13 @@ class ConnectorRuntimeContext:
     """Process-local context supplied when materializing a :class:`StageConnectorPlan`.
 
     Must be built *inside* the owning process after that process's distributed
-    context (if any) exists. ``tp_rank`` is unused for ``STAGE_REPLICA`` (chunk
+    context (if any) exists. ``tp_rank`` is unused for ``CHUNK_TRANSFER_ADAPTER`` (chunk
     transfer adapter / scheduler) — materialization forces local_rank=0 so it
     never consults the worker TP group.
     """
 
     stage_id: int
-    owner_scope: ConnectorOwner
+    owner: ConnectorOwner
     replica_id: int = 0
     tp_rank: int | None = None
     tp_size: int | None = None

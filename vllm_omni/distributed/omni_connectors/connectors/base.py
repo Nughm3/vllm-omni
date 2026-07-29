@@ -50,47 +50,6 @@ class OmniConnectorBase(ABC):
         }
     )
 
-    @classmethod
-    def can_share(cls, recv_extra: dict[str, Any], send_extra: dict[str, Any]) -> bool:
-        """Whether inbound/outbound extras describe one shareable backend.
-
-        Same connector name is not enough: two edges can use the same class
-        against different backends (distinct metadata servers, hosts,
-        protocols, devices). Only non-directional keys must match.
-        """
-        shared_keys = (set(recv_extra) | set(send_extra)) - cls._DIRECTIONAL_EXTRA_KEYS
-        return all(recv_extra.get(key) == send_extra.get(key) for key in shared_keys)
-
-    @classmethod
-    def merge_duplex_specs(cls, recv_extra: dict[str, Any], send_extra: dict[str, Any]) -> dict[str, Any]:
-        """Merge inbound + outbound extras into one ``role="dual"`` config.
-
-        Shared backend knobs come from the outbound extra; direction-specific
-        fields are taken from the edge that owns them: the outbound listen
-        ``zmq_port`` and the inbound upstream ``sender_host`` /
-        ``sender_zmq_port``.
-        """
-        merged = dict(recv_extra)
-        merged.update(send_extra)  # outbound wins on shared knobs
-        merged["role"] = "dual"
-        if "zmq_port" in send_extra:
-            merged["zmq_port"] = send_extra["zmq_port"]
-        for key in ("sender_host", "sender_zmq_port"):
-            if recv_extra.get(key) is not None:
-                merged[key] = recv_extra[key]
-        recv_rank_mapping = recv_extra.get("rank_mapping")
-        send_rank_mapping = send_extra.get("rank_mapping")
-        if recv_rank_mapping != send_rank_mapping:
-            # A dual connector has one shared config dict, but TP topology is
-            # directional. Avoid presenting the outbound mapping as if it
-            # described both edges.
-            merged.pop("rank_mapping", None)
-            if recv_rank_mapping is not None:
-                merged["recv_rank_mapping"] = recv_rank_mapping
-            if send_rank_mapping is not None:
-                merged["send_rank_mapping"] = send_rank_mapping
-        return merged
-
     @abstractmethod
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """Store Python object, internal serialization handled by connector.
@@ -149,6 +108,66 @@ class OmniConnectorBase(ABC):
         """
         pass
 
+    # --- Configuration and helpers for connector creation ---
+
+    @classmethod
+    def can_share(cls, recv_extra: dict[str, Any], send_extra: dict[str, Any]) -> bool:
+        """Whether inbound/outbound extras describe one shareable backend.
+
+        Same connector name is not enough: two edges can use the same class
+        against different backends (distinct metadata servers, hosts,
+        protocols, devices). Only non-directional keys must match.
+        """
+        shared_keys = (set(recv_extra) | set(send_extra)) - cls._DIRECTIONAL_EXTRA_KEYS
+        return all(recv_extra.get(key) == send_extra.get(key) for key in shared_keys)
+
+    @classmethod
+    def merge_duplex_specs(cls, recv_extra: dict[str, Any], send_extra: dict[str, Any]) -> dict[str, Any]:
+        """Merge inbound + outbound extras into one ``role="dual"`` config.
+
+        Shared backend knobs come from the outbound extra; direction-specific
+        fields are taken from the edge that owns them: the outbound listen
+        ``zmq_port`` and the inbound upstream ``sender_host`` /
+        ``sender_zmq_port``.
+        """
+        merged = dict(recv_extra)
+        merged.update(send_extra)  # outbound wins on shared knobs
+        merged["role"] = "dual"
+        if "zmq_port" in send_extra:
+            merged["zmq_port"] = send_extra["zmq_port"]
+        for key in ("sender_host", "sender_zmq_port"):
+            if recv_extra.get(key) is not None:
+                merged[key] = recv_extra[key]
+        recv_rank_mapping = recv_extra.get("rank_mapping")
+        send_rank_mapping = send_extra.get("rank_mapping")
+        if recv_rank_mapping != send_rank_mapping:
+            # A dual connector has one shared config dict, but TP topology is
+            # directional. Avoid presenting the outbound mapping as if it
+            # described both edges.
+            merged.pop("rank_mapping", None)
+            if recv_rank_mapping is not None:
+                merged["recv_rank_mapping"] = recv_rank_mapping
+            if send_rank_mapping is not None:
+                merged["send_rank_mapping"] = send_rank_mapping
+        return merged
+
+    @staticmethod
+    def resolve_role(role: str, *, connector_name: str) -> tuple[bool, bool]:
+        """Resolve a ``role`` config value into ``(can_put, can_get)``.
+
+        - ``"sender"``: bind a listener, accept ``put()`` calls only.
+        - ``"receiver"``: skip the listener bind, accept ``get()`` calls only.
+        - ``"dual"``: bind a listener AND accept ``get()`` — a middle stage
+          whose two edges use the same connector type shares one instance.
+
+        Shared by connectors (e.g. Mooncake/Mori transfer engines) whose
+        listener bind and ``put()``/``get()`` gating depend on role.
+        """
+        role = role.lower()
+        if role not in {"sender", "receiver", "dual"}:
+            raise ValueError(f"Invalid role={role!r} for {connector_name}. Expected 'sender', 'receiver', or 'dual'.")
+        return role in {"sender", "dual"}, role in {"receiver", "dual"}
+
     # --- Default resource-management protocol ---
     # Subclasses get context-manager and destructor support for free;
     # they only need to implement close().
@@ -184,20 +203,3 @@ class OmniConnectorBase(ABC):
         Connectors with different key conventions can override this method.
         """
         return f"{key}{separator}{from_stage}_{to_stage}"
-
-    @staticmethod
-    def resolve_role(role: str, *, connector_name: str) -> tuple[bool, bool]:
-        """Resolve a ``role`` config value into ``(can_put, can_get)``.
-
-        - ``"sender"``: bind a listener, accept ``put()`` calls only.
-        - ``"receiver"``: skip the listener bind, accept ``get()`` calls only.
-        - ``"dual"``: bind a listener AND accept ``get()`` — a middle stage
-          whose two edges use the same connector type shares one instance.
-
-        Shared by connectors (e.g. Mooncake/Mori transfer engines) whose
-        listener bind and ``put()``/``get()`` gating depend on role.
-        """
-        role = role.lower()
-        if role not in {"sender", "receiver", "dual"}:
-            raise ValueError(f"Invalid role={role!r} for {connector_name}. Expected 'sender', 'receiver', or 'dual'.")
-        return role in {"sender", "dual"}, role in {"receiver", "dual"}

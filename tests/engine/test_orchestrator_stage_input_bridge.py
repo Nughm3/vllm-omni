@@ -113,7 +113,7 @@ class FakePrewarmPool:
             )
         )
         self.submitted: list[Any] = []
-        self.stage_client = SimpleNamespace(get_chunk_sender_info=lambda: None)
+        self.stage_client = SimpleNamespace(get_payload_sender_info=lambda: None)
 
     async def submit_initial(self, _request_id, _req_state, request, prompt_text=None):
         self.submitted.append(request)

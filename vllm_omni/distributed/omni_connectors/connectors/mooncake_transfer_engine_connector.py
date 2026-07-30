@@ -100,7 +100,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
     # to_gpu_tensor() / to_bytes() fast-paths.
     # Its backend pool supports one dual instance, and its synchronization
     # permits concurrent receive/send worker threads.
-    capabilities = ConnectorCapabilities(supports_raw_data=True, supports_shared_dual=True, thread_safe_dual=True)
+    capabilities = ConnectorCapabilities(supports_raw_data=True, supports_shared_dual=True)
 
     def __init__(self, config: dict[str, Any]):
         if TransferEngine is None:

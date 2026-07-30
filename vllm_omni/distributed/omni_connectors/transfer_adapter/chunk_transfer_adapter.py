@@ -63,20 +63,18 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             model_config,
             owner=ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
         )
-        self._previous_stage_id = (
-            connector_plan.input_spec.edge.from_stage
-            if connector_plan.input_spec is not None
-            else self._stage_id - 1
-            if connector_plan.uses_legacy_default
-            else None
-        )
-        self._next_stage_id = (
-            connector_plan.output_spec.edge.to_stage
-            if connector_plan.output_spec is not None
-            else self._stage_id + 1
-            if connector_plan.uses_legacy_default
-            else None
-        )
+        if connector_plan.input_spec is not None:
+            self._previous_stage_id = connector_plan.input_spec.edge.from_stage
+        elif connector_plan.uses_legacy_default:
+            self._previous_stage_id = self._stage_id - 1
+        else:
+            self._previous_stage_id = None
+        if connector_plan.output_spec is not None:
+            self._next_stage_id = connector_plan.output_spec.edge.to_stage
+        elif connector_plan.uses_legacy_default:
+            self._next_stage_id = self._stage_id + 1
+        else:
+            self._next_stage_id = None
         self._connectors = OmniConnectorFactory.create_stage_connectors(
             connector_plan,
             ConnectorRuntimeContext(

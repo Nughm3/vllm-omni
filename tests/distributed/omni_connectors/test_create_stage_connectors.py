@@ -44,29 +44,10 @@ def _cta_ctx(stage_id: int = 1, *, replica_id: int = 0) -> ConnectorRuntimeConte
     )
 
 
-def test_legacy_default_shares_one_shm_instance():
-    plan = StageConnectorPlan(uses_legacy_default=True)
-    connectors = OmniConnectorFactory.create_stage_connectors(plan, _tp_worker_ctx(0))
-    assert connectors.receive is not None
-    assert connectors.send is connectors.receive
-    assert type(connectors.receive).__name__ == "SharedMemoryConnector"
-    connectors.close()
-
-
-def test_same_type_mooncake_dual_collapse(mocker):
-    config = OmniTransferConfig(
-        connectors={
-            ("0", "1"): ConnectorSpec(
-                name="MooncakeTransferEngineConnector",
-                extra={"host": "auto", "zmq_port": 50051, "protocol": "rdma"},
-            ),
-            ("1", "2"): ConnectorSpec(
-                name="MooncakeTransferEngineConnector",
-                extra={"host": "auto", "zmq_port": 50051, "protocol": "rdma"},
-            ),
-        }
-    )
-    plan = resolve_stage_connector_plan(config, stage_id=1)
+@pytest.fixture
+def create_recording_connector(mocker):
+    """Patch OmniConnectorFactory.create_connector to return stub instances
+    while recording every ConnectorSpec it was called with."""
     created: list[ConnectorSpec] = []
 
     def _fake_create(*args):
@@ -80,6 +61,33 @@ def test_same_type_mooncake_dual_collapse(mocker):
         return _Stub()
 
     mocker.patch.object(OmniConnectorFactory, "create_connector", side_effect=_fake_create)
+    return created
+
+
+def test_legacy_default_shares_one_shm_instance():
+    plan = StageConnectorPlan(uses_legacy_default=True)
+    connectors = OmniConnectorFactory.create_stage_connectors(plan, _tp_worker_ctx(0))
+    assert connectors.receive is not None
+    assert connectors.send is connectors.receive
+    assert type(connectors.receive).__name__ == "SharedMemoryConnector"
+    connectors.close()
+
+
+def test_same_type_mooncake_dual_collapse(create_recording_connector):
+    config = OmniTransferConfig(
+        connectors={
+            ("0", "1"): ConnectorSpec(
+                name="MooncakeTransferEngineConnector",
+                extra={"host": "auto", "zmq_port": 50051, "protocol": "rdma"},
+            ),
+            ("1", "2"): ConnectorSpec(
+                name="MooncakeTransferEngineConnector",
+                extra={"host": "auto", "zmq_port": 50051, "protocol": "rdma"},
+            ),
+        }
+    )
+    plan = resolve_stage_connector_plan(config, stage_id=1)
+    created = create_recording_connector
     connectors = OmniConnectorFactory.create_stage_connectors(plan, _tp_worker_ctx(1))
     assert connectors.receive is connectors.send
     assert len(created) == 1
@@ -88,7 +96,7 @@ def test_same_type_mooncake_dual_collapse(mocker):
     assert created[0].extra["sender_zmq_port"] == 50051
 
 
-def test_incompatible_same_type_stays_hybrid(mocker):
+def test_incompatible_same_type_stays_hybrid(create_recording_connector):
     config = OmniTransferConfig(
         connectors={
             ("0", "1"): ConnectorSpec(
@@ -103,19 +111,7 @@ def test_incompatible_same_type_stays_hybrid(mocker):
         }
     )
     plan = resolve_stage_connector_plan(config, stage_id=1)
-    created: list[ConnectorSpec] = []
-
-    def _fake_create(*args):
-        spec = args[-1]
-        created.append(spec)
-
-        class _Stub:
-            def close(self):
-                pass
-
-        return _Stub()
-
-    mocker.patch.object(OmniConnectorFactory, "create_connector", side_effect=_fake_create)
+    created = create_recording_connector
     connectors = OmniConnectorFactory.create_stage_connectors(plan, _tp_worker_ctx(1))
     assert connectors.receive is not connectors.send
     assert len(created) == 2
@@ -123,7 +119,7 @@ def test_incompatible_same_type_stays_hybrid(mocker):
     assert created[1].extra["host"] == "10.0.0.2"
 
 
-def test_hybrid_mooncake_shm_two_instances(mocker):
+def test_hybrid_mooncake_shm_two_instances(create_recording_connector):
     config = OmniTransferConfig(
         connectors={
             ("0", "1"): ConnectorSpec(
@@ -134,19 +130,7 @@ def test_hybrid_mooncake_shm_two_instances(mocker):
         }
     )
     plan = resolve_stage_connector_plan(config, stage_id=1)
-    created: list[ConnectorSpec] = []
-
-    def _fake_create(*args):
-        spec = args[-1]
-        created.append(spec)
-
-        class _Stub:
-            def close(self):
-                pass
-
-        return _Stub()
-
-    mocker.patch.object(OmniConnectorFactory, "create_connector", side_effect=_fake_create)
+    created = create_recording_connector
     connectors = OmniConnectorFactory.create_stage_connectors(plan, _tp_worker_ctx(1))
     assert connectors.receive is not connectors.send
     assert [s.name for s in created] == ["MooncakeTransferEngineConnector", "SharedMemoryConnector"]
@@ -198,7 +182,7 @@ def test_owner_filters_cta_vs_mixin():
     cta_owned.close()
 
 
-def test_tp_and_replica_port_offset_applied_once(mocker):
+def test_tp_and_replica_port_offset_applied_once(create_recording_connector):
     config = OmniTransferConfig(
         connectors={
             ("0", "1"): ConnectorSpec(
@@ -213,19 +197,7 @@ def test_tp_and_replica_port_offset_applied_once(mocker):
     )
     plan = resolve_stage_connector_plan(config, stage_id=1)
     # Avoid constructing a real Mooncake engine — capture the spec passed in.
-    created: list[ConnectorSpec] = []
-
-    def _fake_create(*args):
-        spec = args[-1]
-        created.append(spec)
-
-        class _Stub:
-            def close(self):
-                pass
-
-        return _Stub()
-
-    mocker.patch.object(OmniConnectorFactory, "create_connector", side_effect=_fake_create)
+    created = create_recording_connector
 
     OmniConnectorFactory.create_stage_connectors(
         plan,
@@ -238,7 +210,7 @@ def test_tp_and_replica_port_offset_applied_once(mocker):
     assert created[0].extra["role"] == "dual"
 
 
-def test_stage_replica_never_uses_tp_rank_for_ports(mocker):
+def test_stage_replica_never_uses_tp_rank_for_ports(create_recording_connector):
     config = OmniTransferConfig(
         connectors={
             ("0", "1"): ConnectorSpec(
@@ -248,19 +220,7 @@ def test_stage_replica_never_uses_tp_rank_for_ports(mocker):
         }
     )
     plan = resolve_stage_connector_plan(config, stage_id=1, async_chunk=True)
-    created: list[ConnectorSpec] = []
-
-    def _fake_create(*args):
-        spec = args[-1]
-        created.append(spec)
-
-        class _Stub:
-            def close(self):
-                pass
-
-        return _Stub()
-
-    mocker.patch.object(OmniConnectorFactory, "create_connector", side_effect=_fake_create)
+    created = create_recording_connector
     # Even if a bogus tp_rank sneaks in, CHUNK_TRANSFER_ADAPTER must force local_rank=0.
     ctx = ConnectorRuntimeContext(
         stage_id=1,
@@ -291,7 +251,7 @@ def test_stage_connector_set_close_dedupes_dual():
 
 
 def test_dual_merge_preserves_distinct_directional_rank_mappings():
-    merged = OmniConnectorBase.merge_duplex_specs(
+    merged = OmniConnectorBase.merge_dual_specs(
         {"role": "receiver", "rank_mapping": {"from_tp": 4, "to_tp": 2}},
         {"role": "sender", "rank_mapping": {"from_tp": 2, "to_tp": 1}},
     )

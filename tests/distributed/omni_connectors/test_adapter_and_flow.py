@@ -348,7 +348,7 @@ def test_resolve_stage_connector_plan_preserves_tp_topology_template():
     plan = resolve_stage_connector_plan(config, stage_id=1)
 
     assert plan.input_spec is not None
-    topology = plan.input_spec.kv_topology
+    topology = plan.input_spec.parallel_topology
     assert topology is not None
     assert topology.source_tp_size == 4
     assert topology.target_tp_size == 2
@@ -360,6 +360,7 @@ def test_resolve_stage_connector_plan_preserves_tp_topology_template():
     [
         {"extra": {}},
         {"name": "SharedMemoryConnector", "extra": []},
+        {"name": "   ", "extra": {}},
     ],
 )
 def test_legacy_model_connector_config_validation(config):

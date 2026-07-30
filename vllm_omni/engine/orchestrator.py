@@ -1436,7 +1436,7 @@ class Orchestrator:
                 resumable=resumable,
             )
             request.external_req_id = request.request_id
-            request.sender_info = self._build_chunk_sender_info(next_stage_id - 1, req_id)
+            request.sender_info = self._build_payload_sender_info(next_stage_id - 1, req_id)
             return request
 
         processor = self._get_stage_input_processor(next_stage_id)
@@ -1450,7 +1450,7 @@ class Orchestrator:
         )
         request = self._upgrade_processed_stage_request(request, next_input)
         request.external_req_id = req_id
-        request.sender_info = self._build_chunk_sender_info(next_stage_id - 1, req_id)
+        request.sender_info = self._build_payload_sender_info(next_stage_id - 1, req_id)
         return request
 
     @staticmethod
@@ -1938,7 +1938,7 @@ class Orchestrator:
                     resumable=next_stage_resumable,
                 )
                 request.external_req_id = request.request_id
-                request.sender_info = self._build_chunk_sender_info(src_stage_id, req_id)
+                request.sender_info = self._build_payload_sender_info(src_stage_id, req_id)
                 if already_submitted:
                     replica_id = await next_pool.submit_update(req_id, req_state, request)
                 else:
@@ -2141,7 +2141,7 @@ class Orchestrator:
                     resumable=downstream_resumable,
                 )
                 request.external_req_id = request.request_id
-                request.sender_info = self._build_chunk_sender_info(next_stage_id - 1, request_id)
+                request.sender_info = self._build_payload_sender_info(next_stage_id - 1, request_id)
                 replica_id = await next_pool.submit_initial(
                     request_id,
                     req_state,
@@ -2201,7 +2201,7 @@ class Orchestrator:
 
         return sender_infos or None
 
-    def _build_chunk_sender_info(
+    def _build_payload_sender_info(
         self,
         sender_stage_id: int,
         request_id: str,
@@ -2214,24 +2214,15 @@ class Orchestrator:
         sender_stage = sender_pool.get_bound_client(request_id)
         if sender_stage is None:
             sender_stage = sender_pool.stage_client
-        get_sender_info = getattr(sender_stage, "get_chunk_sender_info", None)
+        get_sender_info = getattr(sender_stage, "get_payload_sender_info", None)
         if not callable(get_sender_info):
             return None
-        sender_info = get_sender_info()
-        if isinstance(sender_info, dict):
-            try:
-                sender_info = ConnectorEndpoint(
-                    host=str(sender_info["host"]),
-                    zmq_port=int(sender_info["zmq_port"]),
-                )
-            except (KeyError, TypeError, ValueError):
-                sender_info = None
-        if not isinstance(sender_info, ConnectorEndpoint):
+        sender_info = ConnectorEndpoint.coerce(get_sender_info())
+        if sender_info is None:
             logger.warning(
                 "[Orchestrator] Stage-%s has no valid chunk sender endpoint available",
                 sender_stage_id,
             )
-            return None
         return sender_info
 
     # ---- Shutdown / lifecycle ----

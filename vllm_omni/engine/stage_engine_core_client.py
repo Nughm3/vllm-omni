@@ -384,7 +384,7 @@ class StageEngineCoreClientBase(StageClientBase):
             ),
         }
 
-    def get_chunk_sender_info(self) -> ConnectorEndpoint | None:
+    def get_payload_sender_info(self) -> ConnectorEndpoint | None:
         """Build this replica's ordinary stage-transfer sender endpoint."""
         model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
         if model_config is None:

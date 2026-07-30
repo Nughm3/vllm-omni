@@ -140,8 +140,9 @@ def kv_zmq_port(
     ports for a different namespace (e.g. the omni multimodal stage-transfer
     connectors) pass their own offset — 0 to share no purpose-level offset.
     """
-    replica = get_omni_replica_id() if replica_id is None else max(int(replica_id), 0)
-    return base_port + purpose_offset + replica * KV_REPLICA_PORT_STRIDE + local_rank * KV_RANK_PORT_STRIDE + from_stage
+    return (
+        base_port + purpose_offset + worker_rank_port_offset(local_rank=local_rank, replica_id=replica_id) + from_stage
+    )
 
 
 def worker_rank_port_offset(local_rank: int | None = None, replica_id: int | None = None) -> int:

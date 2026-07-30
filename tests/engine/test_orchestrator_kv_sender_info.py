@@ -25,7 +25,7 @@ class _DummySenderStage:
     def get_kv_sender_info(self):
         return self._sender_info
 
-    def get_chunk_sender_info(self):
+    def get_payload_sender_info(self):
         return self._sender_info
 
 
@@ -58,7 +58,21 @@ def _build_sender_pool(stage_id: int, sender_info: dict[str, object]) -> StagePo
     )
 
 
-def test_build_chunk_sender_info_uses_bound_replica():
+def test_connector_endpoint_coerce_normalizes_dict_and_rejects_invalid():
+    """ConnectorEndpoint.coerce is the single shared normalizer for a
+    sender endpoint that may have crossed a msgspec IPC boundary as a
+    plain dict (used by both the orchestrator and the worker mixin)."""
+    endpoint = ConnectorEndpoint(host="10.0.0.1", zmq_port=50151)
+
+    assert ConnectorEndpoint.coerce(None) is None
+    assert ConnectorEndpoint.coerce(endpoint) is endpoint
+    assert ConnectorEndpoint.coerce({"host": "10.0.0.1", "zmq_port": 50151}) == endpoint
+    assert ConnectorEndpoint.coerce({"host": "10.0.0.1"}) is None  # missing zmq_port
+    assert ConnectorEndpoint.coerce({"host": "10.0.0.1", "zmq_port": "not-an-int"}) is None
+    assert ConnectorEndpoint.coerce("not-a-dict-or-endpoint") is None
+
+
+def test_build_payload_sender_info_uses_bound_replica():
     orchestrator = object.__new__(Orchestrator)
     replica0 = _DummySenderStage({"host": "10.0.0.1", "zmq_port": 50151})
     replica1 = _DummySenderStage({"host": "10.0.0.2", "zmq_port": 50251})
@@ -68,7 +82,7 @@ def test_build_chunk_sender_info_uses_bound_replica():
     )
     orchestrator.stage_pools = [sender_pool]
 
-    sender_info = orchestrator._build_chunk_sender_info(0, "req-on-replica-1")
+    sender_info = orchestrator._build_payload_sender_info(0, "req-on-replica-1")
 
     assert sender_info == ConnectorEndpoint(host="10.0.0.2", zmq_port=50251)
 
@@ -89,7 +103,7 @@ def test_stage_engine_core_client_builds_kv_sender_info_from_tcp_address():
     }
 
 
-def test_stage_engine_core_client_builds_chunk_sender_info_for_actual_replica():
+def test_stage_engine_core_client_builds_payload_sender_info_for_actual_replica():
     client = object.__new__(StageEngineCoreClient)
     client.stage_id = 1
     client.replica_id = 1
@@ -104,7 +118,7 @@ def test_stage_engine_core_client_builds_chunk_sender_info_for_actual_replica():
         )
     )
 
-    assert client.get_chunk_sender_info() == ConnectorEndpoint(host="10.20.30.40", zmq_port=51076)
+    assert client.get_payload_sender_info() == ConnectorEndpoint(host="10.20.30.40", zmq_port=51076)
 
 
 def test_stage_engine_core_client_falls_back_to_detected_ip_for_loopback(monkeypatch):

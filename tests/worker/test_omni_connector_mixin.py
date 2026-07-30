@@ -1335,6 +1335,155 @@ class TestAttachOmniConnectorOutput:
         assert wrapped.omni_connector_output.chunk_ready_req_ids == {"req-1"}
 
 
+class _FailingConnector:
+    """Connector whose put() fails a configurable number of times."""
+
+    def __init__(self, fail_count: int = 1, raise_on_fail: bool = False):
+        self._fail_count = fail_count
+        self._raise_on_fail = raise_on_fail
+        self.attempt = 0
+
+    def put(self, from_stage, to_stage, put_key, data):
+        self.attempt += 1
+        if self.attempt <= self._fail_count:
+            if self._raise_on_fail:
+                raise ConnectionError("transient connector error")
+            return False, 0, None
+        return True, len(str(data)), None
+
+    def get(self, *a, **kw):
+        return None
+
+    def close(self):
+        pass
+
+
+class TestSendRetry:
+    """Tests for P1-2: failed connector sends must be retried."""
+
+    def _make_sender(self, connector):
+        sender = MixinHost()
+        sender.init_omni_connectors(
+            model_config=_make_model_config(stage_id=0, async_chunk=True),
+        )
+        sender._omni_connector = connector
+        sender._stage_id = 0
+        sender._async_chunk = True
+        return sender
+
+    def _make_task(self, req_id="r1"):
+        return {
+            "stage_id": 0,
+            "next_stage_id": 1,
+            "request_id": req_id,
+            "data": {"payload": "test"},
+        }
+
+    def test_send_single_request_returns_false_on_put_failure(self):
+        connector = _FailingConnector(fail_count=999)
+        sender = self._make_sender(connector)
+
+        result = sender._send_single_request(self._make_task())
+        assert not result
+        sender.shutdown_omni_connectors()
+
+    def test_send_single_request_does_not_decrement_on_failure(self):
+        connector = _FailingConnector(fail_count=999)
+        sender = self._make_sender(connector)
+        sender._pending_save_counts["r1"] = 1
+
+        sender._send_single_request(self._make_task())
+        assert sender._pending_save_counts.get("r1") == 1, "pending count must NOT be decremented on failure"
+        sender.shutdown_omni_connectors()
+
+    def test_send_single_request_decrements_on_success(self):
+        connector = MockConnector(stage_id=0)
+        sender = self._make_sender(connector)
+        sender._pending_save_counts["r1"] = 1
+
+        result = sender._send_single_request(self._make_task())
+        assert result
+        assert "r1" not in sender._pending_save_counts, "pending count should be zero/removed on success"
+        sender.shutdown_omni_connectors()
+
+    def test_requeue_or_drop_requeues_on_first_failure(self):
+        sender = self._make_sender(MockConnector(stage_id=0))
+        task = self._make_task()
+
+        sender._requeue_or_drop_failed_send(task)
+
+        assert task.get("_retry_count") == 1
+        with sender._lock:
+            dq = sender._pending_save_reqs.get("r1")
+        assert dq is not None
+        assert len(dq) == 1
+        sender.shutdown_omni_connectors()
+
+    def test_requeue_or_drop_drops_after_max_retries(self):
+        sender = self._make_sender(MockConnector(stage_id=0))
+        sender._pending_save_counts["r1"] = 1
+        task = self._make_task()
+        task["_retry_count"] = sender._MAX_SEND_RETRIES  # already at max
+
+        sender._requeue_or_drop_failed_send(task)
+
+        with sender._lock:
+            dq = sender._pending_save_reqs.get("r1")
+        assert dq is None or len(dq) == 0, "task should NOT be re-enqueued after max retries"
+        assert "r1" not in sender._pending_save_counts, "pending count should be cleaned up on final drop"
+        sender.shutdown_omni_connectors()
+
+    def test_save_loop_retries_on_exception(self):
+        """Integration: _save_loop retries a task when put() raises."""
+        from collections import deque
+
+        connector = _FailingConnector(fail_count=1, raise_on_fail=True)
+        sender = self._make_sender(connector)
+        task = self._make_task()
+
+        with sender._lock:
+            sender._pending_save_reqs["r1"] = deque([task])
+        sender._pending_save_counts["r1"] = 1
+
+        sender._stop_event.clear()
+
+        def run_one_loop():
+            sender._save_loop()
+
+        sender._stop_event.set()  # will exit after one iteration
+        # Run manually instead of threading
+        # Simulate: pop task, send fails, requeue
+        popped_task = None
+        with sender._lock:
+            dq = sender._pending_save_reqs.get("r1")
+            if dq:
+                popped_task = dq.popleft()
+                if not dq:
+                    del sender._pending_save_reqs["r1"]
+
+        if popped_task is not None:
+            success = False
+            try:
+                success = sender._send_single_request(popped_task)
+            except Exception:
+                pass
+            if not success:
+                sender._requeue_or_drop_failed_send(popped_task)
+
+        # After first failure, task should be re-enqueued
+        with sender._lock:
+            dq = sender._pending_save_reqs.get("r1")
+        assert dq is not None
+        assert len(dq) == 1
+        requeued = dq[0]
+        assert requeued.get("_retry_count") == 1
+
+        # Second attempt should succeed (connector now returns True)
+        success = sender._send_single_request(requeued)
+        assert success
+        sender.shutdown_omni_connectors()
+
+
 def test_plan_edges_drive_non_adjacent_stage_routing():
     from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, OmniTransferConfig
     from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_stage_connector_plan

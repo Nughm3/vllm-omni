@@ -49,7 +49,7 @@ class ResolvedConnectorSpec:
     edge: StageEdge
     spec: ConnectorSpec
     owner: ConnectorOwner
-    kv_topology: KVTPTopology | None = None
+    parallel_topology: KVTPTopology | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,7 +106,7 @@ def _parse_stage_id(stage_id: str | int) -> int:
         raise ValueError(f"Stage id must be an integer, got {stage_id!r}") from exc
 
 
-def _kv_topology_from_spec(spec: ConnectorSpec) -> KVTPTopology | None:
+def _parallel_topology_from_spec(spec: ConnectorSpec) -> KVTPTopology | None:
     rank_mapping = spec.extra.get("rank_mapping")
     if not isinstance(rank_mapping, dict):
         return None
@@ -119,6 +119,21 @@ def _kv_topology_from_spec(spec: ConnectorSpec) -> KVTPTopology | None:
     )
     validate_kv_tp_topology(topology)
     return topology
+
+
+def _build_resolved_spec(
+    *,
+    from_stage: int,
+    to_stage: int,
+    spec: ConnectorSpec,
+    owner: ConnectorOwner,
+) -> ResolvedConnectorSpec:
+    return ResolvedConnectorSpec(
+        edge=StageEdge(from_stage=from_stage, to_stage=to_stage),
+        spec=spec,
+        owner=owner,
+        parallel_topology=_parallel_topology_from_spec(spec),
+    )
 
 
 def stage_connector_plan_from_model_config(
@@ -151,7 +166,7 @@ def stage_connector_plan_from_model_config(
             extra = getattr(raw, "extra", None)
         if extra is None:
             extra = {}
-        if not isinstance(name, str) or not name:
+        if not isinstance(name, str) or not name.strip():
             raise ValueError(f"Invalid {attr}: missing connector name")
         if not isinstance(extra, dict):
             raise TypeError(f"Invalid extra config for connector {name}: expected dict, got {type(extra).__name__}")
@@ -164,39 +179,15 @@ def stage_connector_plan_from_model_config(
             model_config, "stage_output_connector_config"
         )
         return StageConnectorPlan(uses_legacy_default=not has_explicit_directional_config)
-
     inbound: tuple[ResolvedConnectorSpec, ...] = ()
     if input_connector is not None:
         from_stage = int(input_connector.extra.get("from_stage", max(0, stage_id - 1)))
-        inbound = (
-            ResolvedConnectorSpec(
-                edge=StageEdge(from_stage=from_stage, to_stage=stage_id),
-                spec=input_connector,
-                owner=owner,
-                kv_topology=_kv_topology_from_spec(input_connector),
-            ),
-        )
-
+        inbound = (_build_resolved_spec(from_stage=from_stage, to_stage=stage_id, spec=input_connector, owner=owner),)
     outbound: tuple[ResolvedConnectorSpec, ...] = ()
     if output_connector is not None:
         to_stage = int(output_connector.extra.get("to_stage", stage_id + 1))
-        outbound = (
-            ResolvedConnectorSpec(
-                edge=StageEdge(from_stage=stage_id, to_stage=to_stage),
-                spec=output_connector,
-                owner=owner,
-                kv_topology=_kv_topology_from_spec(output_connector),
-            ),
-        )
-
+        outbound = (_build_resolved_spec(from_stage=stage_id, to_stage=to_stage, spec=output_connector, owner=owner),)
     return StageConnectorPlan(inbound=inbound, outbound=outbound)
-
-
-def _stage_port_offset(stage_id: str | int) -> int:
-    try:
-        return int(stage_id)
-    except (TypeError, ValueError):
-        return 0
 
 
 def _apply_transfer_engine_ports(
@@ -215,7 +206,10 @@ def _apply_transfer_engine_ports(
     to every rank. The factory adds that offset inside the owning process.
     """
     base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
-    stage_base_port = base_port + _stage_port_offset(from_stage)
+    # A non-numeric from_stage (e.g. a typo'd "from_stage_thinker" edge key
+    # instead of a numeric stage id) must fail loudly here — silently
+    # treating it as offset 0 would collide with stage 0's own port.
+    stage_base_port = base_port + _parse_stage_id(from_stage)
 
     if is_put:
         # Outbound edge: from_stage is this stage — bind base + this_stage.
@@ -320,12 +314,7 @@ def resolve_stage_connector_plan(
                 )
             from_stage = _parse_stage_id(edge_key.removeprefix("from_stage_"))
             inbound.append(
-                ResolvedConnectorSpec(
-                    edge=StageEdge(from_stage=from_stage, to_stage=this_stage),
-                    spec=connector_spec,
-                    owner=owner,
-                    kv_topology=_kv_topology_from_spec(connector_spec),
-                )
+                _build_resolved_spec(from_stage=from_stage, to_stage=this_stage, spec=connector_spec, owner=owner)
             )
         elif edge_key.startswith("to_stage_"):
             if outbound:
@@ -335,12 +324,7 @@ def resolve_stage_connector_plan(
                 )
             to_stage = _parse_stage_id(edge_key.removeprefix("to_stage_"))
             outbound.append(
-                ResolvedConnectorSpec(
-                    edge=StageEdge(from_stage=this_stage, to_stage=to_stage),
-                    spec=connector_spec,
-                    owner=owner,
-                    kv_topology=_kv_topology_from_spec(connector_spec),
-                )
+                _build_resolved_spec(from_stage=this_stage, to_stage=to_stage, spec=connector_spec, owner=owner)
             )
 
     return StageConnectorPlan(

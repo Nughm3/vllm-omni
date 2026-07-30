@@ -27,7 +27,7 @@ class SharedMemoryConnector(OmniConnectorBase):
     # POSIX shared-memory keys are direction-neutral, and the connector's
     # bookkeeping is safe for concurrent receive/send adapter threads.
     # Payloads still use OmniSerializer, so supports_raw_data remains false.
-    capabilities = ConnectorCapabilities(supports_shared_dual=True, thread_safe_dual=True)
+    capabilities = ConnectorCapabilities(supports_shared_dual=True)
 
     def __init__(self, config: dict[str, Any]):
         self.config = config

@@ -116,7 +116,7 @@ class MoriTransferEngineConnector(OmniConnectorBase):
 
     # Mori transfers raw tensor storage through its RDMA engine. Its shared
     # backend state supports dual-role reuse and concurrent get/put threads.
-    capabilities = ConnectorCapabilities(supports_raw_data=True, supports_shared_dual=True, thread_safe_dual=True)
+    capabilities = ConnectorCapabilities(supports_raw_data=True, supports_shared_dual=True)
 
     # ------------------------------------------------------------------ init
     def __init__(self, config: dict[str, Any]):

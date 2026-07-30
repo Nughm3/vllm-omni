@@ -71,7 +71,7 @@ class OmniConnectorFactory:
         2. Apply TP/replica port offset for transfer-engine connectors
            (``CHUNK_TRANSFER_ADAPTER`` forces local_rank=0 and never queries the TP group).
         3. Dual-collapse same-type compatible edges via ``can_share`` /
-           ``merge_duplex_specs`` when shared, thread-safe dual operation is
+           ``merge_dual_specs`` when shared, thread-safe dual operation is
            supported.
         4. Explicit inbound-only → ``send is None``; outbound-only →
            ``receive is None``. Legacy default SHM serves both directions.
@@ -93,7 +93,7 @@ class OmniConnectorFactory:
             return StageConnectorSet(receive=None, send=None)
 
         if recv_spec is not None and send_spec is not None:
-            return cls._build_duplex_or_hybrid(recv_spec, send_spec)
+            return cls._build_dual_or_hybrid(recv_spec, send_spec)
 
         if recv_spec is not None:
             # Explicit inbound-only: do not reuse the receiver as a sender.
@@ -155,7 +155,7 @@ class OmniConnectorFactory:
         return ConnectorSpec(name=resolved.spec.name, extra=extra)
 
     @classmethod
-    def _build_duplex_or_hybrid(
+    def _build_dual_or_hybrid(
         cls,
         recv_spec: ConnectorSpec,
         send_spec: ConnectorSpec,
@@ -164,10 +164,9 @@ class OmniConnectorFactory:
         if (
             recv_spec.name == send_spec.name
             and connector_cls.capabilities.supports_shared_dual
-            and connector_cls.capabilities.thread_safe_dual
             and connector_cls.can_share(recv_spec.extra, send_spec.extra)
         ):
-            merged = connector_cls.merge_duplex_specs(recv_spec.extra, send_spec.extra)
+            merged = connector_cls.merge_dual_specs(recv_spec.extra, send_spec.extra)
             conn = cls.create_connector(ConnectorSpec(name=recv_spec.name, extra=merged))
             logger.info(
                 "Dual-collapsed %s inbound/outbound into one shared instance (role=dual)",

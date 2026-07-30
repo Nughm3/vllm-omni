@@ -124,20 +124,18 @@ class OmniConnectorModelRunnerMixin:
             model_config,
             owner=ConnectorOwner.CONNECTOR_MIXIN,
         )
-        self._previous_stage_id = (
-            connector_plan.input_spec.edge.from_stage
-            if connector_plan.input_spec is not None
-            else self._stage_id - 1
-            if connector_plan.uses_legacy_default
-            else None
-        )
-        self._next_stage_id = (
-            connector_plan.output_spec.edge.to_stage
-            if connector_plan.output_spec is not None
-            else self._stage_id + 1
-            if connector_plan.uses_legacy_default
-            else None
-        )
+        if connector_plan.input_spec is not None:
+            self._previous_stage_id = connector_plan.input_spec.edge.from_stage
+        elif connector_plan.uses_legacy_default:
+            self._previous_stage_id = self._stage_id - 1
+        else:
+            self._previous_stage_id = None
+        if connector_plan.output_spec is not None:
+            self._next_stage_id = connector_plan.output_spec.edge.to_stage
+        elif connector_plan.uses_legacy_default:
+            self._next_stage_id = self._stage_id + 1
+        else:
+            self._next_stage_id = None
         self._connectors = OmniConnectorFactory.create_stage_connectors(
             connector_plan,
             ConnectorRuntimeContext(
@@ -606,19 +604,10 @@ class OmniConnectorModelRunnerMixin:
 
     @staticmethod
     def _normalize_sender_endpoint(sender_info: Any) -> ConnectorEndpoint | None:
-        if sender_info is None or isinstance(sender_info, ConnectorEndpoint):
-            return sender_info
-        if isinstance(sender_info, dict):
-            try:
-                return ConnectorEndpoint(
-                    host=str(sender_info["host"]),
-                    zmq_port=int(sender_info["zmq_port"]),
-                )
-            except (KeyError, TypeError, ValueError):
-                logger.warning("Ignoring malformed stage-transfer sender_info: %r", sender_info)
-                return None
-        logger.warning("Ignoring unsupported stage-transfer sender_info type: %s", type(sender_info).__name__)
-        return None
+        coerced = ConnectorEndpoint.coerce(sender_info)
+        if coerced is None and sender_info is not None:
+            logger.warning("Ignoring invalid stage-transfer sender_info: %r", sender_info)
+        return coerced
 
     def _recv_ordinary_stage_result(
         self,
@@ -2262,8 +2251,8 @@ class OmniConnectorModelRunnerMixin:
                 local_rank=local_rank,
             )
 
-        recv = _runtime_topology(plan.input_spec.kv_topology if plan.input_spec is not None else None)
-        send_template = plan.output_spec.kv_topology if plan.output_spec is not None else None
+        recv = _runtime_topology(plan.input_spec.parallel_topology if plan.input_spec is not None else None)
+        send_template = plan.output_spec.parallel_topology if plan.output_spec is not None else None
         if send_template is None and plan.output_spec is None:
             send = recv
         else:

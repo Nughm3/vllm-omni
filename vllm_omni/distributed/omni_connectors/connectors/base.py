@@ -23,10 +23,6 @@ class ConnectorCapabilities:
     # receiver edge and outbound sender edge of a middle stage.
     supports_shared_dual: bool = False
 
-    # Whether concurrent get/put calls from independent receive/send threads
-    # are safe when the connector is materialized as one shared dual instance.
-    thread_safe_dual: bool = False
-
 
 class OmniConnectorBase(ABC):
     """Base class for all OmniConnectors."""
@@ -122,7 +118,7 @@ class OmniConnectorBase(ABC):
         return all(recv_extra.get(key) == send_extra.get(key) for key in shared_keys)
 
     @classmethod
-    def merge_duplex_specs(cls, recv_extra: dict[str, Any], send_extra: dict[str, Any]) -> dict[str, Any]:
+    def merge_dual_specs(cls, recv_extra: dict[str, Any], send_extra: dict[str, Any]) -> dict[str, Any]:
         """Merge inbound + outbound extras into one ``role="dual"`` config.
 
         Shared backend knobs come from the outbound extra; direction-specific

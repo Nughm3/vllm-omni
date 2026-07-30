@@ -16,7 +16,6 @@ import importlib
 import inspect
 import threading
 from collections import defaultdict, deque
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -2151,48 +2150,6 @@ class OmniConnectorModelRunnerMixin:
     # ------------------------------------------------------------------ #
     #  Helpers
     # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _freeze_request_attr(value: Any) -> Any:
-        if isinstance(value, list):
-            return list(value)
-        if isinstance(value, tuple):
-            return list(value)
-        if isinstance(value, torch.Tensor):
-            return value.clone()
-        raw_list = getattr(value, "_x", None)
-        if raw_list is not None:
-            return list(raw_list)
-        return value
-
-    def _snapshot_request_for_send(self, request: Any, external_req_id: str) -> Any:
-        finished = bool(getattr(request, "is_finished", lambda: False)())
-        attrs: dict[str, Any] = {}
-        try:
-            attrs.update(vars(request))
-        except TypeError:
-            pass
-
-        for name in (
-            "request_id",
-            "req_id",
-            "external_req_id",
-            "prompt_token_ids",
-            "output_token_ids",
-            "all_token_ids",
-            "additional_information",
-            "sampling_params",
-            "multi_modal_data",
-            "mm_hashes",
-        ):
-            if hasattr(request, name):
-                attrs[name] = self._freeze_request_attr(getattr(request, name))
-
-        attrs["external_req_id"] = external_req_id
-        attrs["_frozen_is_finished"] = finished
-        snapshot = SimpleNamespace(**attrs)
-        snapshot.is_finished = lambda: finished
-        return snapshot
 
     @staticmethod
     def _load_custom_func(model_config: Any) -> tuple[str | None, Any | None]:

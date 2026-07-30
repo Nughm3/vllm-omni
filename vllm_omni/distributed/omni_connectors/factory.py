@@ -71,9 +71,8 @@ class OmniConnectorFactory:
         2. Apply TP/replica port offset for transfer-engine connectors
            (``CHUNK_TRANSFER_ADAPTER`` forces local_rank=0 and never queries the TP group).
         3. Dual-collapse same-type compatible edges via ``can_share`` /
-           ``merge_dual_specs`` when shared, thread-safe dual operation is
-           supported.
-        4. Explicit inbound-only → ``send is None``; outbound-only →
+           ``merge_dual_specs`` when shared dual operation is supported.
+        4. Explicit inbound-only: ``send is None``; outbound-only:
            ``receive is None``. Legacy default SHM serves both directions.
         """
         from .utils.initialization import StageConnectorPlan

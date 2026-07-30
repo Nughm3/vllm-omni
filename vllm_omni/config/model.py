@@ -166,10 +166,6 @@ class OmniModelConfig(ModelConfig):
 
     @property
     def stage_input_connector_config(self) -> dict[str, Any] | None:
-        """Inbound (recv) stage connector configuration, derived from
-        ``stage_connector_plan`` — the single source of truth that crosses
-        process boundaries. Contains "name" (connector name), "extra" (extra
-        connector config)."""
         plan = self.stage_connector_plan
         if plan is None:
             return {"name": "SharedMemoryConnector", "extra": {}}
@@ -177,10 +173,6 @@ class OmniModelConfig(ModelConfig):
 
     @property
     def stage_output_connector_config(self) -> dict[str, Any] | None:
-        """Outbound (send) stage connector configuration, derived from
-        ``stage_connector_plan``. Same shape as ``stage_input_connector_config``.
-        When both edges of a middle stage use the same connector type the
-        mixin collapses them into one dual instance."""
         plan = self.stage_connector_plan
         if plan is None:
             return None

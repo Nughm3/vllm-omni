@@ -86,7 +86,7 @@ def _make_request(
 class MixinHost(OmniConnectorModelRunnerMixin):
     """Minimal class that mixes in the mixin for testing.
 
-    Exposes a back-compat ``_omni_connector`` property for tests that inject a
+    Exposes an ``_omni_connector`` property for tests that inject a
     single mock connector into the canonical ``StageConnectorSet``.
     """
 
@@ -540,7 +540,7 @@ class TestChunkStreamCompletedGuard:
 
         host.register_chunk_recv(_make_request("req-1", sender_info=sender_info))
 
-        assert host._sender_info["req-1"] == sender_info
+        assert host._pending_load_reqs["req-1"].sender_info == sender_info
         host.shutdown_omni_connectors()
 
     def test_missing_sender_info_degrades_to_static_endpoint(self):

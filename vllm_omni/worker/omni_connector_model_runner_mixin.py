@@ -162,7 +162,7 @@ class OmniConnectorModelRunnerMixin:
         )
 
         # -- heterogeneous TP rank support (independent per direction) --
-        self._recv_topology, self._send_topology = self._resolve_kv_topologies(
+        self._recv_topology, self._send_topology = self._resolve_parallel_topologies(
             connector_plan,
             local_tp_rank,
         )
@@ -191,7 +191,6 @@ class OmniConnectorModelRunnerMixin:
         self._code_prompt_token_ids: dict[str, list[list[int]]] = defaultdict(list)
         self._cached_ic: dict[str, int] = {}
         self._request_ids_mapping: dict[str, str] = {}
-        self._sender_info: dict[str, ConnectorEndpoint] = {}
 
         # -- async I/O state (shared by chunk + full_payload_mode) --
         self._pending_load_reqs: dict[str, Any] = {}
@@ -369,7 +368,6 @@ class OmniConnectorModelRunnerMixin:
     def _clear_recv_delivery_state(self, req_id: str) -> None:
         self._get_req_chunk.pop(req_id, None)
         self._pending_load_reqs.pop(req_id, None)
-        self._sender_info.pop(req_id, None)
         self._finished_load_reqs.discard(req_id)
         self._chunk_ready_req_ids.discard(req_id)
         self._chunk_finished_req_ids.discard(req_id)
@@ -1106,9 +1104,6 @@ class OmniConnectorModelRunnerMixin:
         # across requests.
         ext = getattr(request, "external_req_id", None)
         self._request_ids_mapping[request_id] = ext if ext is not None else request_id
-        sender_info = getattr(request, "sender_info", None)
-        if sender_info is not None:
-            self._sender_info[request_id] = sender_info
         with self._lock:
             if request_id in self._stage_recv_req_ids:
                 return
@@ -1800,7 +1795,7 @@ class OmniConnectorModelRunnerMixin:
             raise RuntimeError(f"Stage {self._stage_id} has a receive connector without an inbound edge")
         chunk_id = self._get_req_chunk[req_id]
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
-        sender_info = self._sender_info.get(req_id)
+        sender_info = getattr(self._pending_load_reqs.get(req_id), "sender_info", None)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
         if self._async_chunk:
@@ -1887,7 +1882,6 @@ class OmniConnectorModelRunnerMixin:
                     )
                 if is_finished:
                     self._pending_load_reqs.pop(req_id, None)
-                    self._sender_info.pop(req_id, None)
         else:
             # full_payload_mode: the complete payload arrives in a single get(),
             # so always unregister immediately.
@@ -1904,7 +1898,6 @@ class OmniConnectorModelRunnerMixin:
                 # actually visible to the model thread.
                 self._full_payload_pending_broadcast_req_ids.add(req_id)
                 self._pending_load_reqs.pop(req_id, None)
-                self._sender_info.pop(req_id, None)
             logger.debug(
                 "[Stage-%s] full_payload recv complete: req=%s key=%s payload_type=%s",
                 self._stage_id,
@@ -2228,7 +2221,7 @@ class OmniConnectorModelRunnerMixin:
         return fallback_req_id
 
     @staticmethod
-    def _resolve_kv_topologies(
+    def _resolve_parallel_topologies(
         plan: StageConnectorPlan,
         local_rank: int,
     ) -> tuple[KVTPTopology, KVTPTopology]:

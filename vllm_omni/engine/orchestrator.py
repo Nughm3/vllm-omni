@@ -2217,7 +2217,7 @@ class Orchestrator:
         get_sender_info = getattr(sender_stage, "get_payload_sender_info", None)
         if not callable(get_sender_info):
             return None
-        sender_info = ConnectorEndpoint.coerce(get_sender_info())
+        sender_info = get_sender_info()
         if sender_info is None:
             logger.warning(
                 "[Orchestrator] Stage-%s has no valid chunk sender endpoint available",

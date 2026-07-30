@@ -58,24 +58,10 @@ def _build_sender_pool(stage_id: int, sender_info: dict[str, object]) -> StagePo
     )
 
 
-def test_connector_endpoint_coerce_normalizes_dict_and_rejects_invalid():
-    """ConnectorEndpoint.coerce is the single shared normalizer for a
-    sender endpoint that may have crossed a msgspec IPC boundary as a
-    plain dict (used by both the orchestrator and the worker mixin)."""
-    endpoint = ConnectorEndpoint(host="10.0.0.1", zmq_port=50151)
-
-    assert ConnectorEndpoint.coerce(None) is None
-    assert ConnectorEndpoint.coerce(endpoint) is endpoint
-    assert ConnectorEndpoint.coerce({"host": "10.0.0.1", "zmq_port": 50151}) == endpoint
-    assert ConnectorEndpoint.coerce({"host": "10.0.0.1"}) is None  # missing zmq_port
-    assert ConnectorEndpoint.coerce({"host": "10.0.0.1", "zmq_port": "not-an-int"}) is None
-    assert ConnectorEndpoint.coerce("not-a-dict-or-endpoint") is None
-
-
 def test_build_payload_sender_info_uses_bound_replica():
     orchestrator = object.__new__(Orchestrator)
-    replica0 = _DummySenderStage({"host": "10.0.0.1", "zmq_port": 50151})
-    replica1 = _DummySenderStage({"host": "10.0.0.2", "zmq_port": 50251})
+    replica0 = _DummySenderStage(ConnectorEndpoint(host="10.0.0.1", zmq_port=50151))
+    replica1 = _DummySenderStage(ConnectorEndpoint(host="10.0.0.2", zmq_port=50251))
     sender_pool = SimpleNamespace(
         stage_client=replica0,
         get_bound_client=lambda request_id: replica1 if request_id == "req-on-replica-1" else replica0,

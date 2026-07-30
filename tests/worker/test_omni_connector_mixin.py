@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm_omni.engine import ConnectorEndpoint
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
@@ -69,7 +70,7 @@ def _make_model_config(
 def _make_request(
     req_id: str,
     external_req_id: str | None = None,
-    sender_info: dict[str, Any] | None = None,
+    sender_info: ConnectorEndpoint | None = None,
 ):
     r = SimpleNamespace(
         request_id=req_id,
@@ -535,13 +536,11 @@ class TestChunkStreamCompletedGuard:
 
     def test_register_stores_sender_info(self):
         host = self._make_host(stage_id=1)
-        sender_info = {"host": "10.0.0.8", "zmq_port": 50251}
+        sender_info = ConnectorEndpoint(host="10.0.0.8", zmq_port=50251)
 
         host.register_chunk_recv(_make_request("req-1", sender_info=sender_info))
 
-        endpoint = host._sender_info["req-1"]
-        assert endpoint.host == sender_info["host"]
-        assert endpoint.zmq_port == sender_info["zmq_port"]
+        assert host._sender_info["req-1"] == sender_info
         host.shutdown_omni_connectors()
 
     def test_missing_sender_info_degrades_to_static_endpoint(self):
@@ -559,28 +558,11 @@ class TestChunkStreamCompletedGuard:
             sender_info=None,
         )
 
-    def test_malformed_sender_info_always_degrades_gracefully(self):
-        """A sender_info dict in the wrong shape (missing host/zmq_port) is
-        logged and ignored — falls back to metadata=None rather than
-        raising, regardless of how many upstream replicas exist."""
-        host = MixinHost()
-        connector = MagicMock()
-        connector.get.return_value = None
-
-        host._recv_ordinary_stage_result(
-            connector,
-            from_stage="0",
-            to_stage="1",
-            connector_get_key="req-1_0_0",
-            sender_info={"source_host": "legacy-shape"},
-        )
-        connector.get.assert_called_once_with("0", "1", "req-1_0_0", metadata=None)
-
     @pytest.mark.parametrize(
         ("sender_info", "expected_metadata"),
         [
             (
-                {"host": "10.0.0.8", "zmq_port": 50251},
+                ConnectorEndpoint(host="10.0.0.8", zmq_port=50251),
                 {"source_host": "10.0.0.8", "source_port": 50251},
             ),
             (None, None),

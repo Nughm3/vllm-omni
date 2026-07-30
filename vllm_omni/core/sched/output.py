@@ -82,10 +82,7 @@ class OmniChunkRecvHandle:
 
     The runner's ``register_chunk_recv`` only consumes the identifiers and
     sender endpoint from each pending request, so we ship just those fields
-    instead of the full Request object.  Concrete typing
-    keeps msgspec serialization deterministic across IPC (default,
-    PD-disagg, multi-node executor variants) and avoids the
-    ``list[Any]`` fallback path.
+    instead of the full Request object.
     """
 
     request_id: str

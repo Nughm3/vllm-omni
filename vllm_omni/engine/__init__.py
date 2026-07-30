@@ -4,7 +4,6 @@ Engine components for vLLM-Omni.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 import msgspec
@@ -16,8 +15,9 @@ from vllm.v1.engine import (
 )
 
 
-@dataclass(frozen=True, slots=True)
-class ConnectorEndpoint:
+class ConnectorEndpoint(msgspec.Struct, frozen=True):
+    """A stage-transfer sender's (host, port)."""
+
     host: str
     zmq_port: int
 
@@ -29,27 +29,6 @@ class ConnectorEndpoint:
 
     def as_metadata(self) -> dict[str, str | int]:
         return {"source_host": self.host, "source_port": self.zmq_port}
-
-    @classmethod
-    def coerce(cls, value: Any) -> ConnectorEndpoint | None:
-        """Normalize a stage-transfer sender endpoint that may have crossed
-        a process boundary as a plain dict.
-
-        ``ConnectorEndpoint`` is a plain dataclass, not a ``msgspec.Struct``,
-        so msgspec-based IPC (client -> engine-core requests, scheduler ->
-        worker outputs) can decode it back as a bare
-        ``{"host": ..., "zmq_port": ...}`` dict instead of reconstructing
-        the dataclass. Returns ``None`` for anything that can't be resolved
-        to a valid endpoint (including malformed dicts).
-        """
-        if value is None or isinstance(value, cls):
-            return value
-        if isinstance(value, dict):
-            try:
-                return cls(host=str(value["host"]), zmq_port=int(value["zmq_port"]))
-            except (KeyError, TypeError, ValueError):
-                return None
-        return None
 
 
 class PromptEmbedsPayload(msgspec.Struct):

@@ -602,13 +602,6 @@ class OmniConnectorModelRunnerMixin:
         except Exception:
             return None
 
-    @staticmethod
-    def _normalize_sender_endpoint(sender_info: Any) -> ConnectorEndpoint | None:
-        coerced = ConnectorEndpoint.coerce(sender_info)
-        if coerced is None and sender_info is not None:
-            logger.warning("Ignoring invalid stage-transfer sender_info: %r", sender_info)
-        return coerced
-
     def _recv_ordinary_stage_result(
         self,
         connector: OmniConnectorBase,
@@ -618,7 +611,6 @@ class OmniConnectorModelRunnerMixin:
         sender_info: ConnectorEndpoint | None = None,
     ) -> Any:
         """Receive one ordinary non-KV stage payload on the local leader rank only."""
-        sender_info = self._normalize_sender_endpoint(sender_info)
         metadata = None
         if sender_info is not None:
             metadata = sender_info.as_metadata()
@@ -1114,7 +1106,7 @@ class OmniConnectorModelRunnerMixin:
         # across requests.
         ext = getattr(request, "external_req_id", None)
         self._request_ids_mapping[request_id] = ext if ext is not None else request_id
-        sender_info = self._normalize_sender_endpoint(getattr(request, "sender_info", None))
+        sender_info = getattr(request, "sender_info", None)
         if sender_info is not None:
             self._sender_info[request_id] = sender_info
         with self._lock:

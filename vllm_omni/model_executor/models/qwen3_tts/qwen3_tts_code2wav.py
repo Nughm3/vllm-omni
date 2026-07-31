@@ -614,7 +614,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         codec_chunk_frames = 0
         codec_left_context_frames = 0
         model_cfg = getattr(self.vllm_config, "model_config", None)
-        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        connector_cfg = getattr(model_cfg, "stage_input_connector_config", None)
         extra_cfg = (
             connector_cfg.get("extra", connector_cfg)
             if isinstance(connector_cfg, dict)

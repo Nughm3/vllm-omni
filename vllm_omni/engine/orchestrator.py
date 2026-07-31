@@ -2912,7 +2912,6 @@ class Orchestrator:
                 # execute before that conditioning payload arrives.
                 continue
 
-            model_config = getattr(next_pool.stage_vllm_config, "model_config", None)
             connector_plan = connector_plan_from_model_config(model_config) if model_config is not None else None
             inbound = connector_plan.inbound if connector_plan is not None else None
             if inbound is None:

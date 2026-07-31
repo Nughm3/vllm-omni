@@ -11,7 +11,6 @@ from .utils.logging import get_connector_logger
 try:
     from .connectors.base import OmniConnectorBase
     from .utils.config import (
-        TRANSFER_ENGINE_CONNECTOR_NAMES,
         ConnectorSpec,
         StageConnectorPlan,
         StageConnectorSpec,
@@ -23,7 +22,6 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
     from omni_connectors.connectors.base import OmniConnectorBase
     from omni_connectors.utils.config import (
-        TRANSFER_ENGINE_CONNECTOR_NAMES,
         ConnectorSpec,
         StageConnectorPlan,
         StageConnectorSpec,
@@ -32,17 +30,10 @@ except ImportError:
 logger = get_connector_logger(__name__)
 
 
-DualConfigMerger = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any] | None]
-
-
-@dataclass(frozen=True)
-class _ConnectorRegistration:
-    constructor: Callable[[dict[str, Any]], OmniConnectorBase]
-    merge_dual: DualConfigMerger | None = None
-
-
 @dataclass
 class StageConnectorSet:
+    """The receive/send connectors owned by one stage."""
+
     receive: OmniConnectorBase | None = None
     send: OmniConnectorBase | None = None
 
@@ -61,20 +52,18 @@ class StageConnectorSet:
 class OmniConnectorFactory:
     """Factory for creating OmniConnectors."""
 
-    _registry: dict[str, _ConnectorRegistration] = {}
+    _registry: dict[str, Callable[[dict[str, Any]], OmniConnectorBase]] = {}
 
     @classmethod
     def register_connector(
         cls,
         name: str,
         constructor: Callable[[dict[str, Any]], OmniConnectorBase],
-        *,
-        merge_dual: DualConfigMerger | None = None,
     ) -> None:
         """Register a connector constructor."""
         if name in cls._registry:
             raise ValueError(f"Connector '{name}' is already registered.")
-        cls._registry[name] = _ConnectorRegistration(constructor, merge_dual)
+        cls._registry[name] = constructor
         logger.debug(f"Registered connector: {name}")
 
     @classmethod
@@ -83,7 +72,7 @@ class OmniConnectorFactory:
         if spec.name not in cls._registry:
             raise ValueError(f"Unknown connector: {spec.name}. Available: {list(cls._registry.keys())}")
 
-        constructor = cls._registry[spec.name].constructor
+        constructor = cls._registry[spec.name]
         try:
             connector = constructor(spec.extra)
             logger.info(f"Created connector: {spec.name}")
@@ -105,13 +94,10 @@ class OmniConnectorFactory:
         send = cls.materialize_connector_spec(plan.outbound, "sender", stage_id, local_rank, replica_id)
 
         if receive is not None and send is not None and receive.name == send.name:
-            registration = cls._registry.get(receive.name)
-            merger = registration.merge_dual if registration is not None else None
-            if merger is not None:
-                dual = merger(receive.extra, send.extra)
-                if dual is not None:
-                    connector = cls.create_connector(ConnectorSpec(receive.name, dual))
-                    return StageConnectorSet(receive=connector, send=connector)
+            dual = _merge_dual_config(receive.extra, send.extra)
+            if dual is not None:
+                connector = cls.create_connector(ConnectorSpec(receive.name, dual))
+                return StageConnectorSet(receive=connector, send=connector)
 
         return StageConnectorSet(
             receive=cls.create_connector(receive) if receive is not None else None,
@@ -132,13 +118,24 @@ class OmniConnectorFactory:
         extra = dict(edge.spec.extra)
         extra["stage_id"] = stage_id
         extra["role"] = role
-        if edge.spec.name in TRANSFER_ENGINE_CONNECTOR_NAMES:
-            from .utils.initialization import KV_RANK_PORT_STRIDE, KV_REPLICA_PORT_STRIDE
+        from .utils.config import TRANSFER_ENGINE_CONNECTOR_NAMES
 
-            offset = replica_id * KV_REPLICA_PORT_STRIDE + local_rank * KV_RANK_PORT_STRIDE
-            extra["zmq_port"] = int(os.path.expandvars(str(extra.get("zmq_port", 50051)))) + offset
+        if edge.spec.name in TRANSFER_ENGINE_CONNECTOR_NAMES:
+            from .utils.env import expand_env_int
+            from .utils.kv_utils import kv_zmq_port
+
+            base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
+            extra["zmq_port"] = kv_zmq_port(
+                base_port,
+                edge.from_stage,
+                local_rank=local_rank,
+                replica_id=replica_id,
+            )
+            # This is the upstream endpoint. Its rank and replica belong to
+            # the producer, not this worker; request metadata supplies the
+            # exact endpoint when heterogeneous TP/replica routing is used.
             if extra.get("sender_zmq_port") is not None:
-                extra["sender_zmq_port"] = int(os.path.expandvars(str(extra["sender_zmq_port"]))) + offset
+                extra["sender_zmq_port"] = expand_env_int(extra["sender_zmq_port"], "sender_zmq_port")
         return ConnectorSpec(edge.spec.name, extra)
 
     @classmethod
@@ -255,36 +252,29 @@ def _merge_dual_config(receive: dict[str, Any], send: dict[str, Any]) -> dict[st
 OmniConnectorFactory.register_connector(
     "MooncakeStoreConnector",
     _create_mooncake_store_connector,
-    merge_dual=_merge_dual_config,
 )
 OmniConnectorFactory.register_connector(
     "MooncakeTransferEngineConnector",
     _create_mooncake_transfer_engine_connector,
-    merge_dual=_merge_dual_config,
 )
 OmniConnectorFactory.register_connector(
     "SharedMemoryConnector",
     _create_shm_connector,
-    merge_dual=_merge_dual_config,
 )
 OmniConnectorFactory.register_connector(
     "YuanrongConnector",
     _create_yuanrong_connector,
-    merge_dual=_merge_dual_config,
 )
 OmniConnectorFactory.register_connector(
     "YuanrongTransferEngineConnector",
     _create_yuanrong_transfer_engine_connector,
-    merge_dual=_merge_dual_config,
 )
 OmniConnectorFactory.register_connector(
     "MoriTransferEngineConnector",
     _create_mori_transfer_engine_connector,
-    merge_dual=_merge_dual_config,
 )
 # Backward-compatible aliases – will be removed in the future
 OmniConnectorFactory.register_connector(
     "MooncakeConnector",
     _create_mooncake_store_connector,
-    merge_dual=_merge_dual_config,
 )

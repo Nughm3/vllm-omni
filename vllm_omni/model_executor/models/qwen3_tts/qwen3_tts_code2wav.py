@@ -576,6 +576,8 @@ class Qwen3TTSCode2Wav(nn.Module):
             if isinstance(connector_cfg, dict)
             else getattr(connector_cfg, "extra", None)
         )
+        if not isinstance(extra_cfg, dict):
+            extra_cfg = {}
 
         def _get_int_config(name: str, default: int) -> int:
             value = extra_cfg.get(name, default)

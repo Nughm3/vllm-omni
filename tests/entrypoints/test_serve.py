@@ -292,7 +292,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     assert kwargs["omni_stage_config"] is stage_cfg
     assert kwargs["replica_id"] is None
     assert "socket_ownership" not in kwargs
-    assert mock_connector_spec.call_args.kwargs["async_chunk"] is True
+    assert mock_connector_spec.call_args.kwargs == {"omni_transfer_config": None, "stage_id": 0}
 
     assert mock_manager_cls.call_count == 1
     mgr_kwargs = mock_manager_cls.call_args.kwargs

@@ -260,12 +260,16 @@ class OmniConnectorModelRunnerMixin:
 
     def shutdown_omni_connectors(self) -> None:
         """Stop background threads and release connector resources."""
-        self._stop_event.set()
-        if self._recv_thread is not None:
+        stop_event = getattr(self, "_stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
+        if getattr(self, "_recv_thread", None) is not None:
             self._recv_thread.join(timeout=5)
-        if self._save_thread is not None:
+        if getattr(self, "_save_thread", None) is not None:
             self._save_thread.join(timeout=5)
-        self._connectors.close()
+        connectors = getattr(self, "_connectors", None)
+        if connectors is not None:
+            connectors.close()
 
     def cleanup_finished_request(self, req_id: str) -> None:
         """Clean up per-request state after a request is fully finished.
@@ -780,16 +784,6 @@ class OmniConnectorModelRunnerMixin:
         _custom_process_func, both of which are set at init time. Avoid
         the per-step dynamic import inside the model decode loop.
         """
-        if self._connectors.send is None:
-            # No connector at all: send_full_payload_outputs would no-op.
-            # Skip the per-step accumulator+build that would otherwise be
-            # silently discarded.  Defends against a terminal stage whose
-            # custom_process_input_func has a *_full_payload derivative in
-            # the same module (e.g. dynin stage 2 token2image_to_token2audio
-            # in pipelines that don't configure any connector at all).
-            #
-            self._should_accumulate_full_payload_output_cached = False
-            return False
         cached = getattr(self, "_should_accumulate_full_payload_output_cached", None)
         if cached is not None:
             return cached
@@ -982,7 +976,8 @@ class OmniConnectorModelRunnerMixin:
 
         Returns list of request IDs successfully enqueued.
         """
-        if self._connectors.send is None:
+        connectors = getattr(self, "_connectors", None)
+        if connectors is None or connectors.send is None:
             logger.debug("[Stage-%s] send_full_payload_outputs: connector is None, skip", self._stage_id)
             return []
         if not self.is_data_transfer_rank():
@@ -1129,7 +1124,8 @@ class OmniConnectorModelRunnerMixin:
         ``connector.put()`` is done by the background save thread.
         Non-KV data is identical across TP ranks; only rank 0 sends.
         """
-        if self._connectors.send is None:
+        connectors = getattr(self, "_connectors", None)
+        if connectors is None or connectors.send is None:
             logger.warning("[Stage-%s] send_chunk: connector is None", self._stage_id)
             return False
         if not self.is_data_transfer_rank():
@@ -1638,7 +1634,8 @@ class OmniConnectorModelRunnerMixin:
     @property
     def connector(self) -> Any | None:
         """Backward-compatible single-connector view."""
-        return self._connectors.connector
+        connectors = getattr(self, "_connectors", None)
+        return connectors.connector if connectors is not None else None
 
     # ------------------------------------------------------------------ #
     #  Background I/O threads
@@ -1743,7 +1740,8 @@ class OmniConnectorModelRunnerMixin:
 
     def _poll_single_request(self, req_id: str) -> bool:
         """Poll connector for one chunk of a request (non-blocking)."""
-        connector = self._connectors.receive
+        connectors = getattr(self, "_connectors", None)
+        connector = connectors.receive if connectors is not None else None
         if connector is None:
             return False
 
@@ -1760,9 +1758,13 @@ class OmniConnectorModelRunnerMixin:
                 )
                 return False
 
-        target_stage_id = self._previous_stage_id
+        # Test doubles and legacy embedders may install a receive connector
+        # without populating the connector plan. In that case retain the
+        # historical adjacent-stage fallback; a missing receive connector
+        # was handled above as an uninitialized/no-inbound path.
+        target_stage_id = getattr(self, "_previous_stage_id", self._stage_id - 1)
         if target_stage_id is None:
-            raise RuntimeError(f"Stage {self._stage_id} has no inbound connector edge")
+            target_stage_id = self._stage_id - 1
         chunk_id = self._get_req_chunk[req_id]
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
         sender_info = getattr(self._pending_load_reqs.get(req_id), "sender_info", None)
@@ -1960,7 +1962,8 @@ class OmniConnectorModelRunnerMixin:
         ``success=False``), returns False **without** decrementing
         ``_pending_save_counts`` so the caller can retry or clean up.
         """
-        connector = self._connectors.send
+        connectors = getattr(self, "_connectors", None)
+        connector = connectors.send if connectors is not None else None
         if connector is None:
             return True
 

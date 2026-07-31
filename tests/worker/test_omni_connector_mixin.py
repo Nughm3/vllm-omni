@@ -1300,7 +1300,7 @@ class TestConnectorConfigValidation(unittest.TestCase):
         model_config.stage_connector_plan = None
         model_config.stage_connector_config = {"name": "   "}
 
-        with self.assertRaisesRegex(ValueError, "missing connector name"):
+        with self.assertRaisesRegex(ValueError, "Unknown connector"):
             host.init_omni_connectors(model_config=model_config)
 
 

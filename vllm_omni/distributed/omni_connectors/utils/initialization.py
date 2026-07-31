@@ -168,16 +168,19 @@ def _stage_edge_spec(
     target = _stage_id(to_stage)
     extra = dict(spec.extra or {})
     if spec.name in TRANSFER_ENGINE_CONNECTOR_NAMES:
+        from .kv_utils import kv_zmq_port
+
         base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
-        sender_port = base_port + source
         if inbound:
             extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))
             extra["sender_zmq_port"] = expand_env_int(
-                extra.get("sender_zmq_port", sender_port),
+                extra.get("sender_zmq_port", kv_zmq_port(base_port, source)),
                 "sender_zmq_port",
             )
         else:
-            extra["zmq_port"] = sender_port
+            # Keep the configured value as the base port. The factory adds
+            # the local rank/replica portion when materializing this worker.
+            extra["zmq_port"] = base_port
     return StageConnectorSpec(
         from_stage=source,
         to_stage=target,

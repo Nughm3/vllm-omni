@@ -14,9 +14,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     StageConnectorPlan,
     StageConnectorSpec,
 )
-from vllm_omni.distributed.omni_connectors.utils.initialization import (
-    KV_REPLICA_PORT_STRIDE,
-)
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -59,4 +57,4 @@ def test_payload_sender_info_uses_bound_replica_port():
 
     assert endpoint is not None
     assert endpoint.host == "10.0.0.8"
-    assert endpoint.zmq_port == 51000 + 2 * KV_REPLICA_PORT_STRIDE
+    assert endpoint.zmq_port == kv_zmq_port(51000, 1, replica_id=2)

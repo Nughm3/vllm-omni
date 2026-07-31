@@ -2097,15 +2097,16 @@ class Orchestrator:
         for next_stage_id in range(1, req_state.final_stage_id + 1):
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
-            connector_plan = connector_plan_from_model_config(next_pool.stage_vllm_config.model_config)
-            inbound = connector_plan.inbound
-            if inbound is None:
+            if not self._stage_receives_async_chunks(next_stage_id):
                 # Outgoing-only stages receive their first real input from the
                 # orchestrator. Pre-submitting a placeholder lets it race and
                 # execute before that conditioning payload arrives.
                 continue
 
-            sender_stage_id = inbound.from_stage
+            model_config = getattr(next_pool.stage_vllm_config, "model_config", None)
+            connector_plan = connector_plan_from_model_config(model_config) if model_config is not None else None
+            inbound = connector_plan.inbound if connector_plan is not None else None
+            sender_stage_id = inbound.from_stage if inbound is not None else next_stage_id - 1
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             _t_submit_start = _time.perf_counter()
 

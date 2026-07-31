@@ -18,10 +18,9 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     StageConnectorSpec,
 )
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
-    KV_RANK_PORT_STRIDE,
-    KV_REPLICA_PORT_STRIDE,
     resolve_stage_connector_plan,
 )
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -138,10 +137,10 @@ def test_compatible_edges_share_one_dual_instance(created_connectors):
     assert connectors.receive is connectors.send
     assert len(created_connectors) == 1
     extra = created_connectors[0].spec.extra
-    offset = KV_REPLICA_PORT_STRIDE + 2 * KV_RANK_PORT_STRIDE
     assert extra["role"] == "dual"
-    assert extra["zmq_port"] == 50052 + offset
-    assert extra["sender_zmq_port"] == 50051 + offset
+    assert extra["zmq_port"] == kv_zmq_port(50052, 1, local_rank=2, replica_id=1)
+    # The upstream endpoint must not inherit this worker's rank offset.
+    assert extra["sender_zmq_port"] == 50051
 
 
 @pytest.mark.parametrize(

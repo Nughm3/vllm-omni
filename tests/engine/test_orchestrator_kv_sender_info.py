@@ -4,6 +4,11 @@ from types import SimpleNamespace
 import pytest
 from vllm import SamplingParams
 
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    ConnectorSpec,
+    StageConnectorPlan,
+    StageConnectorSpec,
+)
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
@@ -139,7 +144,18 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
     sender_pool = _build_sender_pool(0, {"host": "10.0.0.2", "zmq_port": 50151})
-    diffusion_pool = StagePool(1, diffusion_stage)
+    diffusion_pool = StagePool(
+        1,
+        diffusion_stage,
+        stage_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                stage_id=1,
+                stage_connector_plan=StageConnectorPlan(
+                    inbound=StageConnectorSpec(0, 1, ConnectorSpec("SharedMemoryConnector"))
+                ),
+            )
+        ),
+    )
 
     orchestrator.num_stages = 2
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
@@ -239,7 +255,18 @@ def test_prewarm_diffusion_attaches_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
     sender_pool = _build_sender_pool(0, {"host": "10.0.0.3", "zmq_port": 50151})
-    diffusion_pool = StagePool(1, diffusion_stage)
+    diffusion_pool = StagePool(
+        1,
+        diffusion_stage,
+        stage_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                stage_id=1,
+                stage_connector_plan=StageConnectorPlan(
+                    inbound=StageConnectorSpec(0, 1, ConnectorSpec("SharedMemoryConnector"))
+                ),
+            )
+        ),
+    )
 
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
     orchestrator.num_stages = 2

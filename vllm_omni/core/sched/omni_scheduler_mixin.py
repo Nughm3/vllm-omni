@@ -673,7 +673,7 @@ class OmniSchedulerMixin:
         self,
         request_ids: str | Iterable[str] | None,
         finished_status: RequestStatus,
-    ) -> list[Request]:
+    ) -> list[tuple[str, int]]:
         """Finish requests and clean all Omni-owned queue/coordinator state."""
         if isinstance(request_ids, str):
             target_request_ids = {request_ids}
@@ -706,8 +706,8 @@ class OmniSchedulerMixin:
         self._purge_finished_from_running(target_request_ids)
         self._resync_streaming_input_counter()
 
-        for request in finished:
-            self._free_input_coordinator_request(request.request_id)
+        for request_id, _ in finished:
+            self._free_input_coordinator_request(request_id)
         return finished
 
     def make_stats(self, *args, **kwargs) -> SchedulerStats | None:

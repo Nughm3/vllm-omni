@@ -36,7 +36,7 @@ logger = init_logger(__name__)
 
 def _connector_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
     model_config = getattr(vllm_config, "model_config", None)
-    connector_cfg = getattr(model_config, "stage_connector_config", None)
+    connector_cfg = getattr(model_config, "stage_input_connector_config", None)
     if isinstance(connector_cfg, dict):
         return connector_cfg.get("extra", connector_cfg)
     extra = getattr(connector_cfg, "extra", None)

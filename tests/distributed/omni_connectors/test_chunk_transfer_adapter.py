@@ -15,7 +15,6 @@ from vllm.v1.request import RequestStatus
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
-from vllm_omni.distributed.omni_connectors.stage_connector import StageConnectorSet
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -129,7 +128,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         monkeypatch.setattr(
             OmniConnectorFactory,
             "create_stage_connectors",
-            lambda _plan, _context: StageConnectorSet(receive=connector, send=connector),
+            lambda _plan, **_kwargs: (connector, connector),
         )
 
         role = (connector_extra or {}).get("role")
@@ -172,13 +171,12 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
 def test_typed_plan_materializes_directional_connector_set(monkeypatch):
     receive = mocker_receive = SimpleNamespace(stage_id=1, close=lambda: None)
     send = mocker_send = SimpleNamespace(stage_id=1, close=lambda: None)
-    connector_set = StageConnectorSet(receive=receive, send=send)
     captured = {}
 
-    def _materialize(plan, context):
+    def _materialize(plan, **kwargs):
         captured["plan"] = plan
-        captured["context"] = context
-        return connector_set
+        captured["kwargs"] = kwargs
+        return receive, send
 
     monkeypatch.setattr(OmniConnectorFactory, "create_stage_connectors", _materialize)
     monkeypatch.setattr(OmniTransferAdapterBase, "__init__", lambda self, config: setattr(self, "config", config))
@@ -203,11 +201,11 @@ def test_typed_plan_materializes_directional_connector_set(monkeypatch):
         SimpleNamespace(model_config=model_config, scheduler_config=SimpleNamespace(max_num_seqs=2))
     )
 
-    assert adapter._connectors.receive is mocker_receive
-    assert adapter._connectors.send is mocker_send
+    assert adapter._recv_connector is mocker_receive
+    assert adapter._send_connector is mocker_send
     assert adapter.connector is mocker_send
     assert captured["plan"] is plan
-    assert captured["context"].tp_rank is None
+    assert captured["kwargs"].get("tp_rank") is None
     assert adapter._previous_stage_id == 3
     assert adapter._next_stage_id == 11
 
@@ -221,7 +219,8 @@ def test_adapter_base_starts_only_owned_direction_thread(mocker, has_receive, ha
     send = mocker.MagicMock() if has_send else None
 
     adapter = object.__new__(OmniTransferAdapterBase)
-    adapter._connectors = StageConnectorSet(receive=receive, send=send)
+    adapter._recv_connector = receive
+    adapter._send_connector = send
     OmniTransferAdapterBase.__init__(adapter, config={})
 
     assert (adapter.recv_thread is not None) is has_receive

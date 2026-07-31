@@ -20,7 +20,6 @@ from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
-from vllm_omni.distributed.omni_connectors.stage_connector import ConnectorRuntimeContext
 from vllm_omni.distributed.omni_connectors.utils.config import (
     TRANSFER_ENGINE_CONNECTOR_NAMES,
 )
@@ -393,14 +392,13 @@ class StageEngineCoreClientBase(StageClientBase):
         output = plan.output_spec
         if output is None:
             return None
-        context = ConnectorRuntimeContext(
+        connector_spec = OmniConnectorFactory.resolve_connector_spec(
+            output,
             stage_id=int(self.stage_id),
             owner=output.owner,
             replica_id=int(self.replica_id),
             tp_rank=0 if output.owner == ConnectorOwner.CONNECTOR_MIXIN else None,
-            tp_size=1 if output.owner == ConnectorOwner.CONNECTOR_MIXIN else None,
         )
-        connector_spec = OmniConnectorFactory.resolve_connector_spec(output, context)
         if connector_spec is None:
             return None
         host = self._resolve_sender_host_from_config(connector_spec.extra)

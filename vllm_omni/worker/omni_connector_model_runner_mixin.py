@@ -25,7 +25,6 @@ from vllm.logger import init_logger
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors import ConnectorOwner
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
-from vllm_omni.distributed.omni_connectors.stage_connector import ConnectorRuntimeContext
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     StageConnectorPlan,
     stage_connector_plan_from_model_config,
@@ -117,8 +116,6 @@ class OmniConnectorModelRunnerMixin:
             stage_id = int(stage_id)
         self._stage_id: int = stage_id if isinstance(stage_id, int) else 0
 
-        tp_group = self._get_local_tp_group()
-        tp_size = int(getattr(tp_group, "world_size", 1) or 1)
         local_tp_rank = get_local_tp_rank()
         connector_plan = stage_connector_plan_from_model_config(
             model_config,
@@ -136,15 +133,12 @@ class OmniConnectorModelRunnerMixin:
             self._next_stage_id = self._stage_id + 1
         else:
             self._next_stage_id = None
-        self._connectors = OmniConnectorFactory.create_stage_connectors(
+        self._recv_connector, self._send_connector = OmniConnectorFactory.create_stage_connectors(
             connector_plan,
-            ConnectorRuntimeContext(
-                stage_id=self._stage_id,
-                owner=ConnectorOwner.CONNECTOR_MIXIN,
-                replica_id=get_omni_replica_id(),
-                tp_rank=local_tp_rank,
-                tp_size=tp_size,
-            ),
+            stage_id=self._stage_id,
+            owner=ConnectorOwner.CONNECTOR_MIXIN,
+            replica_id=get_omni_replica_id(),
+            tp_rank=local_tp_rank,
         )
 
         self._custom_process_func_path, self._custom_process_func = self._load_custom_func(model_config)
@@ -155,9 +149,9 @@ class OmniConnectorModelRunnerMixin:
             self._stage_id,
             self._async_chunk,
             self._custom_process_func,
-            type(self._connectors.receive).__name__ if self._connectors.receive else None,
-            type(self._connectors.send).__name__ if self._connectors.send else None,
-            self._connectors.receive is not None and self._connectors.receive is self._connectors.send,
+            type(self._recv_connector).__name__ if self._recv_connector else None,
+            type(self._send_connector).__name__ if self._send_connector else None,
+            self._recv_connector is not None and self._recv_connector is self._send_connector,
             self._custom_process_func_path,
         )
 
@@ -247,14 +241,14 @@ class OmniConnectorModelRunnerMixin:
         # dual stage (recv is send) runs both.
         self._recv_thread: threading.Thread | None = None
         self._save_thread: threading.Thread | None = None
-        if self._connectors.receive is not None:
+        if self._recv_connector is not None:
             self._recv_thread = threading.Thread(
                 target=self._recv_loop,
                 daemon=True,
                 name="omni-mixin-recv",
             )
             self._recv_thread.start()
-        if self._connectors.send is not None:
+        if self._send_connector is not None:
             self._save_thread = threading.Thread(
                 target=self._save_loop,
                 daemon=True,
@@ -276,7 +270,15 @@ class OmniConnectorModelRunnerMixin:
             self._recv_thread.join(timeout=5)
         if self._save_thread is not None:
             self._save_thread.join(timeout=5)
-        self._connectors.close()
+        seen: set[int] = set()
+        for conn in (self._recv_connector, self._send_connector):
+            if conn is None or id(conn) in seen:
+                continue
+            seen.add(id(conn))
+            try:
+                conn.close()
+            except Exception:
+                logger.warning("Failed to close connector %s", type(conn).__name__, exc_info=True)
 
     def cleanup_finished_request(self, req_id: str) -> None:
         """Clean up per-request state after a request is fully finished.
@@ -793,7 +795,7 @@ class OmniConnectorModelRunnerMixin:
         _custom_process_func, both of which are set at init time. Avoid
         the per-step dynamic import inside the model decode loop.
         """
-        if self._connectors.send is None:
+        if self._send_connector is None:
             # No connector at all: send_full_payload_outputs would no-op.
             # Skip the per-step accumulator+build that would otherwise be
             # silently discarded.  Defends against a terminal stage whose
@@ -1007,7 +1009,7 @@ class OmniConnectorModelRunnerMixin:
 
         Returns list of request IDs successfully enqueued.
         """
-        if self._connectors.send is None:
+        if self._send_connector is None:
             logger.debug("[Stage-%s] send_full_payload_outputs: connector is None, skip", self._stage_id)
             return []
         if not self.is_data_transfer_rank():
@@ -1156,7 +1158,7 @@ class OmniConnectorModelRunnerMixin:
         ``connector.put()`` is done by the background save thread.
         Non-KV data is identical across TP ranks; only rank 0 sends.
         """
-        if self._connectors.send is None:
+        if self._send_connector is None:
             logger.warning("[Stage-%s] send_chunk: connector is None", self._stage_id)
             return False
         if not self.is_data_transfer_rank():
@@ -1668,7 +1670,7 @@ class OmniConnectorModelRunnerMixin:
     @property
     def connector(self) -> Any | None:
         """Send-path compatibility view used by legacy payload builders."""
-        return self._connectors.connector
+        return self._send_connector or self._recv_connector
 
     # ------------------------------------------------------------------ #
     #  Background I/O threads
@@ -1773,7 +1775,7 @@ class OmniConnectorModelRunnerMixin:
 
     def _poll_single_request(self, req_id: str) -> bool:
         """Poll connector for one chunk of a request (non-blocking)."""
-        connector = self._connectors.receive
+        connector = self._recv_connector
         if connector is None:
             return False
 
@@ -1990,7 +1992,7 @@ class OmniConnectorModelRunnerMixin:
         ``success=False``), returns False **without** decrementing
         ``_pending_save_counts`` so the caller can retry or clean up.
         """
-        connector = self._connectors.send
+        connector = self._send_connector
         if connector is None:
             return True
 

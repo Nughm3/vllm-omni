@@ -13,7 +13,6 @@ from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_p
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
-from ..stage_connector import ConnectorRuntimeContext
 from ..utils.config import stage_receives_chunks
 from ..utils.initialization import ConnectorOwner, stage_connector_plan_from_model_config
 from ..utils.local_rank import get_omni_replica_id
@@ -75,13 +74,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._next_stage_id = self._stage_id + 1
         else:
             self._next_stage_id = None
-        self._connectors = OmniConnectorFactory.create_stage_connectors(
+        self._recv_connector, self._send_connector = OmniConnectorFactory.create_stage_connectors(
             connector_plan,
-            ConnectorRuntimeContext(
-                stage_id=self._stage_id,
-                owner=ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
-                replica_id=get_omni_replica_id(),
-            ),
+            stage_id=self._stage_id,
+            owner=ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
+            replica_id=get_omni_replica_id(),
         )
         self.receives_chunks = stage_receives_chunks(model_config)
         super().__init__(model_config)
@@ -139,7 +136,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     @property
     def connector(self):
         """Send-path compatibility view used by stage input processors."""
-        return self._connectors.connector
+        return self._send_connector or self._recv_connector
 
     def load_async(self, request: Request):
         """Register a request for asynchronous chunk retrieval.
@@ -187,7 +184,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             request: Request object
             is_segment_finished: whether the segment of request is finished
         """
-        if self._connectors.send is None:
+        if self._send_connector is None:
             raise RuntimeError(f"Stage {self._stage_id} has no outbound connector")
         is_finished = request.is_finished() and not request.resumable
 
@@ -216,7 +213,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     def _poll_single_request(self, request: Request):
         stage_id = self._stage_id
-        connector = self._connectors.receive
+        connector = self._recv_connector
         if connector is None:
             return False
         target_stage_id = self._previous_stage_id
@@ -332,7 +329,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         stage_id = self._stage_id
         # save_async() already validated connector/next_stage_id before this
         # task was enqueued; both are set once at __init__ and never change.
-        connector = self._connectors.send
+        connector = self._send_connector
         next_stage_id = self._next_stage_id
         external_req_id = request.external_req_id
         chunk_id = self.put_req_chunk[external_req_id]

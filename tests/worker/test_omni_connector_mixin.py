@@ -86,20 +86,18 @@ def _make_request(
 class MixinHost(OmniConnectorModelRunnerMixin):
     """Minimal class that mixes in the mixin for testing.
 
-    Exposes an ``_omni_connector`` property for tests that inject a
-    single mock connector into the canonical ``StageConnectorSet``.
+    Exposes an ``_omni_connector`` property for tests that inject a single
+    mock connector as both the recv and send connector.
     """
 
     @property
     def _omni_connector(self):
-        connectors = getattr(self, "_connectors", None)
-        return connectors.connector if connectors is not None else None
+        return self._send_connector or self._recv_connector
 
     @_omni_connector.setter
     def _omni_connector(self, connector):
-        from vllm_omni.distributed.omni_connectors.stage_connector import StageConnectorSet
-
-        self._connectors = StageConnectorSet(receive=connector, send=connector)
+        self._recv_connector = connector
+        self._send_connector = connector
         if connector is not None:
             self._previous_stage_id = self._stage_id - 1
             self._next_stage_id = self._stage_id + 1

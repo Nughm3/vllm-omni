@@ -7,7 +7,6 @@ from .connectors.base import ConnectorCapabilities, OmniConnectorBase
 from .connectors.mooncake_store_connector import MooncakeStoreConnector
 from .connectors.shm_connector import SharedMemoryConnector
 from .connectors.yuanrong_connector import YuanrongConnector
-from .stage_connector import ConnectorRuntimeContext, StageConnectorSet
 
 try:
     from vllm_omni.platforms.npu.omni_connectors.yuanrong_transfer_engine_connector import (
@@ -54,8 +53,6 @@ __all__ = [
     "ConnectorEndpoint",
     # Construction / runtime
     "ConnectorCapabilities",
-    "ConnectorRuntimeContext",
-    "StageConnectorSet",
     # Base classes and implementations
     "OmniConnectorBase",
     # Factory

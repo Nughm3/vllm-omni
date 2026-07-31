@@ -9,10 +9,6 @@ import pytest
 
 from vllm_omni.distributed.omni_connectors.connectors.base import OmniConnectorBase
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
-from vllm_omni.distributed.omni_connectors.stage_connector import (
-    ConnectorRuntimeContext,
-    StageConnectorSet,
-)
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, OmniTransferConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     ConnectorOwner,
@@ -27,21 +23,21 @@ from vllm_omni.distributed.omni_connectors.utils.kv_utils import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _tp_worker_ctx(stage_id: int = 1, *, tp_rank: int = 0, replica_id: int = 0) -> ConnectorRuntimeContext:
-    return ConnectorRuntimeContext(
-        stage_id=stage_id,
-        owner=ConnectorOwner.CONNECTOR_MIXIN,
-        tp_rank=tp_rank,
-        replica_id=replica_id,
-    )
+def _tp_worker_kwargs(stage_id: int = 1, *, tp_rank: int = 0, replica_id: int = 0) -> dict:
+    return {
+        "stage_id": stage_id,
+        "owner": ConnectorOwner.CONNECTOR_MIXIN,
+        "tp_rank": tp_rank,
+        "replica_id": replica_id,
+    }
 
 
-def _cta_ctx(stage_id: int = 1, *, replica_id: int = 0) -> ConnectorRuntimeContext:
-    return ConnectorRuntimeContext(
-        stage_id=stage_id,
-        owner=ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
-        replica_id=replica_id,
-    )
+def _cta_kwargs(stage_id: int = 1, *, replica_id: int = 0) -> dict:
+    return {
+        "stage_id": stage_id,
+        "owner": ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
+        "replica_id": replica_id,
+    }
 
 
 @pytest.fixture
@@ -66,11 +62,11 @@ def create_recording_connector(mocker):
 
 def test_legacy_default_shares_one_shm_instance():
     plan = StageConnectorPlan(uses_legacy_default=True)
-    connectors = OmniConnectorFactory.create_stage_connectors(plan, _tp_worker_ctx(0))
-    assert connectors.receive is not None
-    assert connectors.send is connectors.receive
-    assert type(connectors.receive).__name__ == "SharedMemoryConnector"
-    connectors.close()
+    recv, send = OmniConnectorFactory.create_stage_connectors(plan, **_tp_worker_kwargs(0))
+    assert recv is not None
+    assert send is recv
+    assert type(recv).__name__ == "SharedMemoryConnector"
+    recv.close()
 
 
 def test_same_type_mooncake_dual_collapse(create_recording_connector):
@@ -88,8 +84,8 @@ def test_same_type_mooncake_dual_collapse(create_recording_connector):
     )
     plan = resolve_stage_connector_plan(config, stage_id=1)
     created = create_recording_connector
-    connectors = OmniConnectorFactory.create_stage_connectors(plan, _tp_worker_ctx(1))
-    assert connectors.receive is connectors.send
+    recv, send = OmniConnectorFactory.create_stage_connectors(plan, **_tp_worker_kwargs(1))
+    assert recv is send
     assert len(created) == 1
     assert created[0].extra["role"] == "dual"
     assert created[0].extra["zmq_port"] == 50052
@@ -112,8 +108,8 @@ def test_incompatible_same_type_stays_hybrid(create_recording_connector):
     )
     plan = resolve_stage_connector_plan(config, stage_id=1)
     created = create_recording_connector
-    connectors = OmniConnectorFactory.create_stage_connectors(plan, _tp_worker_ctx(1))
-    assert connectors.receive is not connectors.send
+    recv, send = OmniConnectorFactory.create_stage_connectors(plan, **_tp_worker_kwargs(1))
+    assert recv is not send
     assert len(created) == 2
     assert created[0].extra["host"] == "10.0.0.1"
     assert created[1].extra["host"] == "10.0.0.2"
@@ -131,27 +127,27 @@ def test_hybrid_mooncake_shm_two_instances(create_recording_connector):
     )
     plan = resolve_stage_connector_plan(config, stage_id=1)
     created = create_recording_connector
-    connectors = OmniConnectorFactory.create_stage_connectors(plan, _tp_worker_ctx(1))
-    assert connectors.receive is not connectors.send
+    recv, send = OmniConnectorFactory.create_stage_connectors(plan, **_tp_worker_kwargs(1))
+    assert recv is not send
     assert [s.name for s in created] == ["MooncakeTransferEngineConnector", "SharedMemoryConnector"]
 
 
 def test_inbound_only_send_is_none():
     config = OmniTransferConfig(connectors={("0", "1"): ConnectorSpec(name="SharedMemoryConnector")})
     plan = resolve_stage_connector_plan(config, stage_id=1)
-    connectors = OmniConnectorFactory.create_stage_connectors(plan, _tp_worker_ctx(1))
-    assert connectors.receive is not None
-    assert connectors.send is None
-    connectors.close()
+    recv, send = OmniConnectorFactory.create_stage_connectors(plan, **_tp_worker_kwargs(1))
+    assert recv is not None
+    assert send is None
+    recv.close()
 
 
 def test_outbound_only_receive_is_none():
     config = OmniTransferConfig(connectors={("0", "1"): ConnectorSpec(name="SharedMemoryConnector")})
     plan = resolve_stage_connector_plan(config, stage_id=0)
-    connectors = OmniConnectorFactory.create_stage_connectors(plan, _tp_worker_ctx(0))
-    assert connectors.receive is None
-    assert connectors.send is not None
-    connectors.close()
+    recv, send = OmniConnectorFactory.create_stage_connectors(plan, **_tp_worker_kwargs(0))
+    assert recv is None
+    assert send is not None
+    send.close()
 
 
 def test_owner_filters_cta_vs_mixin():
@@ -164,22 +160,24 @@ def test_owner_filters_cta_vs_mixin():
     # Plan owned by CONNECTOR_MIXIN (async_chunk=False).
     plan = resolve_stage_connector_plan(config, stage_id=1, async_chunk=False)
 
-    mixin_set = OmniConnectorFactory.create_stage_connectors(plan, _tp_worker_ctx(1))
-    assert mixin_set.receive is not None and mixin_set.send is not None
+    mixin_recv, mixin_send = OmniConnectorFactory.create_stage_connectors(plan, **_tp_worker_kwargs(1))
+    assert mixin_recv is not None and mixin_send is not None
 
-    # Chunk transfer adapter calling with CHUNK_TRANSFER_ADAPTER must skip every edge → empty set.
-    cta_set = OmniConnectorFactory.create_stage_connectors(plan, _cta_ctx(1))
-    assert cta_set.receive is None and cta_set.send is None
+    # Chunk transfer adapter calling with CHUNK_TRANSFER_ADAPTER must skip every edge → both None.
+    cta_recv, cta_send = OmniConnectorFactory.create_stage_connectors(plan, **_cta_kwargs(1))
+    assert cta_recv is None and cta_send is None
 
     # Flip ownership for async_chunk.
     cta_plan = resolve_stage_connector_plan(config, stage_id=1, async_chunk=True)
-    cta_owned = OmniConnectorFactory.create_stage_connectors(cta_plan, _cta_ctx(1))
-    assert cta_owned.receive is not None and cta_owned.send is not None
-    mixin_skipped = OmniConnectorFactory.create_stage_connectors(cta_plan, _tp_worker_ctx(1))
-    assert mixin_skipped.receive is None and mixin_skipped.send is None
+    cta_owned_recv, cta_owned_send = OmniConnectorFactory.create_stage_connectors(cta_plan, **_cta_kwargs(1))
+    assert cta_owned_recv is not None and cta_owned_send is not None
+    mixin_skipped_recv, mixin_skipped_send = OmniConnectorFactory.create_stage_connectors(
+        cta_plan, **_tp_worker_kwargs(1)
+    )
+    assert mixin_skipped_recv is None and mixin_skipped_send is None
 
-    mixin_set.close()
-    cta_owned.close()
+    mixin_recv.close()
+    cta_owned_recv.close()
 
 
 def test_tp_and_replica_port_offset_applied_once(create_recording_connector):
@@ -201,7 +199,7 @@ def test_tp_and_replica_port_offset_applied_once(create_recording_connector):
 
     OmniConnectorFactory.create_stage_connectors(
         plan,
-        _tp_worker_ctx(1, tp_rank=2, replica_id=1),
+        **_tp_worker_kwargs(1, tp_rank=2, replica_id=1),
     )
     assert len(created) == 1  # dual-collapsed
     offset = 1 * KV_REPLICA_PORT_STRIDE + 2 * KV_RANK_PORT_STRIDE
@@ -222,32 +220,16 @@ def test_stage_replica_never_uses_tp_rank_for_ports(create_recording_connector):
     plan = resolve_stage_connector_plan(config, stage_id=1, async_chunk=True)
     created = create_recording_connector
     # Even if a bogus tp_rank sneaks in, CHUNK_TRANSFER_ADAPTER must force local_rank=0.
-    ctx = ConnectorRuntimeContext(
+    OmniConnectorFactory.create_stage_connectors(
+        plan,
         stage_id=1,
         owner=ConnectorOwner.CHUNK_TRANSFER_ADAPTER,
         replica_id=3,
         tp_rank=7,
     )
-    OmniConnectorFactory.create_stage_connectors(plan, ctx)
     assert len(created) == 1
     offset = 3 * KV_REPLICA_PORT_STRIDE  # rank contribution forced to 0
     assert created[0].extra["sender_zmq_port"] == 50051 + offset
-
-
-def test_stage_connector_set_close_dedupes_dual():
-    closes = []
-
-    class _Conn:
-        def close(self):
-            closes.append(id(self))
-
-    conn = _Conn()
-    StageConnectorSet(receive=conn, send=conn).close()
-    assert closes == [id(conn)]
-
-    a, b = _Conn(), _Conn()
-    StageConnectorSet(receive=a, send=b).close()
-    assert closes == [id(conn), id(a), id(b)]
 
 
 def test_dual_merge_preserves_distinct_directional_rank_mappings():

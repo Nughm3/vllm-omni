@@ -6,11 +6,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from .stage_connector import ConnectorRuntimeContext, StageConnectorSet
 from .utils.logging import get_connector_logger
 
 if TYPE_CHECKING:
-    from .utils.initialization import ResolvedConnectorSpec, StageConnectorPlan
+    from .utils.initialization import ConnectorOwner, ResolvedConnectorSpec, StageConnectorPlan
 
 from .connectors.base import OmniConnectorBase
 from .utils.config import TRANSFER_ENGINE_CONNECTOR_NAMES, ConnectorSpec
@@ -59,14 +58,18 @@ class OmniConnectorFactory:
     def create_stage_connectors(
         cls,
         plan: StageConnectorPlan,
-        runtime_context: ConnectorRuntimeContext,
-    ) -> StageConnectorSet:
-        """Materialize runtime connectors from a typed stage plan.
+        *,
+        stage_id: int,
+        owner: ConnectorOwner,
+        replica_id: int = 0,
+        tp_rank: int | None = None,
+    ) -> tuple[OmniConnectorBase | None, OmniConnectorBase | None]:
+        """Materialize runtime (receive, send) connectors from a typed stage plan.
 
         Called only inside the owning process after that process's distributed
         context (if any) exists:
 
-        1. Skip edges whose ``owner`` does not match ``runtime_context``
+        1. Skip edges whose ``owner`` does not match the caller's own ``owner``
            (chunk transfer adapter vs mixin collision guard).
         2. Apply TP/replica port offset for transfer-engine connectors
            (``CHUNK_TRANSFER_ADAPTER`` forces local_rank=0 and never queries the TP group).
@@ -84,68 +87,67 @@ class OmniConnectorFactory:
             raise ValueError("Fan-in and fan-out are not currently supported")
 
         if plan.uses_legacy_default:
-            return cls._materialize_legacy_default(runtime_context)
+            return cls._materialize_legacy_default(stage_id)
 
-        recv_spec = cls.resolve_connector_spec(plan.input_spec, runtime_context)
-        send_spec = cls.resolve_connector_spec(plan.output_spec, runtime_context)
+        recv_spec = cls.resolve_connector_spec(
+            plan.input_spec, stage_id=stage_id, owner=owner, replica_id=replica_id, tp_rank=tp_rank
+        )
+        send_spec = cls.resolve_connector_spec(
+            plan.output_spec, stage_id=stage_id, owner=owner, replica_id=replica_id, tp_rank=tp_rank
+        )
         if recv_spec is None and send_spec is None:
-            return StageConnectorSet(receive=None, send=None)
+            return None, None
 
         if recv_spec is not None and send_spec is not None:
             return cls._build_dual_or_hybrid(recv_spec, send_spec)
 
         if recv_spec is not None:
             # Explicit inbound-only: do not reuse the receiver as a sender.
-            return StageConnectorSet(receive=cls.create_connector(recv_spec), send=None)
+            return cls.create_connector(recv_spec), None
 
-        if send_spec is not None:
-            return StageConnectorSet(receive=None, send=cls.create_connector(send_spec))
-
-        return StageConnectorSet(receive=None, send=None)
+        return None, cls.create_connector(send_spec)
 
     @classmethod
-    def _materialize_legacy_default(cls, runtime_context: ConnectorRuntimeContext) -> StageConnectorSet:
+    def _materialize_legacy_default(cls, stage_id: int) -> tuple[OmniConnectorBase, OmniConnectorBase]:
         """No transfer config → one SHM instance serving both directions."""
-        spec = ConnectorSpec(
-            name="SharedMemoryConnector",
-            extra={"stage_id": runtime_context.stage_id, "role": "dual"},
-        )
+        spec = ConnectorSpec(name="SharedMemoryConnector", extra={"stage_id": stage_id, "role": "dual"})
         conn = cls.create_connector(spec)
-        return StageConnectorSet(receive=conn, send=conn)
+        return conn, conn
 
     @classmethod
     def resolve_connector_spec(
         cls,
         resolved: ResolvedConnectorSpec | None,
-        runtime_context: ConnectorRuntimeContext,
+        *,
+        stage_id: int,
+        owner: ConnectorOwner,
+        replica_id: int = 0,
+        tp_rank: int | None = None,
     ) -> ConnectorSpec | None:
         from .utils.initialization import ConnectorOwner
         from .utils.kv_utils import worker_rank_port_offset
 
         if resolved is None:
             return None
-        if resolved.owner != runtime_context.owner:
+        if resolved.owner != owner:
             logger.debug(
                 "Skipping edge %s->%s: owner=%s != caller=%s",
                 resolved.edge.from_stage,
                 resolved.edge.to_stage,
                 resolved.owner.value,
-                runtime_context.owner.value,
+                owner.value,
             )
             return None
 
-        if runtime_context.owner == ConnectorOwner.CHUNK_TRANSFER_ADAPTER:
-            port_offset = worker_rank_port_offset(local_rank=0, replica_id=runtime_context.replica_id)
+        if owner == ConnectorOwner.CHUNK_TRANSFER_ADAPTER:
+            port_offset = worker_rank_port_offset(local_rank=0, replica_id=replica_id)
         else:
-            if runtime_context.tp_rank is None:
+            if tp_rank is None:
                 raise ValueError("CONNECTOR_MIXIN connector resolution requires an explicit tp_rank")
-            port_offset = worker_rank_port_offset(
-                local_rank=runtime_context.tp_rank,
-                replica_id=runtime_context.replica_id,
-            )
+            port_offset = worker_rank_port_offset(local_rank=tp_rank, replica_id=replica_id)
 
         extra = dict(resolved.spec.extra)
-        extra.setdefault("stage_id", runtime_context.stage_id)
+        extra.setdefault("stage_id", stage_id)
         if resolved.spec.name in TRANSFER_ENGINE_CONNECTOR_NAMES and port_offset:
             if "zmq_port" in extra:
                 extra["zmq_port"] = int(extra["zmq_port"]) + port_offset
@@ -158,7 +160,7 @@ class OmniConnectorFactory:
         cls,
         recv_spec: ConnectorSpec,
         send_spec: ConnectorSpec,
-    ) -> StageConnectorSet:
+    ) -> tuple[OmniConnectorBase, OmniConnectorBase]:
         connector_cls = cls._resolve_connector_class(recv_spec.name)
         if (
             recv_spec.name == send_spec.name
@@ -171,7 +173,7 @@ class OmniConnectorFactory:
                 "Dual-collapsed %s inbound/outbound into one shared instance (role=dual)",
                 recv_spec.name,
             )
-            return StageConnectorSet(receive=conn, send=conn)
+            return conn, conn
 
         receive = cls.create_connector(recv_spec)
         send = cls.create_connector(send_spec)
@@ -180,7 +182,7 @@ class OmniConnectorFactory:
             recv_spec.name,
             send_spec.name,
         )
-        return StageConnectorSet(receive=receive, send=send)
+        return receive, send
 
     @classmethod
     def _resolve_connector_class(cls, name: str) -> type[OmniConnectorBase]:

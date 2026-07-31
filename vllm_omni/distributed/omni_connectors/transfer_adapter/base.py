@@ -34,14 +34,13 @@ class OmniTransferAdapterBase:
         self._recv_cond = threading.Condition()
         self._save_cond = threading.Condition()
 
-        connectors = getattr(self, "_connectors", None)
         self.recv_thread: threading.Thread | None = None
-        if connectors is not None and connectors.receive is not None:
+        if getattr(self, "_recv_connector", None) is not None:
             self.recv_thread = threading.Thread(target=self.recv_loop, daemon=True)
             self.recv_thread.start()
 
         self.save_thread: threading.Thread | None = None
-        if connectors is not None and connectors.send is not None:
+        if getattr(self, "_send_connector", None) is not None:
             self.save_thread = threading.Thread(target=self.save_loop, daemon=True)
             self.save_thread.start()
 
@@ -136,6 +135,12 @@ class OmniTransferAdapterBase:
             self.recv_thread.join(timeout=5)
         if self.save_thread is not None:
             self.save_thread.join(timeout=5)
-        connectors = getattr(self, "_connectors", None)
-        if connectors is not None:
-            connectors.close()
+        seen: set[int] = set()
+        for conn in (getattr(self, "_recv_connector", None), getattr(self, "_send_connector", None)):
+            if conn is None or id(conn) in seen:
+                continue
+            seen.add(id(conn))
+            try:
+                conn.close()
+            except Exception:
+                logger.warning("Failed to close connector %s", type(conn).__name__, exc_info=True)

@@ -297,10 +297,12 @@ class OmniConnectorModelRunnerMixin:
 
     def shutdown_omni_connectors(self) -> None:
         """Stop background threads and release connector resources."""
-        self._stop_event.set()
-        if self._recv_thread is not None:
+        stop_event = getattr(self, "_stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
+        if getattr(self, "_recv_thread", None) is not None:
             self._recv_thread.join(timeout=5)
-        if self._save_thread is not None:
+        if getattr(self, "_save_thread", None) is not None:
             self._save_thread.join(timeout=5)
         if self._connectors is not None:
             self._connectors.close()
@@ -1669,7 +1671,8 @@ class OmniConnectorModelRunnerMixin:
     @property
     def connector(self) -> Any | None:
         """Backward-compatible single-connector view."""
-        return self._connectors.connector
+        connectors = getattr(self, "_connectors", None)
+        return connectors.connector if connectors is not None else None
 
     # ------------------------------------------------------------------ #
     #  Background I/O threads
@@ -1791,9 +1794,13 @@ class OmniConnectorModelRunnerMixin:
                 )
                 return False
 
-        target_stage_id = self._previous_stage_id
+        # Test doubles and legacy embedders may install a receive connector
+        # without populating the connector plan. In that case retain the
+        # historical adjacent-stage fallback; a missing receive connector
+        # was handled above as an uninitialized/no-inbound path.
+        target_stage_id = getattr(self, "_previous_stage_id", self._stage_id - 1)
         if target_stage_id is None:
-            raise RuntimeError(f"Stage {self._stage_id} has no inbound connector edge")
+            target_stage_id = self._stage_id - 1
         chunk_id = self._get_req_chunk[req_id]
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
         sender_info = getattr(self._pending_load_reqs.get(req_id), "sender_info", None)

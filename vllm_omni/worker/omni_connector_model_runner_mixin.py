@@ -821,7 +821,7 @@ class OmniConnectorModelRunnerMixin:
             return False
         model_config = self._get_model_config()
         if for_recv:
-            from_stage_id = self._stage_id - 1
+            from_stage_id = self._previous_stage_id
             to_stage_id = self._stage_id
         else:
             from_stage_id = self._stage_id

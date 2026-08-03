@@ -296,34 +296,15 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self,
         sender_host: str,
         sender_zmq_port: int,
-        sender_rank: int | None = None,
     ) -> None:
-        """Inject a sender's ZMQ endpoint into the receiver connector.
-
-        When ``sender_rank`` is ``None`` (default), sets the single default
-        sender used by ``get()`` when no rank is specified — this preserves
-        backward-compatible 1:1 semantics.
-
-        When ``sender_rank`` is an integer, the endpoint is stored in a
-        per-rank registry for internal use (e.g. by
-        ``_query_metadata_from_sender(sender_rank=R)``).
-        """
-        if sender_rank is not None:
-            self._sender_endpoints[sender_rank] = (sender_host, sender_zmq_port)
-            logger.info(
-                "Sender info updated for rank %s: host=%r, zmq_port=%s",
-                sender_rank,
-                sender_host,
-                sender_zmq_port,
-            )
-        else:
-            self.sender_host = sender_host
-            self.sender_zmq_port = sender_zmq_port
-            logger.info(
-                "Sender info updated (default): host=%r, zmq_port=%s",
-                sender_host,
-                sender_zmq_port,
-            )
+        """Inject a sender's ZMQ endpoint into the receiver connector."""
+        self.sender_host = sender_host
+        self.sender_zmq_port = sender_zmq_port
+        logger.info(
+            "Sender info updated (default): host=%r, zmq_port=%s",
+            sender_host,
+            sender_zmq_port,
+        )
 
     def _get_local_ip(self) -> str:
         """

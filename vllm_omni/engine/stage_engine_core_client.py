@@ -277,7 +277,7 @@ class StageEngineCoreClientBase(StageClientBase):
             if not address:
                 continue
             host = urlparse(address).hostname
-            if host in AUTO_HOST_VALUES:
+            if host is None or host in AUTO_HOST_VALUES:
                 continue
             if host in {"localhost", "127.0.0.1"}:
                 detected = self._detect_local_ip()
@@ -389,10 +389,10 @@ class StageEngineCoreClientBase(StageClientBase):
         """Return this replica's transfer-engine endpoint, if it has one."""
         if getattr(self, "_payload_sender_info_initialized", False):
             return getattr(self, "_payload_sender_info", None)
-        self._payload_sender_info_initialized = True
 
         output = self._stage_connector_plan.outbound
         if output is None or output.spec.name not in TRANSFER_ENGINE_CONNECTOR_NAMES:
+            self._payload_sender_info_initialized = True
             return None
 
         spec = OmniConnectorFactory.materialize_connector_spec(
@@ -409,6 +409,7 @@ class StageEngineCoreClientBase(StageClientBase):
         if host is None:
             raise RuntimeError(f"Stage-{self.stage_id} replica-{self.replica_id} has no routable payload sender host")
         self._payload_sender_info = ConnectorEndpoint(host=str(host), zmq_port=int(spec.extra["zmq_port"]))
+        self._payload_sender_info_initialized = True
         return self._payload_sender_info
 
     def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None:

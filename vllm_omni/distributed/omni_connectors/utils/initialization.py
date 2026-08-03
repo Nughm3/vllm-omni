@@ -215,7 +215,7 @@ def connector_plan_from_model_config(model_config: Any) -> StageConnectorPlan:
         raise TypeError(f"Invalid stage_connector_config: expected dict, got {type(raw).__name__}")
     name = raw.get("name")
     extra = raw.get("extra") or {}
-    if not isinstance(name, str) or not name:
+    if not isinstance(name, str) or not name.strip():
         raise ValueError("Invalid stage_connector_config: missing connector name")
     if not isinstance(extra, dict):
         raise TypeError(f"Invalid connector extra: expected dict, got {type(extra).__name__}")

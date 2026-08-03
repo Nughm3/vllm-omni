@@ -1231,8 +1231,11 @@ class TestRankAwareKVRouting(unittest.TestCase):
         expected = ["req_0_0_1_1"]
         self.assertEqual(host.get_rank_aware_kv_send_keys("req", from_stage=0, to_stage=1), expected)
         self.assertEqual(host.get_rank_aware_kv_keys("req", from_stage=0, to_stage=1), expected)
-        self.assertEqual(host.get_kv_rank_mapping()["from_tp"], 2)
-        self.assertEqual(host.get_kv_rank_mapping()["to_tp"], 2)
+        rank_mapping = host.get_kv_rank_mapping()
+        self.assertEqual(rank_mapping["recv"]["from_tp"], 2)
+        self.assertEqual(rank_mapping["recv"]["to_tp"], 2)
+        self.assertEqual(rank_mapping["send"]["from_tp"], 2)
+        self.assertEqual(rank_mapping["send"]["to_tp"], 2)
         host.shutdown_omni_connectors()
 
     def test_send_keys_route_from_rank_gt_to_rank(self):
@@ -1300,7 +1303,7 @@ class TestConnectorConfigValidation(unittest.TestCase):
         model_config.stage_connector_plan = None
         model_config.stage_connector_config = {"name": "   "}
 
-        with self.assertRaisesRegex(ValueError, "Unknown connector"):
+        with self.assertRaisesRegex(ValueError, "missing connector name"):
             host.init_omni_connectors(model_config=model_config)
 
 

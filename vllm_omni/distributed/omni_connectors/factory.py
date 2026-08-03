@@ -99,10 +99,15 @@ class OmniConnectorFactory:
                 connector = cls.create_connector(ConnectorSpec(receive.name, dual))
                 return StageConnectorSet(receive=connector, send=connector)
 
-        return StageConnectorSet(
-            receive=cls.create_connector(receive) if receive is not None else None,
-            send=cls.create_connector(send) if send is not None else None,
-        )
+        receive_connector = None
+        try:
+            receive_connector = cls.create_connector(receive) if receive is not None else None
+            send_connector = cls.create_connector(send) if send is not None else None
+        except Exception:
+            if receive_connector is not None:
+                receive_connector.close()
+            raise
+        return StageConnectorSet(receive=receive_connector, send=send_connector)
 
     @staticmethod
     def materialize_connector_spec(

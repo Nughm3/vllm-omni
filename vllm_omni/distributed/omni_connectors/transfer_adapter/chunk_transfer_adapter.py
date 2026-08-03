@@ -461,7 +461,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 metadata=sender_info.as_metadata() if sender_info is not None else None,
             )
         except Exception as e:
-            logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
+            logger.error(f"{type(connector).__name__} get failed for req {connector_get_key}: {e}")
             with self._receiver_state_lock:
                 if self._registered_load_entries.get(req_id) is not entry:
                     return True

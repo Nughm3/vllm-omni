@@ -260,7 +260,12 @@ def resolve_stage_connector_plan(
 
 
 def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, stage_id: str | int) -> dict[str, Any]:
-    """Return the legacy dict view of a resolved stage connector plan."""
+    """Return the legacy dict view of a resolved stage connector plan.
+
+    Emits both directions when present (``from_stage_*`` for the inbound edge,
+    ``to_stage_*`` for the outbound edge), unlike the pre-dual-connector
+    version of this function, which only ever returned the inbound edge.
+    """
     if transfer_config is None:
         return {}
 

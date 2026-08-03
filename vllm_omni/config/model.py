@@ -181,7 +181,13 @@ class OmniModelConfig(ModelConfig):
 
     @property
     def stage_connector_config(self) -> dict[str, Any] | None:
-        """Compatibility view for model code that only needs connector extras."""
+        """Compatibility view for model code that only needs connector extras.
+
+        Ambiguous on a stage with both an inbound and an outbound edge (a
+        middle/dual stage): this always prefers the inbound config. Producer-side
+        readers on such a stage must use ``stage_output_connector_config`` explicitly
+        instead of this property.
+        """
         return self.stage_input_connector_config or self.stage_output_connector_config
 
     @property

@@ -44,9 +44,15 @@ class StageConnectorSet:
 
     def close(self) -> None:
         if self.receive is not None:
-            self.receive.close()
+            try:
+                self.receive.close()
+            except Exception:
+                logger.exception("Error closing receive connector %s", type(self.receive).__name__)
         if self.send is not None and self.send is not self.receive:
-            self.send.close()
+            try:
+                self.send.close()
+            except Exception:
+                logger.exception("Error closing send connector %s", type(self.send).__name__)
 
 
 class OmniConnectorFactory:

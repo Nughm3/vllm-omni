@@ -536,7 +536,8 @@ class MoriTransferEngineConnector(OmniConnectorBase):
             host = self.sender_host
             port = self.sender_zmq_port
         if not host or not port or str(host).lower() == "auto":
-            raise RuntimeError("get() requires a routable sender endpoint")
+            logger.debug(f"get() has no routable sender endpoint yet for {get_key}; treating as not ready")
+            return None
         return self._query_metadata_at(get_key, str(host), int(port))
 
     # ----------------------------------------------------------------- get()

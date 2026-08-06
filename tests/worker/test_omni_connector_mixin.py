@@ -130,7 +130,8 @@ class _FakeTPGroup:
 )
 def test_init_payload_connector_ownership(role, custom_func, expected):
     model_config = _make_model_config(custom_func=custom_func)
-    # Exercise the legacy role-only configuration path explicitly.
+    # Exercise the legacy config compatibility path; the typed empty plan
+    # takes precedence when present.
     model_config.stage_connector_plan = None
     model_config.stage_connector_config = {
         "name": "MooncakeTransferEngineConnector",
@@ -139,17 +140,21 @@ def test_init_payload_connector_ownership(role, custom_func, expected):
 
     host = MixinHost()
     connector = MockConnector()
+    connector_set = StageConnectorSet(
+        receive=connector if role == "receiver" else None,
+        send=connector if role == "sender" else None,
+    )
     with (
         patch(
             "vllm_omni.worker.omni_connector_model_runner_mixin.OmniConnectorFactory.create_stage_connectors",
-            return_value=StageConnectorSet(receive=connector, send=connector),
+            return_value=connector_set,
         ) as create,
         patch.object(host, "_load_custom_func", return_value=(None, None)),
     ):
         host.init_omni_connectors(model_config)
 
     assert (create.call_count == 1) is expected
-    assert (getattr(host._connectors, "connector", None) is connector) is expected
+    assert (host._connectors is connector_set) is expected
     host.shutdown_omni_connectors()
 
 

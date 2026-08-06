@@ -1015,7 +1015,8 @@ class OmniConnectorModelRunnerMixin:
 
         Returns list of request IDs successfully enqueued.
         """
-        if self._connectors is None or self._connectors.send is None:
+        connectors = getattr(self, "_connectors", None)
+        if connectors is None or connectors.send is None:
             logger.debug("[Stage-%s] send_full_payload_outputs: connector is None, skip", self._stage_id)
             return []
         if not self.is_data_transfer_rank():
@@ -1162,7 +1163,8 @@ class OmniConnectorModelRunnerMixin:
         ``connector.put()`` is done by the background save thread.
         Non-KV data is identical across TP ranks; only rank 0 sends.
         """
-        if self._connectors is None or self._connectors.send is None:
+        connectors = getattr(self, "_connectors", None)
+        if connectors is None or connectors.send is None:
             logger.warning("[Stage-%s] send_chunk: connector is None", self._stage_id)
             return False
         if not self.is_data_transfer_rank():
@@ -1777,9 +1779,10 @@ class OmniConnectorModelRunnerMixin:
 
     def _poll_single_request(self, req_id: str) -> bool:
         """Poll connector for one chunk of a request (non-blocking)."""
-        if self._connectors is None or self._connectors.receive is None:
+        connectors = getattr(self, "_connectors", None)
+        if connectors is None or connectors.receive is None:
             return False
-        connector = self._connectors.receive
+        connector = connectors.receive
 
         if self._async_chunk and self._model_mode != "ar":
             with self._lock:
@@ -1998,9 +2001,10 @@ class OmniConnectorModelRunnerMixin:
         ``success=False``), returns False **without** decrementing
         ``_pending_save_counts`` so the caller can retry or clean up.
         """
-        if self._connectors is None or self._connectors.send is None:
+        connectors = getattr(self, "_connectors", None)
+        if connectors is None or connectors.send is None:
             return True
-        connector = self._connectors.send
+        connector = connectors.send
 
         request_id = task.get("request_id")
         payload_data = task.get("data")

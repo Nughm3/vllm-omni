@@ -189,10 +189,15 @@ def _stage_edge_spec(
 
 
 def default_stage_connector_plan(stage_id: str | int) -> StageConnectorPlan:
-    """Preserve the no-config SHM behavior as an explicit two-way plan."""
+    """
+    Preserve the no-config SHM behavior as an explicit two-way plan.
+
+    Note that there may be an extra SHM connector added to the last stage as the
+    default plan is not aware of the number of stages.
+    """
     stage = _stage_id(stage_id)
     return StageConnectorPlan(
-        inbound=StageConnectorSpec(stage - 1, stage, ConnectorSpec("SharedMemoryConnector")),
+        inbound=StageConnectorSpec(stage - 1, stage, ConnectorSpec("SharedMemoryConnector")) if stage > 0 else None,
         outbound=StageConnectorSpec(stage, stage + 1, ConnectorSpec("SharedMemoryConnector")),
     )
 

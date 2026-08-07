@@ -135,15 +135,15 @@ def test_absent_config_preserves_legacy_shm_but_explicit_empty_config_does_not()
     legacy = resolve_stage_connector_plan(None, 0)
     explicit = resolve_stage_connector_plan(OmniTransferConfig(), 0)
 
-    assert legacy.inbound is not None and legacy.outbound is not None
-    assert legacy.inbound.spec.name == legacy.outbound.spec.name == "SharedMemoryConnector"
+    assert legacy.inbound is None and legacy.outbound is not None
+    assert legacy.outbound.spec.name == "SharedMemoryConnector"
     assert explicit == StageConnectorPlan()
 
 
 def test_legacy_shm_plan_shares_one_dual_instance(created_connectors):
     connectors = OmniConnectorFactory.create_stage_connectors(
-        resolve_stage_connector_plan(None, 0),
-        stage_id=0,
+        resolve_stage_connector_plan(None, 1),
+        stage_id=1,
     )
 
     assert connectors.receive is connectors.send

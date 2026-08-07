@@ -21,6 +21,11 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    ConnectorSpec,
+    StageConnectorPlan,
+    StageConnectorSpec,
+)
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AbortResultMessage,
@@ -781,6 +786,24 @@ async def test_run_async_chunk(orchestrator_factory) -> None:
         [stage0, stage1],
         output_processors=processors,
         async_chunk=True,
+        stage_vllm_configs=[
+            SimpleNamespace(
+                model_config=SimpleNamespace(
+                    max_model_len=64,
+                    stage_connector_plan=StageConnectorPlan(
+                        outbound=StageConnectorSpec(0, 1, ConnectorSpec("SharedMemoryConnector"))
+                    ),
+                )
+            ),
+            SimpleNamespace(
+                model_config=SimpleNamespace(
+                    max_model_len=64,
+                    stage_connector_plan=StageConnectorPlan(
+                        inbound=StageConnectorSpec(0, 1, ConnectorSpec("SharedMemoryConnector"))
+                    ),
+                )
+            ),
+        ],
     )
     request = SimpleNamespace(request_id="req-async", prompt_token_ids=[1, 2, 3, 4])
 

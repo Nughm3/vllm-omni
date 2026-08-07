@@ -269,40 +269,13 @@ def _merge_dual_config(receive: dict[str, Any], send: dict[str, Any]) -> dict[st
     return merged
 
 
-# Register connectors
-OmniConnectorFactory.register_connector(
-    "MooncakeStoreConnector",
-    _create_mooncake_store_connector,
-    supports_dual=True,
-)
-OmniConnectorFactory.register_connector(
-    "MooncakeTransferEngineConnector",
-    _create_mooncake_transfer_engine_connector,
-    supports_dual=True,
-)
-OmniConnectorFactory.register_connector(
-    "SharedMemoryConnector",
-    _create_shm_connector,
-    supports_dual=True,
-)
-OmniConnectorFactory.register_connector(
-    "YuanrongConnector",
-    _create_yuanrong_connector,
-    supports_dual=True,
-)
-OmniConnectorFactory.register_connector(
-    "YuanrongTransferEngineConnector",
-    _create_yuanrong_transfer_engine_connector,
-    supports_dual=True,
-)
-OmniConnectorFactory.register_connector(
-    "MoriTransferEngineConnector",
-    _create_mori_transfer_engine_connector,
-    supports_dual=True,
-)
-# Backward-compatible aliases – will be removed in the future
-OmniConnectorFactory.register_connector(
-    "MooncakeConnector",
-    _create_mooncake_store_connector,
-    supports_dual=True,
-)
+for _name, _constructor in (
+    ("MooncakeStoreConnector", _create_mooncake_store_connector),
+    ("MooncakeTransferEngineConnector", _create_mooncake_transfer_engine_connector),
+    ("SharedMemoryConnector", _create_shm_connector),
+    ("YuanrongConnector", _create_yuanrong_connector),
+    ("YuanrongTransferEngineConnector", _create_yuanrong_transfer_engine_connector),
+    ("MoriTransferEngineConnector", _create_mori_transfer_engine_connector),
+    ("MooncakeConnector", _create_mooncake_store_connector),
+):
+    OmniConnectorFactory.register_connector(_name, _constructor, supports_dual=True)

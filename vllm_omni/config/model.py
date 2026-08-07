@@ -180,17 +180,6 @@ class OmniModelConfig(ModelConfig):
         return self._connector_config(plan.outbound)
 
     @property
-    def stage_connector_config(self) -> dict[str, Any] | None:
-        """Compatibility view for model code that only needs connector extras.
-
-        Ambiguous on a stage with both an inbound and an outbound edge (a
-        middle/dual stage): this always prefers the inbound config. Producer-side
-        readers on such a stage must use ``stage_output_connector_config`` explicitly
-        instead of this property.
-        """
-        return self.stage_input_connector_config or self.stage_output_connector_config
-
-    @property
     def architectures(self) -> list[str]:
         # Falsy (None or "") means "no stage override": fall back to the
         # checkpoint config's own architectures. The stage-config builder

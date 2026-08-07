@@ -579,25 +579,6 @@ def resolve_omni_kv_config_for_stage(
     Selects the edge owned by the stage's KV manager. Legacy callers that do
     not provide a stage config retain the outgoing-first behavior.
     """
-    if not transfer_cfg or not getattr(transfer_cfg, "connectors", None):
-        return None, None, None
-
-    stage_id_str = str(stage_id)
-
-    # Find outgoing edges (Sender logic)
-    outgoing = [
-        (to_stage, spec)
-        for (from_stage, to_stage), spec in transfer_cfg.connectors.items()
-        if from_stage == stage_id_str
-    ]
-
-    # Find incoming edges (Receiver logic)
-    incoming = [
-        (from_stage, spec)
-        for (from_stage, to_stage), spec in transfer_cfg.connectors.items()
-        if to_stage == stage_id_str
-    ]
-
     omni_kv_config = getattr(stage_config, "omni_kv_config", None)
     if omni_kv_config is None:
         engine_args = getattr(stage_config, "engine_args", None)
@@ -616,9 +597,28 @@ def resolve_omni_kv_config_for_stage(
             "OmniKVTransferManager supports only one directional connector"
         )
 
+    if not transfer_cfg or not getattr(transfer_cfg, "connectors", None):
+        return None, None, None
+
     omni_conn_cfg = None
     omni_from = None
     omni_to = None
+
+    stage_id_str = str(stage_id)
+
+    # Find outgoing edges (Sender logic)
+    outgoing = [
+        (to_stage, spec)
+        for (from_stage, to_stage), spec in transfer_cfg.connectors.items()
+        if from_stage == stage_id_str
+    ]
+
+    # Find incoming edges (Receiver logic)
+    incoming = [
+        (from_stage, spec)
+        for (from_stage, to_stage), spec in transfer_cfg.connectors.items()
+        if to_stage == stage_id_str
+    ]
 
     # Inject direction-specific role so the connector initializes correctly.
     if outgoing and not need_recv_cache:

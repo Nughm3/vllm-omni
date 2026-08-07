@@ -12,6 +12,9 @@ from vllm_omni.distributed.omni_connectors.factory import (
     OmniConnectorFactory,
     StageConnectorSet,
 )
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+    OmniKVTransferManager,
+)
 from vllm_omni.distributed.omni_connectors.utils.config import (
     ConnectorSpec,
     OmniTransferConfig,
@@ -111,13 +114,19 @@ def test_kv_config_uses_manager_owned_direction_with_equal_tp(
     assert (from_stage, to_stage) == expected_edge
 
 
-def test_kv_config_rejects_bidirectional_manager():
-    transfer_config = OmniTransferConfig(
-        connectors={
-            ("0", "1"): ConnectorSpec("MooncakeTransferEngineConnector"),
-            ("1", "2"): ConnectorSpec("MoriTransferEngineConnector"),
-        }
-    )
+@pytest.mark.parametrize(
+    ("transfer_config"),
+    (
+        None,
+        OmniTransferConfig(
+            connectors={
+                ("0", "1"): ConnectorSpec("MooncakeTransferEngineConnector"),
+                ("1", "2"): ConnectorSpec("MoriTransferEngineConnector"),
+            }
+        ),
+    ),
+)
+def test_kv_config_rejects_bidirectional_manager(transfer_config):
     stage_config = SimpleNamespace(
         engine_args={
             "omni_kv_config": {
@@ -126,9 +135,19 @@ def test_kv_config_rejects_bidirectional_manager():
             }
         }
     )
-
     with pytest.raises(ValueError, match="supports only one directional connector"):
         resolve_omni_kv_config_for_stage(transfer_config, 1, stage_config)
+
+
+def test_kv_manager_create_rejects_bidirectional_config():
+    with pytest.raises(ValueError, match="supports only one directional connector"):
+        OmniKVTransferManager._create(
+            {
+                "connector_config": {"type": "SharedMemoryConnector"},
+                "need_recv_cache": True,
+                "need_send_cache": True,
+            }
+        )
 
 
 def test_absent_config_preserves_legacy_shm_but_explicit_empty_config_does_not():

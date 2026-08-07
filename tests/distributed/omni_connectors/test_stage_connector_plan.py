@@ -22,6 +22,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     StageConnectorSpec,
 )
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    connector_plan_from_model_config,
     resolve_omni_kv_config_for_stage,
     resolve_stage_connector_plan,
 )
@@ -157,6 +158,22 @@ def test_absent_config_preserves_legacy_shm_but_explicit_empty_config_does_not()
     assert legacy.inbound is None and legacy.outbound is not None
     assert legacy.outbound.spec.name == "SharedMemoryConnector"
     assert explicit == StageConnectorPlan()
+
+
+def test_attribute_style_legacy_connector_config_is_normalized():
+    model_config = SimpleNamespace(
+        stage_id=1,
+        stage_connector_plan=None,
+        stage_connector_config=SimpleNamespace(
+            name="SharedMemoryConnector",
+            extra={"role": "sender"},
+        ),
+    )
+
+    plan = connector_plan_from_model_config(model_config)
+
+    assert plan.inbound is None
+    assert plan.outbound == _edge(1, 2, "SharedMemoryConnector", role="sender")
 
 
 def test_legacy_shm_plan_shares_one_dual_instance(created_connectors):

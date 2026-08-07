@@ -183,6 +183,9 @@ class OmniConnectorModelRunnerMixin:
         )
         self._local_rank = local_tp_rank
         if self._kv_transfer_manager is not None:
+            manager_config = self._kv_transfer_manager.config
+            need_recv_cache = bool(manager_config.need_recv_cache)
+            need_send_cache = bool(manager_config.need_send_cache)
             kv_topology = getattr(self._kv_transfer_manager, "tp_topology", None)
             effective_mapping = (
                 getattr(kv_topology, "source_tp_size", None),
@@ -192,18 +195,25 @@ class OmniConnectorModelRunnerMixin:
             if all(isinstance(value, int) for value in effective_mapping):
                 override_topology = KVTPTopology(*effective_mapping)
                 validate_kv_tp_topology(override_topology)
-                self._recv_topology = override_topology
-                self._send_topology = override_topology
-                self._local_rank = effective_mapping[2]
+                if need_recv_cache and need_send_cache and self._recv_topology != self._send_topology:
+                    raise ValueError("A single KV transfer manager cannot own asymmetric receive and send topologies")
+                if need_recv_cache:
+                    self._recv_topology = override_topology
+                if need_send_cache:
+                    self._send_topology = override_topology
+                if need_recv_cache or need_send_cache:
+                    self._local_rank = effective_mapping[2]
         self._recv_from_tp = self._recv_topology.source_tp_size
         self._recv_to_tp = self._recv_topology.target_tp_size
         self._send_from_tp = self._send_topology.source_tp_size
         self._send_to_tp = self._send_topology.target_tp_size
         if self._kv_transfer_manager is not None:
-            self._kv_transfer_manager.kv_send_key_builder = self.get_rank_aware_kv_send_keys
-            self._kv_transfer_manager.kv_recv_key_builder = self.get_rank_aware_kv_keys
-            self._kv_transfer_manager.kv_payload_merger = self._merge_rank_sharded_kv_payloads
-            self._kv_transfer_manager.kv_payload_slicer = self._slice_rank_sharded_kv_payload
+            if need_send_cache:
+                self._kv_transfer_manager.kv_send_key_builder = self.get_rank_aware_kv_send_keys
+                self._kv_transfer_manager.kv_payload_slicer = self._slice_rank_sharded_kv_payload
+            if need_recv_cache:
+                self._kv_transfer_manager.kv_recv_key_builder = self.get_rank_aware_kv_keys
+                self._kv_transfer_manager.kv_payload_merger = self._merge_rank_sharded_kv_payloads
 
         # -- chunk index tracking (ported from OmniChunkTransferAdapter) --
         self._put_req_chunk: dict[str, int] = defaultdict(int)
@@ -1797,13 +1807,9 @@ class OmniConnectorModelRunnerMixin:
                 )
                 return False
 
-        # Test doubles and legacy embedders may install a receive connector
-        # without populating the connector plan. In that case retain the
-        # historical adjacent-stage fallback; a missing receive connector
-        # was handled above as an uninitialized/no-inbound path.
-        target_stage_id = getattr(self, "_previous_stage_id", self._stage_id - 1)
+        target_stage_id = self._previous_stage_id
         if target_stage_id is None:
-            target_stage_id = self._stage_id - 1
+            raise RuntimeError(f"Stage {self._stage_id} has no inbound connector edge")
         chunk_id = self._get_req_chunk[req_id]
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
         sender_info = getattr(self._pending_load_reqs.get(req_id), "sender_info", None)

@@ -2912,6 +2912,7 @@ class Orchestrator:
                 # execute before that conditioning payload arrives.
                 continue
 
+            model_config = getattr(next_pool.stage_vllm_config, "model_config", None)
             connector_plan = connector_plan_from_model_config(model_config) if model_config is not None else None
             inbound = connector_plan.inbound if connector_plan is not None else None
             if inbound is None:
@@ -2926,7 +2927,7 @@ class Orchestrator:
             if next_pool.stage_type == "diffusion":
                 submit_kwargs = {
                     "kv_sender_info": self._build_kv_sender_info(
-                        list(getattr(next_pool.stage_client, "engine_input_source", None) or [next_stage_id - 1]),
+                        list(getattr(next_pool.stage_client, "engine_input_source", None) or [sender_stage_id]),
                         request_id=request_id,
                     )
                 }

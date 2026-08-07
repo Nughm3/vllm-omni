@@ -16,7 +16,6 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import ConstantList
 
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
-from vllm_omni.distributed import ConnectorSpec
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
@@ -253,23 +252,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         request.num_prompt_tokens = len(request.prompt_token_ids)
         if getattr(request, "prefill_stats", None) is None:
             request.prefill_stats = PrefillStats()
-
-    @classmethod
-    def create_connector(cls, model_config: Any):
-        connector_config = getattr(model_config, "stage_connector_config", None)
-        if connector_config is None:
-            connector_config = {}
-        elif not isinstance(connector_config, dict):
-            connector_config = {
-                "name": getattr(connector_config, "name", None),
-                "extra": getattr(connector_config, "extra", {}),
-            }
-
-        connector_specs = ConnectorSpec(
-            name=connector_config.get("name", "SharedMemoryConnector"),
-            extra=connector_config.get("extra", {}),
-        )
-        return OmniConnectorFactory.create_connector(connector_specs)
 
     @property
     def connector(self):

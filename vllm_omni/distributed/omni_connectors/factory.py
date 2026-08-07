@@ -59,17 +59,22 @@ class OmniConnectorFactory:
     """Factory for creating OmniConnectors."""
 
     _registry: dict[str, Callable[[dict[str, Any]], OmniConnectorBase]] = {}
+    _dual_role_connectors: set[str] = set()
 
     @classmethod
     def register_connector(
         cls,
         name: str,
         constructor: Callable[[dict[str, Any]], OmniConnectorBase],
+        *,
+        supports_dual: bool = False,
     ) -> None:
         """Register a connector constructor."""
         if name in cls._registry:
             raise ValueError(f"Connector '{name}' is already registered.")
         cls._registry[name] = constructor
+        if supports_dual:
+            cls._dual_role_connectors.add(name)
         logger.debug(f"Registered connector: {name}")
 
     @classmethod
@@ -99,7 +104,12 @@ class OmniConnectorFactory:
         receive = cls.materialize_connector_spec(plan.inbound, "receiver", stage_id, local_rank, replica_id)
         send = cls.materialize_connector_spec(plan.outbound, "sender", stage_id, local_rank, replica_id)
 
-        if receive is not None and send is not None and receive.name == send.name:
+        if (
+            receive is not None
+            and send is not None
+            and receive.name == send.name
+            and receive.name in cls._dual_role_connectors
+        ):
             dual = _merge_dual_config(receive.extra, send.extra)
             if dual is not None:
                 connector = cls.create_connector(ConnectorSpec(receive.name, dual))
@@ -263,29 +273,36 @@ def _merge_dual_config(receive: dict[str, Any], send: dict[str, Any]) -> dict[st
 OmniConnectorFactory.register_connector(
     "MooncakeStoreConnector",
     _create_mooncake_store_connector,
+    supports_dual=True,
 )
 OmniConnectorFactory.register_connector(
     "MooncakeTransferEngineConnector",
     _create_mooncake_transfer_engine_connector,
+    supports_dual=True,
 )
 OmniConnectorFactory.register_connector(
     "SharedMemoryConnector",
     _create_shm_connector,
+    supports_dual=True,
 )
 OmniConnectorFactory.register_connector(
     "YuanrongConnector",
     _create_yuanrong_connector,
+    supports_dual=True,
 )
 OmniConnectorFactory.register_connector(
     "YuanrongTransferEngineConnector",
     _create_yuanrong_transfer_engine_connector,
+    supports_dual=True,
 )
 OmniConnectorFactory.register_connector(
     "MoriTransferEngineConnector",
     _create_mori_transfer_engine_connector,
+    supports_dual=True,
 )
 # Backward-compatible aliases – will be removed in the future
 OmniConnectorFactory.register_connector(
     "MooncakeConnector",
     _create_mooncake_store_connector,
+    supports_dual=True,
 )

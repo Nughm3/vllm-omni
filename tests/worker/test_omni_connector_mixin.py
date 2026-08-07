@@ -23,8 +23,12 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
 )
 from vllm_omni.distributed.omni_connectors.utils.config import (
     ConnectorSpec,
+    OmniTransferConfig,
     StageConnectorPlan,
     StageConnectorSpec,
+)
+from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    resolve_omni_kv_config_for_stage,
 )
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import KVTPTopology
 from vllm_omni.outputs import OmniConnectorOutput
@@ -1265,6 +1269,99 @@ class TestRankAwareKVRouting(unittest.TestCase):
         host._send_to_tp = to_tp
         host._local_rank = local_rank
         return host
+
+    def test_middle_stage_uses_owned_direction_in_4_to_2_to_1_topology(self):
+        recv_mapping = {"from_tp": 4, "to_tp": 2}
+        send_mapping = {"from_tp": 2, "to_tp": 1}
+        transfer_config = OmniTransferConfig(
+            connectors={
+                ("0", "1"): ConnectorSpec(
+                    "MooncakeTransferEngineConnector",
+                    {"rank_mapping": recv_mapping},
+                ),
+                ("1", "2"): ConnectorSpec(
+                    "MoriTransferEngineConnector",
+                    {"rank_mapping": send_mapping},
+                ),
+            }
+        )
+
+        cases = (
+            ({"need_recv_cache": True}, "MooncakeTransferEngineConnector", "receiver"),
+            ({"need_send_cache": True}, "MoriTransferEngineConnector", "sender"),
+        )
+        for manager_flags, expected_type, expected_role in cases:
+            with self.subTest(role=expected_role):
+                stage_config = SimpleNamespace(engine_args={"omni_kv_config": manager_flags})
+                connector_config, from_stage, to_stage = resolve_omni_kv_config_for_stage(
+                    transfer_config,
+                    1,
+                    stage_config,
+                )
+                expected_mapping = recv_mapping if expected_role == "receiver" else send_mapping
+                self.assertIsNotNone(connector_config)
+                self.assertEqual(connector_config["type"], expected_type)
+                self.assertEqual(connector_config["role"], expected_role)
+                self.assertEqual(connector_config["rank_mapping"], expected_mapping)
+
+                with patch(
+                    "vllm_omni.distributed.omni_connectors.kv_transfer_manager.get_local_tp_rank",
+                    return_value=1,
+                ):
+                    manager = OmniKVTransferManager._create(
+                        {
+                            **manager_flags,
+                            "omni_from_stage": from_stage,
+                            "omni_to_stage": to_stage,
+                            "stage_id": 1,
+                            "rank_mapping": expected_mapping,
+                        }
+                    )
+
+                model_config = _make_model_config(stage_id=1)
+                model_config.stage_connector_plan = StageConnectorPlan(
+                    inbound=StageConnectorSpec(
+                        0,
+                        1,
+                        ConnectorSpec("MooncakeTransferEngineConnector", {"rank_mapping": recv_mapping}),
+                    ),
+                    outbound=StageConnectorSpec(
+                        1,
+                        2,
+                        ConnectorSpec("MoriTransferEngineConnector", {"rank_mapping": send_mapping}),
+                    ),
+                )
+                with (
+                    patch(
+                        "vllm_omni.worker.omni_connector_model_runner_mixin.get_local_tp_rank",
+                        return_value=1,
+                    ),
+                    patch(
+                        "vllm_omni.worker.omni_connector_model_runner_mixin.OmniConnectorFactory.create_stage_connectors",
+                        return_value=StageConnectorSet(),
+                    ),
+                ):
+                    host = MixinHost()
+                    host.init_omni_connectors(model_config, manager)
+
+                mapping = host.get_kv_rank_mapping()
+                self.assertEqual(mapping["recv"], recv_mapping)
+                self.assertEqual(mapping["send"], send_mapping)
+                if expected_role == "receiver":
+                    self.assertIsNotNone(manager.kv_recv_key_builder)
+                    self.assertIsNone(manager.kv_send_key_builder)
+                    self.assertEqual(
+                        manager.kv_recv_key_builder("req", from_stage=0, to_stage=1),
+                        ["req_0_0_2_1", "req_0_0_3_1"],
+                    )
+                else:
+                    self.assertIsNotNone(manager.kv_send_key_builder)
+                    self.assertIsNone(manager.kv_recv_key_builder)
+                    self.assertEqual(
+                        manager.kv_send_key_builder("req", from_stage=1, to_stage=2),
+                        ["req_1_0_1_0"],
+                    )
+                host.shutdown_omni_connectors()
 
     def test_recv_keys_use_remote_rank_as_from_rank(self):
         host = self._make_host(from_tp=4, to_tp=2, local_rank=1)

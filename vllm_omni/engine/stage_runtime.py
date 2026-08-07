@@ -358,7 +358,11 @@ class StageRuntime:
                 omni_transfer_config=omni_transfer_config,
                 stage_id=stage_id,
             )
-            omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
+            omni_kv_connector = resolve_omni_kv_config_for_stage(
+                omni_transfer_config,
+                stage_id,
+                stage_cfg,
+            )
             num_replicas = replicas_per_stage[stage_idx]
             launch_mode = self._get_launch_mode(stage_id)
 

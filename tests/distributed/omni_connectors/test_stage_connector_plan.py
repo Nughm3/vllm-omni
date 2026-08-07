@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     StageConnectorSpec,
 )
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    resolve_omni_kv_config_for_stage,
     resolve_stage_connector_plan,
 )
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
@@ -68,6 +70,65 @@ def test_plan_resolves_only_edges_attached_to_the_stage():
     assert middle.inbound is not None and middle.outbound is not None
     assert last.inbound is not None
     assert last.outbound is None
+
+
+@pytest.mark.parametrize(
+    ("omni_kv_config", "expected_type", "expected_edge", "expected_role"),
+    [
+        ({"need_recv_cache": True}, "MooncakeTransferEngineConnector", ("0", "1"), "receiver"),
+        ({"need_send_cache": True}, "MoriTransferEngineConnector", ("1", "2"), "sender"),
+    ],
+)
+def test_kv_config_uses_manager_owned_direction_with_equal_tp(
+    omni_kv_config,
+    expected_type,
+    expected_edge,
+    expected_role,
+):
+    transfer_config = OmniTransferConfig(
+        connectors={
+            ("0", "1"): ConnectorSpec(
+                "MooncakeTransferEngineConnector",
+                {"rank_mapping": {"from_tp": 2, "to_tp": 2}},
+            ),
+            ("1", "2"): ConnectorSpec(
+                "MoriTransferEngineConnector",
+                {"rank_mapping": {"from_tp": 2, "to_tp": 2}},
+            ),
+        }
+    )
+    stage_config = SimpleNamespace(engine_args={"omni_kv_config": omni_kv_config})
+
+    connector_config, from_stage, to_stage = resolve_omni_kv_config_for_stage(
+        transfer_config,
+        1,
+        stage_config,
+    )
+
+    assert connector_config is not None
+    assert connector_config["type"] == expected_type
+    assert connector_config["role"] == expected_role
+    assert (from_stage, to_stage) == expected_edge
+
+
+def test_kv_config_rejects_bidirectional_manager():
+    transfer_config = OmniTransferConfig(
+        connectors={
+            ("0", "1"): ConnectorSpec("MooncakeTransferEngineConnector"),
+            ("1", "2"): ConnectorSpec("MoriTransferEngineConnector"),
+        }
+    )
+    stage_config = SimpleNamespace(
+        engine_args={
+            "omni_kv_config": {
+                "need_recv_cache": True,
+                "need_send_cache": True,
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="supports only one directional connector"):
+        resolve_omni_kv_config_for_stage(transfer_config, 1, stage_config)
 
 
 def test_absent_config_preserves_legacy_shm_but_explicit_empty_config_does_not():

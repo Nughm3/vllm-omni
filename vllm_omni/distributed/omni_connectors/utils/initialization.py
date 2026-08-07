@@ -565,12 +565,14 @@ def build_stage_connectors(
 
 
 def resolve_omni_kv_config_for_stage(
-    transfer_cfg: OmniTransferConfig | None, stage_id: int | str
+    transfer_cfg: OmniTransferConfig | None,
+    stage_id: int | str,
+    stage_config: Any | None = None,
 ) -> tuple[dict[str, Any] | None, str | None, str | None]:
     """Resolve connector configuration for a specific stage (Sender/Receiver).
 
-    This determines the primary connector configuration to be injected into the
-    engine arguments, prioritizing outgoing edges (Sender role).
+    Selects the edge owned by the stage's KV manager. Legacy callers that do
+    not provide a stage config retain the outgoing-first behavior.
     """
     if not transfer_cfg or not getattr(transfer_cfg, "connectors", None):
         return None, None, None
@@ -591,13 +593,30 @@ def resolve_omni_kv_config_for_stage(
         if to_stage == stage_id_str
     ]
 
+    omni_kv_config = getattr(stage_config, "omni_kv_config", None)
+    if omni_kv_config is None:
+        engine_args = getattr(stage_config, "engine_args", None)
+        if hasattr(engine_args, "get"):
+            omni_kv_config = engine_args.get("omni_kv_config")
+    if hasattr(omni_kv_config, "get"):
+        need_recv_cache = bool(omni_kv_config.get("need_recv_cache", False))
+        need_send_cache = bool(omni_kv_config.get("need_send_cache", False))
+    else:
+        need_recv_cache = bool(getattr(omni_kv_config, "need_recv_cache", False))
+        need_send_cache = bool(getattr(omni_kv_config, "need_send_cache", False))
+
+    if need_recv_cache and need_send_cache:
+        raise ValueError(
+            f"Stage {stage_id} enables both KV receive and send, but "
+            "OmniKVTransferManager supports only one directional connector"
+        )
+
     omni_conn_cfg = None
     omni_from = None
     omni_to = None
 
-    # Prioritize outgoing (Sender) if exists, else check incoming (Receiver).
     # Inject direction-specific role so the connector initializes correctly.
-    if outgoing:
+    if outgoing and not need_recv_cache:
         if len(outgoing) > 1:
             logger.debug(
                 "Stage-%s has %d outgoing edges; using the smallest to_stage",
@@ -607,15 +626,15 @@ def resolve_omni_kv_config_for_stage(
         outgoing.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else str(x[0]))
         to_s, spec = outgoing[0]
         omni_conn_cfg = {"type": spec.name, **(spec.extra or {})}
-        omni_conn_cfg.setdefault("role", "sender")
+        omni_conn_cfg["role"] = "sender"
         omni_from = stage_id_str
         omni_to = str(to_s)
-    elif incoming:
+    elif incoming and not need_send_cache:
         # For receiver, pick one incoming edge to configure the connector
         incoming.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else str(x[0]))
         from_s, spec = incoming[0]
         omni_conn_cfg = {"type": spec.name, **(spec.extra or {})}
-        omni_conn_cfg.setdefault("role", "receiver")
+        omni_conn_cfg["role"] = "receiver"
         omni_from = str(from_s)
         omni_to = stage_id_str
 

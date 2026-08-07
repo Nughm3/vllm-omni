@@ -1032,7 +1032,11 @@ def run_headless(args: TrackingNamespace) -> None:
         return
 
     omni_transfer_config = load_omni_transfer_config_for_model(model, config_path)
-    omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
+    omni_kv_connector = resolve_omni_kv_config_for_stage(
+        omni_transfer_config,
+        stage_id,
+        stage_cfg,
+    )
     stage_connector_plan = get_stage_connector_plan(
         omni_transfer_config=omni_transfer_config,
         stage_id=stage_id,

@@ -210,9 +210,9 @@ class OmniConnectorModelRunnerMixin:
         if self._kv_transfer_manager is not None:
             if need_send_cache:
                 self._kv_transfer_manager.kv_send_key_builder = self.get_rank_aware_kv_send_keys
-                self._kv_transfer_manager.kv_payload_slicer = self._slice_rank_sharded_kv_payload
             if need_recv_cache:
                 self._kv_transfer_manager.kv_recv_key_builder = self.get_rank_aware_kv_keys
+                self._kv_transfer_manager.kv_payload_slicer = self._slice_rank_sharded_kv_payload
                 self._kv_transfer_manager.kv_payload_merger = self._merge_rank_sharded_kv_payloads
 
         # -- chunk index tracking (ported from OmniChunkTransferAdapter) --

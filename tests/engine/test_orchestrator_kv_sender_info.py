@@ -170,6 +170,7 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
     )
 
     output = SimpleNamespace(request_id="req-1", finished=True)
+    sender_pool.select_replica_id("req-1")
     asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-1", sender_pool.stage_id, output, req_state))
 
     assert diffusion_stage.calls[0]["request_id"] == "req-1"
@@ -199,6 +200,7 @@ def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
     )
 
     output = SimpleNamespace(request_id="req-3", finished=True)
+    source_pool.select_replica_id("req-3")
     asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-3", previous_pool.stage_id, output, req_state))
 
     assert diffusion_stage.calls[0]["kv_sender_info"] == {

@@ -270,9 +270,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         Args:
             request: The request object needing data.
         """
-        stage_id = self._stage_id
-
-        if stage_id == 0 or not self.receives_chunks:
+        if self._stage_id == 0 or not self.receives_chunks:
             return
         if not hasattr(request, "additional_information"):
             request.additional_information = None
@@ -1238,11 +1236,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """
         if not self.receives_chunks:
             return
-        stage_id = self._stage_id
-
-        if stage_id == 0:
+        if self._stage_id == 0:
             return
-
         if requests is not None:
             self.attach_cached_additional_information(scheduler_output, requests)
         self._clear_chunk_ready(scheduler_output)

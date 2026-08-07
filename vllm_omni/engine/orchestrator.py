@@ -3025,9 +3025,11 @@ class Orchestrator:
                 continue
 
             sender_pool = self.stage_pools[sender_stage_id]
-            sender_stage = sender_pool.get_bound_client(request_id) if request_id is not None else None
+            sender_stage = (
+                sender_pool.get_bound_client(request_id) if request_id is not None else sender_pool.stage_client
+            )
             if sender_stage is None:
-                sender_stage = sender_pool.stage_client
+                continue
             get_sender_info = getattr(sender_stage, "get_kv_sender_info", None)
             if not callable(get_sender_info):
                 continue
@@ -3051,7 +3053,9 @@ class Orchestrator:
     ) -> ConnectorEndpoint | None:
         """Resolve the endpoint of the producer replica bound to a request."""
         sender_pool = self.stage_pools[sender_stage_id]
-        sender_stage = sender_pool.get_bound_client(request_id) or sender_pool.stage_client
+        sender_stage = sender_pool.get_bound_client(request_id)
+        if sender_stage is None:
+            return None
         get_sender_info = getattr(sender_stage, "get_payload_sender_info", None)
         return get_sender_info() if callable(get_sender_info) else None
 

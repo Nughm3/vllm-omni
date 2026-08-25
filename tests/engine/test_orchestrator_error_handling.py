@@ -463,9 +463,7 @@ async def test_async_chunk_prewarm_failure_reports_failing_downstream_stage(orch
             )
         ),
     ]
-    stage_pools = _build_stage_pools(
-        [[stage0], [stage1], [stage2]], stage_vllm_configs=stage_vllm_configs
-    )
+    stage_pools = _build_stage_pools([[stage0], [stage1], [stage2]], stage_vllm_configs=stage_vllm_configs)
     # Diffusion pools are built from their client directly by the test helper;
     # attach the stage config explicitly so prewarm can resolve inbound edges.
     stage_pools[1]._stage_vllm_config = stage_vllm_configs[1]

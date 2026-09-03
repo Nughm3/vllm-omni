@@ -406,7 +406,6 @@ def test_talker_attention_policy_controls_streaming_recompute(build_adapter, att
     assert adapter._streaming_prompt_previous_chunks == expected_previous_chunks
 
 
-
 def test_load_poll(build_adapter):
     adapter, connector = build_adapter(stage_id=2, model_mode="ar")
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
@@ -1718,7 +1717,7 @@ def test_cleanup_and_reregister_discards_inflight_old_segment_chunk(build_adapte
     get_started = threading.Event()
     release_get = threading.Event()
 
-    def blocking_get(*_args):
+    def blocking_get(*_args, **_kwargs):
         get_started.set()
         assert release_get.wait(timeout=5)
         return (
